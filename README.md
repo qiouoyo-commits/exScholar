@@ -1,27 +1,40 @@
 # exScholar
 
-exScholar is a local-first paper discovery and review workspace. It can search papers by keyword, fetch abstracts, build a static website for browsing results, expand to related papers, maintain a citation library, and export review logs for downstream summarization.
+exScholar is a local-first paper search and deep-reading workspace.
 
-## What It Does
+It supports:
 
-- Search papers by keyword and save results as `CSV`, `JSON`, and static HTML
-- Fetch abstracts from multiple sources
-- Build a browsable site with timeline, keyword pages, and citation library
-- Expand a paper into related papers using DOI / citation APIs
-- Export local review bundles from existing keywords and abstracts
+- keyword-based paper search
+- abstract fetching
+- static result pages for browsing
+- citation expansion from an existing paper
+- a deep-reading library that links papers, PDFs, reading groups, and structured reading pages
+- PDF-based metadata extraction and single-call structured analysis via Moonshot/Kimi
+
+## Core Features
+
+- Search papers by keyword and save `CSV`, `JSON`, and static HTML
+- Browse results through timeline, keyword pages, and expansion pages
+- Add papers into the deep-reading library
+- Upload a PDF when adding a paper, or upload a PDF later and bind it to an existing paper
+- Match uploaded PDFs to existing papers by DOI, title/year, or title similarity
+- Generate a deep-reading workspace with:
+  - `paper.json`
+  - `analysis.json`
+  - extracted full text and sections
+- Run one-call structured reading analysis with `kimi-k2.5`
 
 ## Requirements
 
-- Python `3.11`
-- Conda environment recommended
+- Python `3.11+`
+- Conda recommended
 - Playwright `chromium`
-- `aiohttp`-based abstract pipeline
+- network access for DBLP / OpenAlex / Moonshot / AI4Scholar
 
-Recommended runtime:
+Recommended environment:
 
-- Conda env: `openclaw-analytics`
-- Use `oc-conda-run` when available
-- Avoid system/base Python `3.13` for the abstract-fetch workflow
+- conda env: `openclaw-analytics`
+- use `oc-conda-run` when available
 
 ## Setup
 
@@ -31,33 +44,36 @@ conda activate openclaw-analytics
 python -m playwright install chromium
 ```
 
-Or use the wrapper if `oc-conda-run` is available:
+Or:
 
 ```bash
 oc-conda-run -- python -m playwright install chromium
 ```
 
-You can also run searches through the fixed wrapper:
-
-```bash
-./run_search.sh --keywords "openclaw" --slug demo --top 5 --year-from 2020
-```
-
 ## Configuration
 
-Copy `.env.local.example` to `.env.local` and fill in what you need.
+Copy `.env.local.example` to `.env.local` and fill in the values you need.
 
-Main settings:
+Main site settings:
 
-- `PUBLIC_SITE_BASE_URL`
 - `PUBLIC_SITE_HOST`
 - `PUBLIC_SITE_PORT`
+- `PUBLIC_SITE_BASE_URL`
 - `SITE_SERVER_HOST`
 - `SITE_PASSWORD_SALT`
 - `SITE_PASSWORD_HASH`
 - `SITE_SESSION_SECRET`
+
+Search / expansion settings:
+
 - `REFERENCE_EXPAND_LIMIT`
 - `AI4SCHOLAR_API_KEY`
+
+Deep-reading analysis settings:
+
+- `MOONSHOT_API_KEY`
+- `MOONSHOT_BASE_URL`
+- `MOONSHOT_ANALYSIS_MODEL`
 
 Proxy settings are optional:
 
@@ -66,55 +82,37 @@ Proxy settings are optional:
 - `PROXY_USERNAME`
 - `PROXY_PASSWORD`
 
-## Proxy Integration
-
-The crawler supports Shenlong proxy IP rotation through:
-
-- `PROXY_API_KEY`
-- `PROXY_API_SIGN`
-- `PROXY_USERNAME`
-- `PROXY_PASSWORD`
-
-Implementation notes for later development:
-
-- proxy endpoint: `http://api.shenlongip.com/ip`
-- protocol mode: `2`
-- pattern: `json`
-- count: `1`
-- proxy pool falls back to local network if proxy config is unavailable
-- proxy config is validated on startup before the pool is used
-
-If proxy settings are missing or invalid, the project will continue with local requests instead of failing hard.
-
 ## Common Commands
 
 Run a keyword search:
 
 ```bash
 ./run_search.sh \
-  --keywords "openclaw" \
-  --slug "demo" \
-  --top 5 \
+  --keywords "physiological notification;biosignal alert" \
+  --venues "chi,uist,cscw" \
+  --slug "physio-ui" \
+  --top 50 \
   --year-from 2020
 ```
 
-Direct Python entry:
+Run the Python entry directly:
 
 ```bash
 oc-conda-run -- python search.py \
-  --keywords "openclaw" \
-  --slug "demo" \
-  --top 5 \
+  --keywords "physiological notification;biosignal alert" \
+  --venues "chi,uist,cscw" \
+  --slug "physio-ui" \
+  --top 50 \
   --year-from 2020
 ```
 
-Run the original crawler entry:
+Run the original crawler:
 
 ```bash
 oc-conda-run -- python main.py -ccf a -c conf -m 20 -p 10
 ```
 
-Start the static site:
+Start the site:
 
 ```bash
 oc-conda-run -- python serve_searches.py
@@ -126,44 +124,9 @@ Set or rotate the site password:
 oc-conda-run -- python set_site_password.py --password 'your-password'
 ```
 
-Export a local review bundle:
-
-```bash
-oc-conda-run -- python keyword_review.py \
-  --query "stress coping UI research review" \
-  --slug "stress-review"
-```
-
-## CLI Reference
-
-Keyword search:
-
-- `--keywords`: semicolon-separated keyword groups
-- `--venues`: comma-separated venue abbreviations; empty means global search
-- `--slug`: output directory slug
-- `--top`: max papers per keyword × venue before dedupe
-- `--year-from`: lower year bound
-- `--no-abstract`: skip abstract fetching
-
-Main crawler:
-
-- `-ccf`: CCF level such as `a`, `b`, `c`
-- `-c, --classification`: `conf` or `journal`
-- `-m, --max-concurrent`: max abstract-fetch concurrency
-- `-p, --proxy-pool-size`: proxy pool size
-
-Review export:
-
-- `--query`: natural-language review request
-- `--keywords`: explicit semicolon-separated keywords
-- `--top-keywords`: max auto-selected keywords
-- `--max-papers`: cap exported papers
-- `--slug`: output slug
-- `--list-only`: only print available keywords
-
 ## Output Layout
 
-Original search results:
+Search results:
 
 ```text
 data/searches/YYYY-MM-DD_<slug>/
@@ -175,36 +138,66 @@ Expansion results:
 data/expansions/YYYY-MM-DD_<slug>/
 ```
 
-Review logs:
+Deep-reading workspaces:
 
 ```text
-data/review_logs/YYYY-MM-DD_<slug>/
+data/reading/<paper_id>/
+  ├── paper.json
+  ├── analysis.json
+  └── source/
+      ├── <uploaded-pdf>.pdf
+      ├── full_text.json
+      └── sections.json
 ```
 
-Each search result directory typically contains:
+Library PDFs:
+
+```text
+data/library/
+```
+
+Typical search directory contents:
 
 - `search.json`
 - `papers.csv`
 - `papers.json`
 - `site/index.html`
 
+## Deep Reading Flow
+
+1. Add a paper from search results, optionally with a PDF.
+2. Or upload a PDF from the deep-reading page.
+3. The system extracts metadata from the PDF.
+4. It tries to match an existing paper by:
+   - DOI
+   - exact title + year
+   - exact title
+   - title similarity >= 85%
+5. The PDF is linked to the matched paper or used to create a new paper record.
+6. A deep-reading workspace is created.
+7. The PDF text is extracted via Moonshot Files API.
+8. A single Kimi call generates structured `analysis.json`.
+
 ## Site Features
 
-- Timeline for original searches and expansion searches
-- Keyword index page
-- Keyword detail pages
-- Citation library with tag filtering and JSON export
-- Expansion pages for related papers
+- Timeline for search and expansion history
+- Keyword index and keyword detail pages
+- Deep-reading library with:
+  - tag filters
+  - group filters
+  - reading groups
+  - PDF upload and binding
+  - remove-from-reading action
+- Per-paper reading page with Overview / Problem / Method / Results / Critique
 - Password-protected access
 
 ## Development Notes
 
-- `search.py` writes original results into `data/searches/`
-- `serve_searches.py` serves both `data/searches/` and `data/expansions/`
-- `keyword_review.py` exports review bundles into `data/review_logs/`
+- `search.py` writes search results into `data/searches/`
+- `serve_searches.py` serves search, expansion, and deep-reading pages
+- `data/` runtime outputs are mostly not tracked in git
 - `.env.local` is intentionally excluded from version control
-- `data/` is kept clean in the repository; runtime outputs are not committed
-- If local data is insufficient for review generation, run a fresh search first
+- Moonshot requests are configured to bypass environment proxy settings inside the app
 
 ## Project Structure
 
@@ -213,7 +206,6 @@ Each search result directory typically contains:
 ├── main.py
 ├── search.py
 ├── serve_searches.py
-├── keyword_review.py
 ├── run_search.sh
 ├── set_site_password.py
 ├── driver.py
@@ -223,9 +215,3 @@ Each search result directory typically contains:
 ├── skills/
 └── data/
 ```
-
-## Notes
-
-- Static site URLs are derived from `PUBLIC_SITE_BASE_URL`
-- Site password hashes are managed through `set_site_password.py`
-- Expansion search prefers `AI4SCHOLAR_API_KEY` when available and falls back to DOI-based sources

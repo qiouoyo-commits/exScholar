@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import csv
+import io
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import sqlite3
+import shutil
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 from html import escape
 from http import cookies
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +31,8 @@ PUBLIC_SITE_BASE_URL = (os.getenv("PUBLIC_SITE_BASE_URL") or "").strip().rstrip(
 DATA_DIR = ROOT_DIR / "data"
 SEARCHES_DIR = DATA_DIR / "searches"
 EXPANSIONS_DIR = DATA_DIR / "expansions"
+LIBRARY_DIR = DATA_DIR / "library"
+READING_DIR = DATA_DIR / "reading"
 DB_PATH = ROOT_DIR / "data" / "citation_library.sqlite3"
 
 PASSWORD_SALT = (os.getenv("SITE_PASSWORD_SALT") or "").strip()
@@ -37,6 +42,9 @@ SESSION_COOKIE = "ccf_site_session"
 PBKDF2_ITERATIONS = 200_000
 REFERENCE_LIMIT = int((os.getenv("REFERENCE_EXPAND_LIMIT") or "20").strip() or "20")
 AI4SCHOLAR_API_KEY = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
+MOONSHOT_API_KEY = (os.getenv("MOONSHOT_API_KEY") or "").strip()
+MOONSHOT_BASE_URL = (os.getenv("MOONSHOT_BASE_URL") or "https://api.moonshot.cn/v1").strip().rstrip("/")
+MOONSHOT_ANALYSIS_MODEL = (os.getenv("MOONSHOT_ANALYSIS_MODEL") or "kimi-k2-turbo-preview").strip()
 
 SESSIONS: dict[str, dict] = {}
 
@@ -64,6 +72,8 @@ def require_password() -> bool:
 
 def ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    READING_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -80,6 +90,8 @@ def ensure_db():
                 tags TEXT DEFAULT '',
                 source_search_slug TEXT,
                 source_csv_index INTEGER,
+                pdf_path TEXT,
+                reading_paper_id TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(doi),
                 UNIQUE(title, year)
@@ -92,6 +104,10 @@ def ensure_db():
         }
         if "tags" not in columns:
             conn.execute("ALTER TABLE citations ADD COLUMN tags TEXT DEFAULT ''")
+        if "pdf_path" not in columns:
+            conn.execute("ALTER TABLE citations ADD COLUMN pdf_path TEXT")
+        if "reading_paper_id" not in columns:
+            conn.execute("ALTER TABLE citations ADD COLUMN reading_paper_id TEXT")
         conn.execute(
             """
             UPDATE citations
@@ -99,6 +115,31 @@ def ensure_db():
             WHERE (tags IS NULL OR tags = '')
               AND matched_kw IS NOT NULL
               AND matched_kw != ''
+            """
+        )
+        # Create reading_groups table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reading_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        # Create citation_group_links table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS citation_group_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                citation_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(citation_id, group_id),
+                FOREIGN KEY (citation_id) REFERENCES citations(id) ON DELETE CASCADE,
+                FOREIGN KEY (group_id) REFERENCES reading_groups(id) ON DELETE CASCADE
+            )
             """
         )
         conn.commit()
@@ -232,7 +273,7 @@ def get_source_matched_kw(meta: dict) -> str:
     return ""
 
 
-def upsert_citation(paper: dict, search_slug: str):
+def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
     ensure_db()
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     default_tags = (
@@ -245,8 +286,8 @@ def upsert_citation(paper: dict, search_slug: str):
             """
             INSERT INTO citations (
                 title, doi, url, authors, year, venue, abstract, matched_kw, tags,
-                source_search_slug, source_csv_index, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_search_slug, source_csv_index, pdf_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(doi) DO UPDATE SET
                 url=excluded.url,
                 authors=excluded.authors,
@@ -256,7 +297,8 @@ def upsert_citation(paper: dict, search_slug: str):
                 matched_kw=excluded.matched_kw,
                 tags=COALESCE(NULLIF(citations.tags, ''), excluded.tags),
                 source_search_slug=excluded.source_search_slug,
-                source_csv_index=excluded.source_csv_index
+                source_csv_index=excluded.source_csv_index,
+                pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path)
             """,
             (
                 paper.get("title", ""),
@@ -270,6 +312,7 @@ def upsert_citation(paper: dict, search_slug: str):
                 normalize_tags(default_tags),
                 search_slug,
                 paper.get("csv_index"),
+                pdf_path,
                 now,
             ),
         )
@@ -278,8 +321,8 @@ def upsert_citation(paper: dict, search_slug: str):
                 """
                 INSERT INTO citations (
                     title, doi, url, authors, year, venue, abstract, matched_kw, tags,
-                    source_search_slug, source_csv_index, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_search_slug, source_csv_index, pdf_path, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(title, year) DO UPDATE SET
                     url=excluded.url,
                     authors=excluded.authors,
@@ -288,7 +331,8 @@ def upsert_citation(paper: dict, search_slug: str):
                     matched_kw=excluded.matched_kw,
                     tags=COALESCE(NULLIF(citations.tags, ''), excluded.tags),
                     source_search_slug=excluded.source_search_slug,
-                    source_csv_index=excluded.source_csv_index
+                    source_csv_index=excluded.source_csv_index,
+                    pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path)
                 """,
                 (
                     paper.get("title", ""),
@@ -302,10 +346,23 @@ def upsert_citation(paper: dict, search_slug: str):
                     normalize_tags(default_tags),
                     search_slug,
                     paper.get("csv_index"),
+                    pdf_path,
                     now,
                 ),
             )
+        citation_id = None
+        doi = (paper.get("doi") or "").strip()
+        if doi:
+            row = conn.execute("SELECT id FROM citations WHERE doi = ?", (doi,)).fetchone()
+            citation_id = row[0] if row else None
+        if not citation_id:
+            row = conn.execute(
+                "SELECT id FROM citations WHERE title = ? AND year = ?",
+                (paper.get("title", ""), str(paper.get("year", "") or "")),
+            ).fetchone()
+            citation_id = row[0] if row else None
         conn.commit()
+        return citation_id
 
 
 def list_citations():
@@ -315,7 +372,7 @@ def list_citations():
         rows = conn.execute(
             """
             SELECT id, title, doi, url, authors, year, venue, abstract,
-                   matched_kw, tags, source_search_slug, source_csv_index, created_at
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
             FROM citations
             ORDER BY created_at DESC, id DESC
             """
@@ -333,7 +390,7 @@ def get_citations_by_ids(ids: list[int]):
         rows = conn.execute(
             f"""
             SELECT id, title, doi, url, authors, year, venue, abstract,
-                   matched_kw, tags, source_search_slug, source_csv_index, created_at
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
             FROM citations
             WHERE id IN ({placeholders})
             ORDER BY created_at DESC, id DESC
@@ -341,6 +398,22 @@ def get_citations_by_ids(ids: list[int]):
             ids,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_citation_by_id(citation_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, title, doi, url, authors, year, venue, abstract,
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+            FROM citations
+            WHERE id = ?
+            """,
+            (citation_id,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def normalize_tags(raw) -> str:
@@ -377,6 +450,785 @@ def update_citation_tags(citation_id: int, tags: str):
             (normalize_tags(tags), citation_id),
         )
         conn.commit()
+
+
+def update_citation_pdf(citation_id: int, pdf_path: str):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE citations SET pdf_path = ? WHERE id = ?",
+            (pdf_path, citation_id),
+        )
+        conn.commit()
+
+
+def clear_citation_reading_link(citation_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE citations SET reading_paper_id = NULL WHERE id = ?",
+            (citation_id,),
+        )
+        conn.commit()
+
+
+def list_reading_groups():
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, name, description, created_at
+            FROM reading_groups
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_reading_group(name: str, description: str = ""):
+    ensure_db()
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "INSERT INTO reading_groups (name, description, created_at) VALUES (?, ?, ?)",
+            (name.strip(), description.strip(), now),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def delete_reading_group(group_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM citation_group_links WHERE group_id = ?", (group_id,))
+        conn.execute("DELETE FROM reading_groups WHERE id = ?", (group_id,))
+        conn.commit()
+
+
+def reading_group_exists(group_id: int) -> bool:
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT 1 FROM reading_groups WHERE id = ?", (group_id,)).fetchone()
+    return bool(row)
+
+
+def citation_exists(citation_id: int) -> bool:
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT 1 FROM citations WHERE id = ?", (citation_id,)).fetchone()
+    return bool(row)
+
+
+def get_citation_groups(citation_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT rg.id, rg.name, rg.description
+            FROM reading_groups rg
+            JOIN citation_group_links cgl ON rg.id = cgl.group_id
+            WHERE cgl.citation_id = ?
+            ORDER BY rg.name
+            """,
+            (citation_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_citation_to_group(citation_id: int, group_id: int):
+    ensure_db()
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO citation_group_links (citation_id, group_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (citation_id, group_id, now),
+        )
+        conn.commit()
+
+
+def remove_citation_from_group(citation_id: int, group_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM citation_group_links WHERE citation_id = ? AND group_id = ?",
+            (citation_id, group_id),
+        )
+        conn.commit()
+
+
+def list_citations_with_groups():
+    ensure_db()
+    citations = list_citations()
+    for citation in citations:
+        citation["groups"] = get_citation_groups(citation["id"])
+    return citations
+
+
+def safe_file_stem(name: str, fallback: str = "paper") -> str:
+    chars = []
+    for ch in (name or "").strip():
+        if ch.isalnum():
+            chars.append(ch.lower())
+        elif chars and chars[-1] != "-":
+            chars.append("-")
+    value = "".join(chars).strip("-")
+    return value[:80] or fallback
+
+
+def store_uploaded_pdf(file_item, title: str = "") -> str:
+    if not file_item or not getattr(file_item, "file", None):
+        return ""
+    filename = (getattr(file_item, "filename", "") or "").strip()
+    content_type = (getattr(file_item, "type", "") or "").lower()
+    suffix = Path(filename).suffix.lower()
+    if suffix != ".pdf" and content_type != "application/pdf":
+        raise ValueError("仅支持上传 PDF 文件。")
+    stem = safe_file_stem(title or Path(filename).stem or "paper")
+    unique_name = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}-{stem}.pdf"
+    dest = LIBRARY_DIR / unique_name
+    file_item.file.seek(0)
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(file_item.file, fh)
+    return f"library/{unique_name}"
+
+
+def citation_pdf_abspath(citation: dict | None) -> Path | None:
+    if not citation:
+        return None
+    pdf_rel = (citation.get("pdf_path") or "").strip()
+    if not pdf_rel:
+        return None
+    path = DATA_DIR / pdf_rel
+    return path if path.exists() else None
+
+
+def citation_has_pdf(citation: dict | None) -> bool:
+    return citation_pdf_abspath(citation) is not None
+
+
+def utc_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def build_reading_paper_id(citation: dict) -> str:
+    base = safe_file_stem(citation.get("title") or "", fallback="paper")
+    return f"paper_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}_{base[:24]}"
+
+
+def reading_workspace_path(paper_id: str) -> Path:
+    return READING_DIR / paper_id
+
+
+def default_analysis_payload(paper_id: str) -> dict:
+    now = utc_now()
+    empty_module = {"status": "pending", "version": 0, "generated_at": None, "data": {}}
+    return {
+        "paper_id": paper_id,
+        "schema_version": "1.0.0",
+        "analysis_version": 1,
+        "pipeline_mode": "1_call",
+        "modules": {
+            "overview": dict(empty_module),
+            "problem": dict(empty_module),
+            "method": dict(empty_module),
+            "results": dict(empty_module),
+            "critique": dict(empty_module),
+        },
+        "calls": [
+            {
+                "call_id": "call_01",
+                "module": "all_modules",
+                "status": "pending",
+                "started_at": None,
+                "ended_at": None,
+                "model": None,
+                "input_scope": ["full_pdf"],
+                "output_version": 0,
+            }
+        ],
+        "updated_at": now,
+    }
+
+
+def split_authors(authors_text: str) -> list[str]:
+    parts = []
+    for item in (authors_text or "").replace(";", ",").split(","):
+        name = " ".join(item.strip().split())
+        if name:
+            parts.append(name)
+    return parts
+
+
+def normalize_title_for_match(title: str) -> str:
+    chars = []
+    prev_space = False
+    for ch in (title or "").lower():
+        if ch.isalnum():
+            chars.append(ch)
+            prev_space = False
+        elif not prev_space:
+            chars.append(" ")
+            prev_space = True
+    return " ".join("".join(chars).split())
+
+
+def title_similarity(a: str, b: str) -> float:
+    left = normalize_title_for_match(a)
+    right = normalize_title_for_match(b)
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def ensure_reading_workspace_for_citation(citation_id: int):
+    ensure_db()
+    citation = get_citation_by_id(citation_id)
+    if not citation:
+        raise ValueError("Citation 不存在")
+    library_pdf = citation_pdf_abspath(citation)
+    if not library_pdf:
+        raise ValueError("该文献尚未上传 PDF，暂时不能进入深度阅读。")
+
+    paper_id = citation.get("reading_paper_id") or build_reading_paper_id(citation)
+    workspace = reading_workspace_path(paper_id)
+    source_dir = workspace / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    paper_json_path = workspace / "paper.json"
+    analysis_json_path = workspace / "analysis.json"
+
+    dest_pdf = source_dir / library_pdf.name
+    if not dest_pdf.exists():
+        shutil.copy2(library_pdf, dest_pdf)
+    source_pdf_path = f"/reading/{paper_id}/source/{dest_pdf.name}"
+
+    now = utc_now()
+    paper_payload = {
+        "paper_id": paper_id,
+        "title": citation.get("title") or "",
+        "authors": split_authors(citation.get("authors") or ""),
+        "year": int(citation["year"]) if str(citation.get("year") or "").isdigit() else citation.get("year") or None,
+        "venue": citation.get("venue") or "",
+        "doi": citation.get("doi") or None,
+        "keywords": [part.strip() for part in (citation.get("tags") or "").split(",") if part.strip()],
+        "pdf": {
+            "file_name": Path(source_pdf_path).name if source_pdf_path else "",
+            "file_path": source_pdf_path,
+            "page_count": None,
+            "uploaded_at": citation.get("created_at") or now,
+        },
+        "text_source": {
+            "full_text_path": f"/reading/{paper_id}/source/full_text.json",
+            "sections_path": f"/reading/{paper_id}/source/sections.json",
+        },
+        "status": {
+            "ingestion": "completed" if source_pdf_path else "pending",
+            "analysis": "pending",
+        },
+        "created_at": citation.get("created_at") or now,
+        "updated_at": now,
+    }
+    paper_json_path.write_text(json.dumps(paper_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if not analysis_json_path.exists():
+        analysis_json_path.write_text(json.dumps(default_analysis_payload(paper_id), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE citations SET reading_paper_id = ? WHERE id = ?",
+            (paper_id, citation_id),
+        )
+        conn.commit()
+
+    return {
+        "paper_id": paper_id,
+        "workspace": workspace,
+        "paper_json_path": paper_json_path,
+        "analysis_json_path": analysis_json_path,
+        "reading_url": f"/reading/{paper_id}",
+    }
+
+
+def load_reading_bundle(paper_id: str):
+    workspace = reading_workspace_path(paper_id)
+    paper_json_path = workspace / "paper.json"
+    analysis_json_path = workspace / "analysis.json"
+    if not paper_json_path.exists() or not analysis_json_path.exists():
+        return None
+    try:
+        paper = json.loads(paper_json_path.read_text(encoding="utf-8"))
+        analysis = json.loads(analysis_json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return {
+        "paper": paper,
+        "analysis": analysis,
+        "workspace": workspace,
+    }
+
+
+def reading_json_ready(paper_id: str) -> bool:
+    bundle = load_reading_bundle(paper_id)
+    return bool(bundle)
+
+
+def remove_reading_workspace_for_citation(citation_id: int):
+    citation = get_citation_by_id(citation_id)
+    if not citation:
+        raise ValueError("Citation 不存在")
+    paper_id = (citation.get("reading_paper_id") or "").strip()
+    if not paper_id:
+        return False
+    workspace = reading_workspace_path(paper_id)
+    if workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
+    clear_citation_reading_link(citation_id)
+    return True
+
+
+def match_existing_citation(title: str = "", doi: str = "", year: str = ""):
+    ensure_db()
+    normalized_doi = (doi or "").strip()
+    normalized_title = (title or "").strip()
+    normalized_year = str(year or "").strip()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = None
+        if normalized_doi:
+            row = conn.execute(
+                """
+                SELECT id, title, doi, url, authors, year, venue, abstract,
+                       matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                FROM citations WHERE doi = ?
+                """,
+                (normalized_doi,),
+            ).fetchone()
+        if not row and normalized_title and normalized_year:
+            row = conn.execute(
+                """
+                SELECT id, title, doi, url, authors, year, venue, abstract,
+                       matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                FROM citations WHERE title = ? AND year = ?
+                """,
+                (normalized_title, normalized_year),
+            ).fetchone()
+        if not row and normalized_title:
+            row = conn.execute(
+                """
+                SELECT id, title, doi, url, authors, year, venue, abstract,
+                       matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                FROM citations WHERE title = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (normalized_title,),
+            ).fetchone()
+        if not row and normalized_title:
+            rows = conn.execute(
+                """
+                SELECT id, title, doi, url, authors, year, venue, abstract,
+                       matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                FROM citations
+                WHERE title IS NOT NULL AND title != ''
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+            best_row = None
+            best_score = 0.0
+            for candidate in rows:
+                score = title_similarity(normalized_title, candidate["title"] or "")
+                if score >= 0.85 and score > best_score:
+                    best_row = candidate
+                    best_score = score
+            row = best_row
+    return dict(row) if row else None
+
+
+def create_or_match_citation_from_metadata(metadata: dict, pdf_path: str = "", search_slug: str = ""):
+    title = (metadata.get("title") or "").strip()
+    doi = normalize_doi(metadata.get("doi") or "")
+    year = str(metadata.get("year") or "").strip()
+    matched = match_existing_citation(title=title, doi=doi, year=year)
+    if matched:
+        if pdf_path:
+            update_citation_pdf(int(matched["id"]), pdf_path)
+        return get_citation_by_id(int(matched["id"])), True
+    paper = {
+        "title": title or (Path(pdf_path).stem if pdf_path else "Untitled Paper"),
+        "doi": doi,
+        "url": "",
+        "authors": ", ".join(metadata.get("authors") or []),
+        "year": year,
+        "venue": (metadata.get("venue") or "").strip(),
+        "content": (metadata.get("abstract") or "").strip(),
+        "matched_kw": "",
+        "csv_index": None,
+        "tags": "",
+    }
+    citation_id = upsert_citation(paper, (search_slug or "").strip(), pdf_path=pdf_path or None)
+    return get_citation_by_id(citation_id), bool(matched)
+
+
+def read_json_file(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json_file(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_paper_status(paper_json_path: Path, *, ingestion: str | None = None, analysis: str | None = None):
+    paper = read_json_file(paper_json_path, {})
+    status = paper.setdefault("status", {})
+    if ingestion is not None:
+        status["ingestion"] = ingestion
+    if analysis is not None:
+        status["analysis"] = analysis
+    paper["updated_at"] = utc_now()
+    write_json_file(paper_json_path, paper)
+    return paper
+
+
+def moonshot_headers() -> dict:
+    if not MOONSHOT_API_KEY:
+        raise ValueError("未配置 MOONSHOT_API_KEY")
+    return {"Authorization": f"Bearer {MOONSHOT_API_KEY}"}
+
+
+def moonshot_session():
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+def moonshot_upload_pdf(pdf_path: Path) -> dict:
+    session = moonshot_session()
+    with pdf_path.open("rb") as fh:
+        resp = session.post(
+            f"{MOONSHOT_BASE_URL}/files",
+            headers=moonshot_headers(),
+            files={"file": (pdf_path.name, fh, "application/pdf")},
+            data={"purpose": "file-extract"},
+            timeout=120,
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def moonshot_get_file_content(file_id: str):
+    session = moonshot_session()
+    resp = session.get(
+        f"{MOONSHOT_BASE_URL}/files/{quote(file_id, safe='')}/content",
+        headers=moonshot_headers(),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" in content_type:
+        return resp.json()
+    text = resp.text
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"content": text}
+
+
+def normalize_full_text_payload(raw_content):
+    if isinstance(raw_content, dict):
+        payload = raw_content
+    else:
+        payload = {"content": str(raw_content or "")}
+    text = ""
+    if isinstance(payload.get("content"), str):
+        text = payload["content"]
+    elif isinstance(payload.get("text"), str):
+        text = payload["text"]
+    elif isinstance(payload.get("markdown"), str):
+        text = payload["markdown"]
+    elif isinstance(payload.get("pages"), list):
+        text = "\n\n".join(
+            page.get("content") or page.get("text") or ""
+            for page in payload["pages"]
+            if isinstance(page, dict)
+        )
+    sections = []
+    for idx, block in enumerate(text.split("\n\n"), start=1):
+        value = block.strip()
+        if not value:
+            continue
+        sections.append({"id": f"S{idx}", "heading": "", "content": value})
+    return {
+        "raw": payload,
+        "text": text.strip(),
+        "sections": sections,
+    }
+
+
+def build_metadata_extraction_prompt(extracted_text: str, filename: str = "") -> str:
+    sample = extracted_text[:40000]
+    return f"""
+You are extracting bibliographic metadata from an academic paper PDF.
+Return one JSON object only.
+
+Rules:
+- Use the PDF text as the primary source.
+- If unsure, use empty string.
+- authors must be an array of author names.
+- year should be a 4-digit year string if available.
+- doi should be normalized and not include https://doi.org/.
+
+Required schema:
+{{
+  "title": "",
+  "authors": [""],
+  "venue": "",
+  "year": "",
+  "doi": "",
+  "abstract": ""
+}}
+
+File name: {filename}
+
+PDF extracted text:
+{sample}
+""".strip()
+
+
+def moonshot_extract_metadata(extracted_text: str, filename: str = "") -> dict:
+    session = moonshot_session()
+    payload = {
+        "model": MOONSHOT_ANALYSIS_MODEL,
+        "messages": [
+            {"role": "system", "content": "You extract academic paper metadata and return strict JSON only."},
+            {"role": "user", "content": build_metadata_extraction_prompt(extracted_text, filename)},
+        ],
+        "temperature": 0.1,
+    }
+    resp = session.post(
+        f"{MOONSHOT_BASE_URL}/chat/completions",
+        headers={**moonshot_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    meta = extract_json_object(content)
+    authors = meta.get("authors") or []
+    if isinstance(authors, str):
+        authors = split_authors(authors)
+    elif isinstance(authors, list):
+        authors = [" ".join(str(item).strip().split()) for item in authors if str(item).strip()]
+    else:
+        authors = []
+    return {
+        "title": " ".join(str(meta.get("title") or "").split()),
+        "authors": authors,
+        "venue": " ".join(str(meta.get("venue") or "").split()),
+        "year": str(meta.get("year") or "").strip(),
+        "doi": normalize_doi(str(meta.get("doi") or "").strip()),
+        "abstract": " ".join(str(meta.get("abstract") or "").split()),
+    }
+
+
+def build_single_call_prompt(paper: dict, extracted_text: str) -> str:
+    sample = extracted_text[:120000]
+    return f"""
+You are reading an academic paper PDF and must produce a single JSON object only.
+
+Fill these top-level keys exactly:
+- overview
+- problem
+- method
+- results
+- critique
+
+Rules:
+- Output valid JSON only. No markdown fences.
+- Keep field names exactly as requested.
+- Use concise but information-dense academic summaries.
+- If evidence is missing, use empty string or empty array rather than inventing details.
+- Base every field on the provided PDF text.
+
+Paper metadata:
+title: {paper.get('title') or ''}
+authors: {', '.join(paper.get('authors') or [])}
+venue: {paper.get('venue') or ''}
+year: {paper.get('year') or ''}
+doi: {paper.get('doi') or ''}
+
+Required schema:
+{{
+  "overview": {{
+    "paper_type": "",
+    "research_theme": "",
+    "core_problem": "",
+    "core_approach": "",
+    "contributions": ["", ""]
+  }},
+  "problem": {{
+    "background": "",
+    "gap": "",
+    "importance": "",
+    "research_goal": "",
+    "paper_logic": [
+      {{"step": 1, "label": "Problem", "content": ""}},
+      {{"step": 2, "label": "Approach", "content": ""}},
+      {{"step": 3, "label": "Evaluation", "content": ""}},
+      {{"step": 4, "label": "Findings", "content": ""}},
+      {{"step": 5, "label": "Implications", "content": ""}}
+    ]
+  }},
+  "method": {{
+    "object_of_study": "",
+    "method_goal": "",
+    "pipeline": ["", ""],
+    "design_choices": [
+      {{"choice": "", "why_it_matters": ""}}
+    ],
+    "participants_or_data": "",
+    "evaluation_setup": "",
+    "analysis_method": ""
+  }},
+  "results": {{
+    "findings": [
+      {{"id": "F1", "claim": "", "evidence": "", "figure_refs": [], "support_level": ""}}
+    ],
+    "key_figures": [
+      {{"figure_id": "", "title": "", "what_it_shows": "", "why_it_matters": ""}}
+    ],
+    "author_claims": [""],
+    "claim_evidence_match": ""
+  }},
+  "critique": {{
+    "strengths": [""],
+    "limitations": [""],
+    "hidden_assumptions": [""],
+    "weak_points": [""],
+    "future_directions": [""],
+    "research_positioning": ""
+  }}
+}}
+
+PDF extracted text:
+{sample}
+""".strip()
+
+
+def extract_json_object(text: str) -> dict:
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("模型未返回内容")
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+    raise ValueError("模型返回不是合法 JSON")
+
+
+def moonshot_generate_analysis(paper: dict, extracted_text: str) -> dict:
+    session = moonshot_session()
+    payload = {
+        "model": MOONSHOT_ANALYSIS_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a precise academic reading assistant that outputs strict JSON."},
+            {"role": "user", "content": build_single_call_prompt(paper, extracted_text)},
+        ],
+        "temperature": 0.2,
+    }
+    resp = session.post(
+        f"{MOONSHOT_BASE_URL}/chat/completions",
+        headers={**moonshot_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=240,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    return extract_json_object(content)
+
+
+def coerce_analysis_result(result: dict, paper_id: str) -> dict:
+    now = utc_now()
+    modules = {}
+    for name in ("overview", "problem", "method", "results", "critique"):
+        modules[name] = {
+            "status": "completed",
+            "version": 1,
+            "generated_at": now,
+            "data": result.get(name) or {},
+        }
+    return {
+        "paper_id": paper_id,
+        "schema_version": "1.0.0",
+        "analysis_version": 1,
+        "pipeline_mode": "1_call",
+        "modules": modules,
+        "calls": [
+            {
+                "call_id": "call_01",
+                "module": "all_modules",
+                "status": "completed",
+                "started_at": None,
+                "ended_at": now,
+                "model": MOONSHOT_ANALYSIS_MODEL,
+                "input_scope": ["full_pdf"],
+                "output_version": 1,
+            }
+        ],
+        "updated_at": now,
+    }
+
+
+def analyze_reading_paper(paper_id: str):
+    bundle = load_reading_bundle(paper_id)
+    if not bundle:
+        raise ValueError("阅读工作区不存在")
+    paper = bundle["paper"]
+    workspace = bundle["workspace"]
+    paper_json_path = workspace / "paper.json"
+    analysis_json_path = workspace / "analysis.json"
+    pdf_rel = ((paper.get("pdf") or {}).get("file_path") or "").lstrip("/")
+    if not pdf_rel:
+        raise ValueError("该阅读工作区缺少 PDF 链接")
+    pdf_abs = DATA_DIR / pdf_rel
+    if not pdf_abs.exists():
+        raise ValueError("该阅读工作区缺少可访问的 PDF 文件")
+
+    update_paper_status(paper_json_path, ingestion="processing", analysis="in_progress")
+    try:
+        file_meta = moonshot_upload_pdf(pdf_abs)
+        file_id = file_meta.get("id") or file_meta.get("file_id") or ""
+        if not file_id:
+            raise ValueError("Moonshot files 接口未返回 file id")
+        raw_content = moonshot_get_file_content(file_id)
+        normalized = normalize_full_text_payload(raw_content)
+
+        source_dir = workspace / "source"
+        full_text_json = source_dir / "full_text.json"
+        sections_json = source_dir / "sections.json"
+        write_json_file(full_text_json, {"file": file_meta, "content": normalized["raw"], "text": normalized["text"]})
+        write_json_file(sections_json, {"sections": normalized["sections"]})
+
+        result = moonshot_generate_analysis(paper, normalized["text"])
+        final_analysis = coerce_analysis_result(result, paper_id)
+        write_json_file(analysis_json_path, final_analysis)
+        update_paper_status(paper_json_path, ingestion="completed", analysis="completed")
+        return final_analysis
+    except Exception:
+        update_paper_status(paper_json_path, ingestion="completed", analysis="failed")
+        raise
 
 
 def reconstruct_abstract(inverted_index: dict | None) -> str:
@@ -875,7 +1727,7 @@ def build_timeline_html():
         </div>
         <div class="hero-links">
           <a href="/keywords">Keywords</a>
-          <a href="/library">Citation 库</a>
+          <a href="/reading">深度阅读</a>
           <button id="logout-btn" type="button">退出登录</button>
         </div>
       </div>
@@ -982,7 +1834,7 @@ def build_keywords_html():
         </div>
         <div class="actions">
           <a href="/">返回时间线</a>
-          <a href="/library">Citation 库</a>
+          <a href="/reading">深度阅读</a>
         </div>
       </div>
     </section>
@@ -997,6 +1849,8 @@ def build_keyword_detail_html(keyword: str):
     if not entry:
         return build_keywords_html()
     cards = []
+    all_groups = list_reading_groups()
+    group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
     payload_json = json.dumps(entry["papers"], ensure_ascii=False).replace("</script>", "<\\/script>")
     for idx, paper in enumerate(entry["papers"], start=1):
         meta_parts = [
@@ -1016,9 +1870,20 @@ def build_keyword_detail_html(keyword: str):
               <div class="meta">{escape(meta_text)}</div>
               <div class="meta">{doi_text}</div>
               <p>{escape(paper.get('content') or '暂无内容')}</p>
+              <div class="group-select-row" style="margin:12px 0;">
+                <label>选择 Reading Group（可选）:</label>
+                <select id="group-select-{idx}" style="margin-left:8px; padding:6px; border-radius:8px; border:1px solid #d5cbba;">
+                  <option value="">-- 不选择 --</option>
+                  {group_options}
+                </select>
+              </div>
+              <div class="pdf-upload-row" style="margin:12px 0;">
+                <label>上传 PDF（可选）:</label>
+                <input type="file" id="pdf-input-{idx}" accept=".pdf" style="margin-left:8px;">
+              </div>
               <div class="links">
                 {link_html}
-                <button class="action" type="button" onclick="addKeywordCitation({idx})">加入 Citation 库</button>
+                <button class="action" type="button" onclick="addKeywordCitation({idx})">加入深度阅读</button>
                 <button class="action secondary" type="button" onclick="expandKeywordPaper({idx})">扩展搜索</button>
               </div>
             </article>
@@ -1089,6 +1954,99 @@ def build_keyword_detail_html(keyword: str):
   <script id="keyword-papers" type="application/json">{payload_json}</script>
   <script>
     const keywordPapers = JSON.parse(document.getElementById('keyword-papers').textContent);
+    let readingGroups = [];
+
+    function escapeHtml(value) {{
+      return (value || '').toString()
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }}
+
+    function ensureCitationDialog() {{
+      let dialog = document.getElementById('citation-dialog');
+      if (dialog) return dialog;
+      dialog = document.createElement('dialog');
+      dialog.id = 'citation-dialog';
+      dialog.style.maxWidth = '560px';
+      dialog.style.width = 'calc(100vw - 24px)';
+      dialog.style.border = '1px solid #d5cbba';
+      dialog.style.borderRadius = '18px';
+      dialog.style.padding = '0';
+      dialog.innerHTML = `
+        <form method="dialog" id="citation-form" style="padding:20px;">
+          <h3 style="margin:0 0 12px; font-size:24px;">加入深度阅读</h3>
+          <div id="citation-dialog-title" style="color:#6f685c; line-height:1.6; margin-bottom:14px;"></div>
+          <label style="display:block; margin-bottom:10px;">
+            <div style="margin-bottom:6px; color:#6f685c;">Reading Group</div>
+            <select id="citation-group-select" style="width:100%; padding:10px 12px; border-radius:12px; border:1px solid #d5cbba;">
+              <option value="">暂不加入 Group</option>
+            </select>
+          </label>
+          <label style="display:block; margin-bottom:14px;">
+            <div style="margin-bottom:6px; color:#6f685c;">上传 PDF（可选）</div>
+            <input id="citation-pdf-input" type="file" accept="application/pdf,.pdf" style="width:100%;">
+          </label>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button id="citation-submit" type="submit" value="submit" style="border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">保存</button>
+            <button type="submit" value="cancel" style="border:none; background:#6f6455; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">取消</button>
+          </div>
+        </form>
+      `;
+      document.body.appendChild(dialog);
+      return dialog;
+    }}
+
+    async function loadReadingGroups() {{
+      const resp = await fetch('/api/reading-groups', {{ credentials: 'same-origin' }});
+      const data = await resp.json().catch(() => ({{ ok: false, groups: [] }}));
+      readingGroups = data.ok ? (data.groups || []) : [];
+    }}
+
+    async function submitCitation(searchSlug, paper) {{
+      const dialog = ensureCitationDialog();
+      document.getElementById('citation-dialog-title').textContent = paper.title || '';
+      const select = document.getElementById('citation-group-select');
+      const fileInput = document.getElementById('citation-pdf-input');
+      select.innerHTML = '<option value="">暂不加入 Group</option>' + readingGroups.map(
+        (group) => `<option value="${{group.id}}">${{escapeHtml(group.name)}}</option>`
+      ).join('');
+      fileInput.value = '';
+      const result = await new Promise((resolve) => {{
+        const form = document.getElementById('citation-form');
+        const handler = async (event) => {{
+          event.preventDefault();
+          const submitterValue = event.submitter && event.submitter.value;
+          form.removeEventListener('submit', handler);
+          if (submitterValue !== 'submit') {{
+            dialog.close();
+            resolve(null);
+            return;
+          }}
+          const formData = new FormData();
+          formData.append('search_slug', searchSlug || '');
+          formData.append('paper', JSON.stringify(paper));
+          if (select.value) formData.append('group_id', select.value);
+          if (fileInput.files[0]) formData.append('pdf', fileInput.files[0]);
+          const resp = await fetch('/api/citations', {{
+            method: 'POST',
+            credentials: 'same-origin',
+            body: formData
+          }});
+          const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+          dialog.close();
+          if (!resp.ok || data.ok === false) {{
+            resolve({{ error: data.error || '请求失败' }});
+            return;
+          }}
+          resolve(data);
+        }};
+        form.addEventListener('submit', handler);
+        dialog.showModal();
+      }});
+      return result;
+    }}
 
     async function apiPost(path, body) {{
       const resp = await fetch(path, {{
@@ -1108,11 +2066,16 @@ def build_keyword_detail_html(keyword: str):
       const paper = keywordPapers[index - 1];
       if (!paper) return;
       try {{
-        const data = await apiPost('/api/citations', {{
-          search_slug: paper.source_slug || '',
-          paper
-        }});
-        alert(data.message || '已加入 Citation 库。');
+        if (!readingGroups.length) {{
+          await loadReadingGroups();
+        }}
+        const data = await submitCitation(paper.source_slug || '', paper);
+        if (!data) return;
+        if (data.error) throw new Error(data.error);
+        if (data.reading_url) {{
+          window.open(data.reading_url, '_blank', 'noopener');
+        }}
+        alert(data.message || '已加入深度阅读。');
       }} catch (error) {{
         alert(error.message);
       }}
@@ -1134,6 +2097,7 @@ def build_keyword_detail_html(keyword: str):
 
     window.addKeywordCitation = addKeywordCitation;
     window.expandKeywordPaper = expandKeywordPaper;
+    loadReadingGroups().catch(() => {{}});
   </script>
 </body>
 </html>"""
@@ -1173,7 +2137,7 @@ def build_login_html(error: str = ""):
 <body>
   <form class="card" method="post" action="/api/auth/login">
     <h1>Private Site</h1>
-    <p>这个站点需要密码才能访问搜索结果、Citation 库和扩展引用功能。</p>
+    <p>这个站点需要密码才能访问搜索结果、深度阅读模块和扩展引用功能。</p>
     <input name="password" type="password" placeholder="输入站点密码" autocomplete="current-password" required>
     <button type="submit">登录</button>
     {error_html}
@@ -1182,8 +2146,139 @@ def build_login_html(error: str = ""):
 </html>"""
 
 
+def build_reading_detail_html(paper_id: str):
+    bundle = load_reading_bundle(paper_id)
+    if not bundle:
+        return "<!doctype html><html lang='zh-CN'><body><h1>未找到阅读页</h1></body></html>"
+    paper = bundle["paper"]
+    analysis = bundle["analysis"]
+    modules = analysis.get("modules") or {}
+    overview = (modules.get("overview") or {}).get("data") or {}
+    problem = (modules.get("problem") or {}).get("data") or {}
+    method = (modules.get("method") or {}).get("data") or {}
+    results = (modules.get("results") or {}).get("data") or {}
+    critique = (modules.get("critique") or {}).get("data") or {}
+
+    def render_list(items, empty="等待分析生成"):
+        values = items or []
+        return "".join(f"<li>{escape(str(item))}</li>" for item in values) or f"<li>{empty}</li>"
+
+    logic = "".join(
+        f"<li><strong>{escape(str(item.get('step', '')))}. {escape(item.get('label') or '')}</strong><div>{escape(item.get('content') or '')}</div></li>"
+        for item in (problem.get("paper_logic") or [])
+    ) or "<li>等待分析生成</li>"
+    findings = "".join(
+        f"<li><strong>{escape(item.get('id') or '')}</strong> {escape(item.get('claim') or '')}<div>{escape(item.get('evidence') or '')}</div></li>"
+        for item in (results.get("findings") or [])
+    ) or "<li>等待分析生成</li>"
+    pdf_path = ((paper.get("pdf") or {}).get("file_path") or "").strip()
+    pdf_link = f'<a href="{escape(pdf_path)}" target="_blank" rel="noreferrer">打开 PDF</a>' if pdf_path else ""
+    analysis_status = ((paper.get("status") or {}).get("analysis") or "pending").strip()
+    analyze_label = "重新分析" if analysis_status == "completed" else "开始分析"
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(paper.get("title") or "Deep Reading")}</title>
+  <style>
+    body {{ margin:0; font-family: Georgia, "Noto Serif SC", serif; background:#f3efe7; color:#1f1c18; }}
+    .wrap {{ max-width:1080px; margin:0 auto; padding:28px 18px 72px; }}
+    .hero, .section {{ border:1px solid #d5cbba; border-radius:24px; background:rgba(255,251,244,0.96); box-shadow:0 18px 40px rgba(76,50,28,0.08); }}
+    .hero {{ padding:28px; margin-bottom:18px; }}
+    .section {{ padding:22px; margin-top:16px; }}
+    .actions, .meta, .grid {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    .actions a {{ display:inline-block; background:#9c4f2f; color:white; text-decoration:none; padding:10px 14px; border-radius:999px; }}
+    .meta {{ color:#6f685c; line-height:1.8; font-size:14px; margin-top:8px; }}
+    .grid.cards {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }}
+    .card {{ border:1px solid #e3d8c8; border-radius:18px; padding:14px; background:#fffdfa; }}
+    .cols {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
+    h1 {{ margin:0 0 8px; font-size:42px; line-height:1.1; }}
+    h2 {{ margin:0 0 10px; font-size:28px; }}
+    h3 {{ margin:0 0 8px; font-size:20px; }}
+    p, li {{ line-height:1.8; }}
+    ul {{ margin:0; padding-left:20px; }}
+    @media (max-width: 720px) {{ .cols {{ grid-template-columns:1fr; }} .actions a {{ width:100%; text-align:center; }} h1 {{ font-size:32px; }} }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <div class="actions"><a href="/reading">返回深度阅读</a>{pdf_link}<a href="#" id="run-analysis">{analyze_label}</a></div>
+      <h1>{escape(paper.get("title") or "Untitled Paper")}</h1>
+      <div class="meta">{escape(", ".join(paper.get("authors") or []) or "未知作者")} · {escape(str(paper.get("venue") or "未知 venue"))} · {escape(str(paper.get("year") or "未知年份"))}</div>
+      <div class="meta">Theme: {escape(overview.get("research_theme") or "待生成")} · DOI: {escape(paper.get("doi") or "无")} · Analysis: {escape(analysis_status)}</div>
+    </section>
+    <section class="section">
+      <h2>Overview</h2>
+      <div class="grid cards">
+        <div class="card"><h3>Paper Type</h3><p>{escape(overview.get("paper_type") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Core Problem</h3><p>{escape(overview.get("core_problem") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Core Approach</h3><p>{escape(overview.get("core_approach") or "等待分析生成")}</p></div>
+      </div>
+      <div class="card" style="margin-top:12px;"><h3>Contributions</h3><ul>{render_list(overview.get("contributions"))}</ul></div>
+    </section>
+    <section class="section">
+      <h2>Problem</h2>
+      <div class="grid cards">
+        <div class="card"><h3>Background</h3><p>{escape(problem.get("background") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Gap</h3><p>{escape(problem.get("gap") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Importance</h3><p>{escape(problem.get("importance") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Goal</h3><p>{escape(problem.get("research_goal") or "等待分析生成")}</p></div>
+      </div>
+      <div class="card" style="margin-top:12px;"><h3>Paper Logic</h3><ul>{logic}</ul></div>
+    </section>
+    <section class="section">
+      <h2>Method</h2>
+      <div class="grid cards">
+        <div class="card"><h3>Object</h3><p>{escape(method.get("object_of_study") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Method Goal</h3><p>{escape(method.get("method_goal") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Participants / Data</h3><p>{escape(method.get("participants_or_data") or "等待分析生成")}</p></div>
+        <div class="card"><h3>Evaluation</h3><p>{escape(method.get("evaluation_setup") or "等待分析生成")}</p></div>
+      </div>
+      <div class="card" style="margin-top:12px;"><h3>Pipeline</h3><ul>{render_list(method.get("pipeline"))}</ul></div>
+    </section>
+    <section class="section">
+      <h2>Results</h2>
+      <div class="card"><h3>Claim-Evidence Match</h3><p>{escape(results.get("claim_evidence_match") or "等待分析生成")}</p></div>
+      <div class="card" style="margin-top:12px;"><h3>Findings</h3><ul>{findings}</ul></div>
+    </section>
+    <section class="section">
+      <h2>Critique</h2>
+      <div class="cols">
+        <div class="card"><h3>Strengths</h3><ul>{render_list(critique.get("strengths"))}</ul></div>
+        <div class="card"><h3>Limitations</h3><ul>{render_list(critique.get("limitations"))}</ul></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const runBtn = document.getElementById('run-analysis');
+    if (runBtn) {{
+      runBtn.addEventListener('click', async (event) => {{
+        event.preventDefault();
+        runBtn.textContent = '分析中...';
+        const resp = await fetch('/api/reading/{paper_id}/analyze', {{
+          method: 'POST',
+          credentials: 'same-origin'
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'分析失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '分析失败');
+          runBtn.textContent = '{analyze_label}';
+          return;
+        }}
+        window.location.reload();
+      }});
+    }}
+  </script>
+</body>
+</html>"""
+
+
 def build_library_html():
     items = list_citations()
+    all_groups = list_reading_groups()
     all_tags = []
     seen_tags = set()
     for item in items:
@@ -1197,15 +2292,33 @@ def build_library_html():
         f'<button class="tag" type="button" data-filter="{tag.lower()}">{tag}</button>'
         for tag in all_tags
     )
+    group_filter_html = "".join(
+        f'<button class="tag" type="button" data-group-filter="{g["id"]}">{escape(g["name"])}</button>'
+        for g in all_groups
+    )
+    upload_group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
     cards = []
     for item in items:
         doi_text = f"DOI: {item['doi']}" if item.get("doi") else "无 DOI"
         url_html = f'<a href="{item["url"]}" target="_blank" rel="noreferrer">原文链接</a>' if item.get("url") else ""
+        has_pdf = citation_has_pdf(item)
+        reading_ready = bool(item.get("reading_paper_id")) and reading_json_ready(item.get("reading_paper_id"))
+        if has_pdf:
+            reading_label = "打开深度阅读" if reading_ready else "生成深度阅读"
+            reading_button = f'<button class="deep-reading-link" type="button" data-id="{item["id"]}" data-paper-id="{item.get("reading_paper_id") or ""}" data-ready="{str(reading_ready).lower()}">{reading_label}</button>'
+            reading_hint = ""
+        else:
+            reading_button = ""
+            reading_hint = "上传 PDF 后可进入深度阅读"
+        groups = get_citation_groups(item["id"])
+        group_badges = "".join(f'<span class="group-badge" data-group-id="{g["id"]}">{g["name"]}</span>' for g in groups) or '<span class="muted">未加入任何 Group</span>'
+        group_ids = ",".join(str(g["id"]) for g in groups)
+        group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
         tags = [part.strip() for part in (item.get("tags") or "").split(",") if part.strip()]
         tag_badges = "".join(f'<button class="tag" type="button" data-filter-tag="{tag}">{tag}</button>' for tag in tags) or '<span class="muted">无 tags</span>'
         cards.append(
             f"""
-            <article class="card" data-tags="{(item.get("tags") or "").lower()}">
+            <article class="card" data-tags="{(item.get("tags") or "").lower()}" data-group-ids="{group_ids}" data-citation-id="{item["id"]}">
               <div class="checkrow">
                 <label class="checklabel">
                   <input class="cite-check" type="checkbox" value="{item["id"]}">
@@ -1216,23 +2329,39 @@ def build_library_html():
               <h2>{item["title"]}</h2>
               <div class="meta">{item.get("authors") or "未知作者"} · {item.get("venue") or "未知 venue"} · {item.get("year") or "未知年份"}</div>
               <div class="meta">{doi_text} · 来自搜索：{item.get("source_search_slug") or "未知"}</div>
+              <div class="group-row"><strong>Groups: </strong>{group_badges}</div>
+              <div class="group-editor" style="display:flex; gap:8px; flex-wrap:wrap; margin:10px 0;">
+                <select class="group-select" style="flex:1; padding:8px; border-radius:10px; border:1px solid #d5cbba;">
+                  <option value="">选择 Group...</option>
+                  {group_options}
+                </select>
+                <button class="add-to-group" type="button" data-id="{item["id"]}" style="padding:8px 14px; border-radius:10px;">加入</button>
+                <button class="remove-from-group" type="button" data-id="{item["id"]}" style="padding:8px 14px; border-radius:10px; background:#6f6455;">移出</button>
+              </div>
               <div class="tag-row">{tag_badges}</div>
               <div class="tag-editor">
                 <input class="tag-input" type="text" value="{item.get("tags") or ''}" placeholder="输入 tags，逗号分隔">
                 <button class="save-tag" type="button" data-id="{item["id"]}">保存 tags</button>
               </div>
               <p>{item.get("abstract") or "暂无摘要"}</p>
-              <div class="links">{url_html}</div>
+              <div class="links">
+                {url_html}
+                <button class="upload-pdf-link" type="button" data-id="{item["id"]}">上传 PDF</button>
+                <input class="upload-pdf-input" type="file" accept="application/pdf,.pdf" style="display:none;">
+                {reading_button}
+                <button class="remove-reading-link" type="button" data-id="{item["id"]}">移出深度阅读</button>
+                <span class="muted">{reading_hint}</span>
+              </div>
             </article>
             """
         )
-    body = "\n".join(cards) if cards else '<div class="empty">Citation 库还是空的，先去搜索结果页加入几篇吧。</div>'
+    body = "\n".join(cards) if cards else '<div class="empty">深度阅读模块还是空的，先去搜索结果页加入几篇，或直接上传 PDF 吧。</div>'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Citation Library</title>
+  <title>Deep Reading</title>
   <style>
     body {{ margin:0; font-family: Georgia, "Noto Serif SC", serif; background:#f2efe8; color:#1e1d1a; }}
     .wrap {{ max-width:1020px; margin:0 auto; padding:28px 18px 72px; }}
@@ -1257,6 +2386,8 @@ def build_library_html():
     .filters .tag.active {{ background:#9c4f2f; color:white; }}
     .tag-row {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }}
     .tag-editor {{ display:flex; gap:10px; flex-wrap:wrap; margin:12px 0; }}
+    .group-row {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; align-items:center; }}
+    .group-badge {{ background:#c8e6c9; color:#2e7d32; padding:4px 10px; border-radius:999px; font-size:13px; }}
     .tag-editor input {{
       flex:1 1 280px; padding:10px 12px; border-radius:14px; border:1px solid #d5cbba; font:inherit;
     }}
@@ -1285,15 +2416,38 @@ def build_library_html():
     <section class="hero">
       <div class="row">
         <div>
-          <h1>Citation 库</h1>
-          <div class="muted">这里保存你从搜索页手动加入的论文。当前共 {len(items)} 篇。</div>
+          <h1>深度阅读</h1>
+          <div class="muted">这里保存文献、PDF 与深度阅读入口。你可以从搜索页加入时上传 PDF，也可以在这里上传 PDF 并由系统创建或匹配到数据库文献。当前共 {len(items)} 篇。</div>
           <div class="actions">
             <button id="select-all" type="button">全选 / 取消</button>
             <button id="export-json" type="button">导出所选 JSON</button>
+            <button id="manage-groups" type="button">管理 Reading Groups</button>
+          </div>
+          <div id="reading-upload" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#faf8f5;">
+            <div style="grid-column:1 / -1; color:#6f685c; font-size:14px;">上传 PDF 后会自动识别标题、作者、Venue、年份与 DOI，并创建或匹配到现有文献。</div>
+            <select id="reading-group">
+              <option value="">暂不加入 Group</option>
+              {upload_group_options}
+            </select>
+            <input type="file" id="reading-pdf" accept="application/pdf,.pdf">
+            <button id="reading-upload-btn" type="button">上传并生成阅读页</button>
+          </div>
+          <div id="group-management" style="display:none; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#faf8f5;">
+            <div style="font-weight:600; margin-bottom:8px;">Reading Groups</div>
+            <div id="group-list" style="margin-bottom:10px;"></div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <input type="text" id="new-group-name" placeholder="新 Group 名称" style="flex:1; padding:8px 12px; border-radius:10px; border:1px solid #d5cbba;">
+              <input type="text" id="new-group-desc" placeholder="描述（可选）" style="flex:2; padding:8px 12px; border-radius:10px; border:1px solid #d5cbba;">
+              <button id="create-group" type="button" style="padding:8px 14px; border-radius:10px;">创建</button>
+            </div>
           </div>
           <div class="filters">
             <button class="tag active" type="button" data-filter="all">全部</button>
             {filter_html}
+          </div>
+          <div class="filters" style="margin-top:10px;">
+            <button class="tag active" type="button" data-group-filter="all">全部 Group</button>
+            {group_filter_html}
           </div>
         </div>
         <a href="/">返回时间线</a>
@@ -1307,6 +2461,8 @@ def build_library_html():
     const checks = () => Array.from(document.querySelectorAll('.cite-check'));
     const cards = () => Array.from(document.querySelectorAll('.card'));
     const filterButtons = () => Array.from(document.querySelectorAll('[data-filter]'));
+    const groupFilterButtons = () => Array.from(document.querySelectorAll('[data-group-filter]'));
+    let activeGroupFilter = 'all';
 
     if (selectAllBtn) {{
       selectAllBtn.addEventListener('click', () => {{
@@ -1354,7 +2510,26 @@ def build_library_html():
         filterButtons().forEach((item) => item.classList.toggle('active', item === btn));
         cards().forEach((card) => {{
           const tags = card.dataset.tags || '';
-          const visible = filter === 'all' || tags.split(',').map((x) => x.trim()).includes(filter);
+          const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
+          const tagVisible = filter === 'all' || tags.split(',').map((x) => x.trim()).includes(filter);
+          const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
+          const visible = tagVisible && groupVisible;
+          card.style.display = visible ? '' : 'none';
+        }});
+      }});
+    }});
+
+    groupFilterButtons().forEach((btn) => {{
+      btn.addEventListener('click', () => {{
+        activeGroupFilter = btn.dataset.groupFilter || 'all';
+        groupFilterButtons().forEach((item) => item.classList.toggle('active', item === btn));
+        const activeTag = (filterButtons().find((item) => item.classList.contains('active')) || {{ dataset: {{ filter: 'all' }} }}).dataset.filter || 'all';
+        cards().forEach((card) => {{
+          const tags = card.dataset.tags || '';
+          const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
+          const tagVisible = activeTag === 'all' || tags.split(',').map((x) => x.trim()).includes(activeTag);
+          const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
+          const visible = tagVisible && groupVisible;
           card.style.display = visible ? '' : 'none';
         }});
       }});
@@ -1388,6 +2563,190 @@ def build_library_html():
         window.location.reload();
       }});
     }});
+
+    // Group management
+    const manageGroupsBtn = document.getElementById('manage-groups');
+    const groupManagementDiv = document.getElementById('group-management');
+    const groupListDiv = document.getElementById('group-list');
+    const createGroupBtn = document.getElementById('create-group');
+    const newGroupNameInput = document.getElementById('new-group-name');
+    const newGroupDescInput = document.getElementById('new-group-desc');
+    const readingUploadBtn = document.getElementById('reading-upload-btn');
+
+    async function loadGroups() {{
+      const resp = await fetch('/api/reading-groups', {{ credentials: 'same-origin' }});
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data.ok) return;
+      let html = '';
+      data.groups.forEach(g => {{
+        html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid #e0e0e0;">
+          <span><strong>${{g.name}}</strong>${{g.description ? ' - ' + g.description : ''}}</span>
+          <button class="delete-group" data-id="${{g.id}}" style="padding:4px 10px; border-radius:8px; font-size:12px; background:#c62828;">删除</button>
+        </div>`;
+      }});
+      groupListDiv.innerHTML = html || '<span class="muted">暂无 Groups</span>';
+      document.querySelectorAll('.delete-group').forEach(btn => {{
+        btn.addEventListener('click', async () => {{
+          const id = btn.dataset.id;
+          if (!confirm('确定删除此 Group？其中的文章不会被删除。')) return;
+          const resp = await fetch('/api/reading-groups/' + id, {{ method: 'DELETE', credentials: 'same-origin' }});
+          if (resp.ok) loadGroups();
+        }});
+      }});
+    }}
+
+    if (manageGroupsBtn) {{
+      manageGroupsBtn.addEventListener('click', () => {{
+        const visible = groupManagementDiv.style.display !== 'none';
+        groupManagementDiv.style.display = visible ? 'none' : 'block';
+        if (!visible) loadGroups();
+      }});
+    }}
+
+    if (createGroupBtn) {{
+      createGroupBtn.addEventListener('click', async () => {{
+        const name = newGroupNameInput.value.trim();
+        const description = newGroupDescInput.value.trim();
+        if (!name) {{ alert('请输入 Group 名称'); return; }}
+        const resp = await fetch('/api/reading-groups', {{
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ name, description }})
+        }});
+        if (resp.ok) {{
+          newGroupNameInput.value = '';
+          newGroupDescInput.value = '';
+          loadGroups();
+          window.location.reload();
+        }}
+      }});
+    }}
+
+    // Add/remove citation from group
+    document.querySelectorAll('.add-to-group').forEach(btn => {{
+      btn.addEventListener('click', async () => {{
+        const card = btn.closest('.card');
+        const select = card.querySelector('.group-select');
+        const groupId = select.value;
+        if (!groupId) {{ alert('请选择 Group'); return; }}
+        const citationId = btn.dataset.id;
+        const resp = await fetch('/api/citations/' + citationId + '/groups/' + groupId, {{
+          method: 'POST', credentials: 'same-origin'
+        }});
+        if (resp.ok) window.location.reload();
+      }});
+    }});
+
+    document.querySelectorAll('.remove-from-group').forEach(btn => {{
+      btn.addEventListener('click', async () => {{
+        const card = btn.closest('.card');
+        const select = card.querySelector('.group-select');
+        const groupId = select.value;
+        if (!groupId) {{ alert('请选择 Group'); return; }}
+        const citationId = btn.dataset.id;
+        const resp = await fetch('/api/citations/' + citationId + '/groups/' + groupId, {{
+          method: 'DELETE', credentials: 'same-origin'
+        }});
+        if (resp.ok) window.location.reload();
+      }});
+    }});
+
+    document.querySelectorAll('.upload-pdf-link').forEach((btn) => {{
+      btn.addEventListener('click', () => {{
+        const card = btn.closest('.card');
+        const input = card.querySelector('.upload-pdf-input');
+        if (input) input.click();
+      }});
+    }});
+
+    document.querySelectorAll('.upload-pdf-input').forEach((input) => {{
+      input.addEventListener('change', async () => {{
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const card = input.closest('.card');
+        const citationId = card.dataset.citationId;
+        const formData = new FormData();
+        formData.append('pdf', file);
+        const resp = await fetch('/api/citations/' + citationId + '/pdf', {{
+          method: 'POST',
+          credentials: 'same-origin',
+          body: formData
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'上传失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '上传失败');
+          input.value = '';
+          return;
+        }}
+        window.location.reload();
+      }});
+    }});
+
+    document.querySelectorAll('.deep-reading-link').forEach((btn) => {{
+      btn.addEventListener('click', async () => {{
+        const ready = (btn.dataset.ready || '') === 'true';
+        const paperId = btn.dataset.paperId || '';
+        if (ready && paperId) {{
+          window.location.href = '/reading/' + encodeURIComponent(paperId);
+          return;
+        }}
+        const citationId = btn.dataset.id;
+        const resp = await fetch('/api/citations/' + citationId + '/reading', {{
+          method: 'POST',
+          credentials: 'same-origin'
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'生成失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '生成失败');
+          return;
+        }}
+        window.location.href = data.reading_url;
+      }});
+    }});
+
+    document.querySelectorAll('.remove-reading-link').forEach((btn) => {{
+      btn.addEventListener('click', async () => {{
+        const citationId = btn.dataset.id;
+        if (!confirm('确定将该文献移出深度阅读吗？不会删除文献记录本身。')) return;
+        const resp = await fetch('/api/citations/' + citationId + '/reading', {{
+          method: 'DELETE',
+          credentials: 'same-origin'
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'移除失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '移除失败');
+          return;
+        }}
+        window.location.reload();
+      }});
+    }});
+
+    if (readingUploadBtn) {{
+      readingUploadBtn.addEventListener('click', async () => {{
+        const formData = new FormData();
+        const groupId = document.getElementById('reading-group').value;
+        const pdfFile = document.getElementById('reading-pdf').files[0];
+        if (!pdfFile) {{
+          alert('请先选择 PDF。');
+          return;
+        }}
+        if (groupId) formData.append('group_id', groupId);
+        formData.append('pdf', pdfFile);
+        const resp = await fetch('/api/reading/upload', {{
+          method: 'POST',
+          credentials: 'same-origin',
+          body: formData
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'上传失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '上传失败');
+          return;
+        }}
+        window.location.reload();
+      }});
+    }}
   </script>
 </body>
 </html>"""
@@ -1402,6 +2761,32 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" in content_type:
+            environ = {
+                "REQUEST_METHOD": self.command,
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": str(length),
+            }
+            form = __import__("cgi").FieldStorage(
+                fp=io.BytesIO(raw),
+                headers=self.headers,
+                environ=environ,
+                keep_blank_values=True,
+            )
+            data = {}
+            if getattr(form, "list", None):
+                for field in form.list:
+                    if field.filename:
+                        data[field.name] = field
+                    elif field.name in data:
+                        current = data[field.name]
+                        if isinstance(current, list):
+                            current.append(field.value)
+                        else:
+                            data[field.name] = [current, field.value]
+                    else:
+                        data[field.name] = field.value
+            return data
         if "application/json" in content_type:
             return json.loads(raw.decode("utf-8") or "{}")
         if "application/x-www-form-urlencoded" in content_type:
@@ -1485,12 +2870,26 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_html(build_keyword_detail_html(keyword))
             return
 
-        if self.path == "/library":
+        if self.path in ("/library", "/reading"):
             self.send_html(build_library_html())
             return
 
+        if self.path.startswith("/reading/"):
+            paper_id = unquote(self.path[len("/reading/"):]).strip().strip("/")
+            if paper_id and "/" not in paper_id:
+                bundle = load_reading_bundle(paper_id)
+                if bundle and ((bundle.get("paper") or {}).get("pdf") or {}).get("file_path"):
+                    self.send_html(build_reading_detail_html(paper_id))
+                    return
+                self.send_html("<!doctype html><html lang='zh-CN'><body><h1>该阅读页缺少可访问的 PDF，暂时不能打开。</h1></body></html>", status=404)
+                return
+
         if self.path == "/api/citations":
-            self.send_json({"ok": True, "items": list_citations()})
+            self.send_json({"ok": True, "items": list_citations_with_groups()})
+            return
+
+        if self.path == "/api/reading-groups":
+            self.send_json({"ok": True, "groups": list_reading_groups()})
             return
 
         if self.path == "/api/expansions":
@@ -1544,12 +2943,47 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/citations":
             data = self.parse_body()
             paper = data.get("paper") or {}
+            if isinstance(paper, str):
+                try:
+                    paper = json.loads(paper)
+                except Exception:
+                    paper = {}
             search_slug = (data.get("search_slug") or "").strip()
+            group_id_raw = data.get("group_id")
             if not paper.get("title"):
                 self.send_json({"ok": False, "error": "missing_title"}, status=400)
                 return
-            upsert_citation(paper, search_slug)
-            self.send_json({"ok": True, "message": "已加入 Citation 库。"})
+            try:
+                pdf_path = store_uploaded_pdf(data.get("pdf"), paper.get("title") or "")
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            citation_id = upsert_citation(paper, search_slug, pdf_path=pdf_path or None)
+            reading_url = ""
+            if group_id_raw not in (None, ""):
+                try:
+                    group_id = int(group_id_raw)
+                except Exception:
+                    self.send_json({"ok": False, "error": "group_id 不合法"}, status=400)
+                    return
+                if not reading_group_exists(group_id):
+                    self.send_json({"ok": False, "error": "Reading Group 不存在"}, status=404)
+                    return
+                if citation_id:
+                    add_citation_to_group(citation_id, group_id)
+            if pdf_path and citation_id:
+                reading = ensure_reading_workspace_for_citation(citation_id)
+                analyze_reading_paper(reading["paper_id"])
+                reading_url = reading["reading_url"]
+            self.send_json(
+                {
+                    "ok": True,
+                    "message": "已加入深度阅读。",
+                    "citation_id": citation_id,
+                    "pdf_path": pdf_path or "",
+                    "reading_url": reading_url,
+                }
+            )
             return
 
         if self.path == "/api/citations/export":
@@ -1588,6 +3022,152 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "message": "tags 已更新。"})
             return
 
+        if self.path == "/api/reading-groups":
+            data = self.parse_body()
+            name = (data.get("name") or "").strip()
+            description = (data.get("description") or "").strip()
+            if not name:
+                self.send_json({"ok": False, "error": "Group 名称不能为空"}, status=400)
+                return
+            try:
+                group_id = create_reading_group(name, description)
+            except sqlite3.IntegrityError:
+                self.send_json({"ok": False, "error": "Group 名称已存在"}, status=409)
+                return
+            self.send_json({"ok": True, "group_id": group_id, "message": "Group 已创建。"})
+            return
+
+        if self.path == "/api/reading/upload":
+            data = self.parse_body()
+            try:
+                pdf_path = store_uploaded_pdf(data.get("pdf"), (data.get("title") or "").strip())
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            if not pdf_path:
+                self.send_json({"ok": False, "error": "缺少 PDF 文件"}, status=400)
+                return
+            try:
+                file_meta = moonshot_upload_pdf(DATA_DIR / pdf_path)
+                file_id = file_meta.get("id") or file_meta.get("file_id") or ""
+                if not file_id:
+                    raise ValueError("Moonshot files 接口未返回 file id")
+                raw_content = moonshot_get_file_content(file_id)
+                normalized = normalize_full_text_payload(raw_content)
+                metadata = moonshot_extract_metadata(normalized["text"], Path(pdf_path).name)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"PDF 元信息识别失败: {exc}"}, status=500)
+                return
+            citation, matched = create_or_match_citation_from_metadata(metadata, pdf_path=pdf_path)
+            if not citation:
+                self.send_json({"ok": False, "error": "无法创建文献记录"}, status=500)
+                return
+            group_id_raw = data.get("group_id")
+            if group_id_raw not in (None, ""):
+                try:
+                    add_citation_to_group(int(citation["id"]), int(group_id_raw))
+                except Exception:
+                    pass
+            reading = ensure_reading_workspace_for_citation(int(citation["id"]))
+            analyze_reading_paper(reading["paper_id"])
+            self.send_json(
+                {
+                    "ok": True,
+                    "citation_id": citation["id"],
+                    "matched_existing": matched,
+                    "metadata": metadata,
+                    "reading_url": reading["reading_url"],
+                    "paper_id": reading["paper_id"],
+                }
+            )
+            return
+
+        if self.path.startswith("/api/citations/") and self.path.endswith("/pdf"):
+            data = self.parse_body()
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            try:
+                citation_id = int(parts[2])
+            except Exception:
+                self.send_json({"ok": False, "error": "citation id 不合法"}, status=400)
+                return
+            citation = get_citation_by_id(citation_id)
+            if not citation:
+                self.send_json({"ok": False, "error": "Citation 不存在"}, status=404)
+                return
+            try:
+                pdf_path = store_uploaded_pdf(data.get("pdf"), citation.get("title") or "")
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            if not pdf_path:
+                self.send_json({"ok": False, "error": "缺少 PDF 文件"}, status=400)
+                return
+            update_citation_pdf(citation_id, pdf_path)
+            citation = get_citation_by_id(citation_id)
+            reading_url = ""
+            if citation and citation.get("reading_paper_id"):
+                try:
+                    reading_url = ensure_reading_workspace_for_citation(citation_id)["reading_url"]
+                except Exception:
+                    reading_url = ""
+            self.send_json({"ok": True, "message": "PDF 已绑定到该文献。", "pdf_path": pdf_path, "reading_url": reading_url})
+            return
+
+        if self.path.startswith("/api/citations/") and "/groups/" in self.path:
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            try:
+                citation_id = int(parts[2])
+                group_id = int(parts[4])
+            except Exception:
+                self.send_json({"ok": False, "error": "路径参数不合法"}, status=400)
+                return
+            if not citation_exists(citation_id):
+                self.send_json({"ok": False, "error": "Citation 不存在"}, status=404)
+                return
+            if not reading_group_exists(group_id):
+                self.send_json({"ok": False, "error": "Reading Group 不存在"}, status=404)
+                return
+            add_citation_to_group(citation_id, group_id)
+            self.send_json({"ok": True, "message": "已加入 Group。"})
+            return
+
+        if self.path.startswith("/api/citations/") and self.path.endswith("/reading"):
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            try:
+                citation_id = int(parts[2])
+            except Exception:
+                self.send_json({"ok": False, "error": "citation id 不合法"}, status=400)
+                return
+            if not citation_exists(citation_id):
+                self.send_json({"ok": False, "error": "Citation 不存在"}, status=404)
+                return
+            try:
+                reading = ensure_reading_workspace_for_citation(citation_id)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            try:
+                analyze_reading_paper(reading["paper_id"])
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"分析失败: {exc}"}, status=500)
+                return
+            self.send_json({"ok": True, "reading_url": reading["reading_url"], "paper_id": reading["paper_id"]})
+            return
+
+        if self.path.startswith("/api/reading/") and self.path.endswith("/analyze"):
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            paper_id = parts[2] if len(parts) >= 4 else ""
+            if not paper_id:
+                self.send_json({"ok": False, "error": "paper id 不合法"}, status=400)
+                return
+            try:
+                analyze_reading_paper(paper_id)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"分析失败: {exc}"}, status=500)
+                return
+            self.send_json({"ok": True, "message": "分析完成。"})
+            return
+
         if self.path == "/api/papers/expand-references":
             data = self.parse_body()
             search_slug = (data.get("search_slug") or "").strip()
@@ -1601,6 +3181,53 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": f"扩展引用失败: {exc}"}, status=500)
                 return
             self.send_json({"ok": True, "site_url": site_url})
+            return
+
+        self.send_json({"ok": False, "error": "not_found"}, status=404)
+
+    def do_DELETE(self):
+        if not self.is_authenticated():
+            self.reject_unauthorized()
+            return
+
+        if self.path.startswith("/api/reading-groups/"):
+            group_id_raw = self.path.rsplit("/", 1)[-1]
+            try:
+                group_id = int(group_id_raw)
+            except Exception:
+                self.send_json({"ok": False, "error": "group id 不合法"}, status=400)
+                return
+            if not reading_group_exists(group_id):
+                self.send_json({"ok": False, "error": "Reading Group 不存在"}, status=404)
+                return
+            delete_reading_group(group_id)
+            self.send_json({"ok": True, "message": "Group 已删除，文章保留。"})
+            return
+
+        if self.path.startswith("/api/citations/") and "/groups/" in self.path:
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            try:
+                citation_id = int(parts[2])
+                group_id = int(parts[4])
+            except Exception:
+                self.send_json({"ok": False, "error": "路径参数不合法"}, status=400)
+                return
+            remove_citation_from_group(citation_id, group_id)
+            self.send_json({"ok": True, "message": "已移出 Group。"})
+            return
+
+        if self.path.startswith("/api/citations/") and self.path.endswith("/reading"):
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            try:
+                citation_id = int(parts[2])
+            except Exception:
+                self.send_json({"ok": False, "error": "citation id 不合法"}, status=400)
+                return
+            if not citation_exists(citation_id):
+                self.send_json({"ok": False, "error": "Citation 不存在"}, status=404)
+                return
+            removed = remove_reading_workspace_for_citation(citation_id)
+            self.send_json({"ok": True, "message": "已移出深度阅读。", "removed": removed})
             return
 
         self.send_json({"ok": False, "error": "not_found"}, status=404)

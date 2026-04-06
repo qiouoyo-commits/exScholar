@@ -24,6 +24,4 @@ data/*
 !data/searches/.gitkeep
 !data/expansions/
 !data/expansions/.gitkeep
-!data/review_logs/
-!data/review_logs/.gitkeep
 /utils/ccf_info

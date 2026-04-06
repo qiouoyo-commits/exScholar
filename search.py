@@ -54,7 +54,7 @@ def _detect_http_proxy() -> dict | None:
     for proxy_url in _HTTP_PROXY_CANDIDATES:
         try:
             r = requests.get("https://dblp.org/", proxies={"https": proxy_url, "http": proxy_url},
-                             timeout=5, headers={"User-Agent": "ccf-research-skill/1.0"})
+                             timeout=5, headers={"User-Agent": "exscholar-search/1.0"})
             if r.status_code < 500:
                 return {"http": proxy_url, "https": proxy_url}
         except Exception:
@@ -171,7 +171,7 @@ def dblp_search(keywords: str, venue: str | None, top: int, year_from: int) -> l
     for attempt in range(3):
         try:
             resp = requests.get(DBLP_SEARCH_URL, params=params, timeout=15,
-                                headers={"User-Agent": "ccf-research-skill/1.0"},
+                                headers={"User-Agent": "exscholar-search/1.0"},
                                 proxies=_DBLP_PROXIES or {})
             resp.raise_for_status()
             data = resp.json()
@@ -540,7 +540,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       <div class="meta">共 <span id="total-count">{len(records)}</span> 篇，支持按标题、关键词、摘要内容检索。</div>
       <div class="topbar">
         <a class="pill" href="/">返回时间线</a>
-        <a class="pill" href="/library">打开 Citation 库</a>
+        <a class="pill" href="/reading">打开深度阅读</a>
       </div>
     </section>
 
@@ -569,6 +569,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     const emptyTemplate = document.getElementById('empty');
     let expansionIndex = {{}};
     let activeMatchedKw = 'all';
+    let readingGroups = [];
     const toast = document.createElement('div');
     toast.className = 'toast';
     document.body.appendChild(toast);
@@ -590,6 +591,89 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       toast.classList.add('show');
       clearTimeout(showToast.timer);
       showToast.timer = setTimeout(() => toast.classList.remove('show'), 2600);
+    }}
+
+    function ensureCitationDialog() {{
+      let dialog = document.getElementById('citation-dialog');
+      if (dialog) return dialog;
+      dialog = document.createElement('dialog');
+      dialog.id = 'citation-dialog';
+      dialog.style.maxWidth = '560px';
+      dialog.style.width = 'calc(100vw - 24px)';
+      dialog.style.border = '1px solid #d5cbba';
+      dialog.style.borderRadius = '18px';
+      dialog.style.padding = '0';
+      dialog.innerHTML = `
+        <form method="dialog" id="citation-form" style="padding:20px;">
+          <h3 style="margin:0 0 12px; font-size:24px;">加入深度阅读</h3>
+          <div id="citation-dialog-title" style="color:#6f685c; line-height:1.6; margin-bottom:14px;"></div>
+          <label style="display:block; margin-bottom:10px;">
+            <div style="margin-bottom:6px; color:#6f685c;">Reading Group</div>
+            <select id="citation-group-select" style="width:100%; padding:10px 12px; border-radius:12px; border:1px solid #d5cbba;">
+              <option value="">暂不加入 Group</option>
+            </select>
+          </label>
+          <label style="display:block; margin-bottom:14px;">
+            <div style="margin-bottom:6px; color:#6f685c;">上传 PDF（可选）</div>
+            <input id="citation-pdf-input" type="file" accept="application/pdf,.pdf" style="width:100%;">
+          </label>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button type="submit" value="submit" style="border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">保存</button>
+            <button type="submit" value="cancel" style="border:none; background:#6f6455; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">取消</button>
+          </div>
+        </form>
+      `;
+      document.body.appendChild(dialog);
+      return dialog;
+    }}
+
+    async function loadReadingGroups() {{
+      const resp = await fetch('/api/reading-groups', {{ credentials: 'same-origin' }});
+      const data = await resp.json().catch(() => ({{ ok: false, groups: [] }}));
+      readingGroups = data.ok ? (data.groups || []) : [];
+    }}
+
+    async function submitCitation(searchSlug, paper) {{
+      const dialog = ensureCitationDialog();
+      document.getElementById('citation-dialog-title').textContent = paper.title || '';
+      const select = document.getElementById('citation-group-select');
+      const fileInput = document.getElementById('citation-pdf-input');
+      select.innerHTML = '<option value="">暂不加入 Group</option>' + readingGroups.map(
+        (group) => `<option value="${{group.id}}">${{esc(group.name)}}</option>`
+      ).join('');
+      fileInput.value = '';
+      return new Promise((resolve) => {{
+        const form = document.getElementById('citation-form');
+        const handler = async (event) => {{
+          event.preventDefault();
+          const action = event.submitter && event.submitter.value;
+          form.removeEventListener('submit', handler);
+          if (action !== 'submit') {{
+            dialog.close();
+            resolve(null);
+            return;
+          }}
+          const formData = new FormData();
+          formData.append('search_slug', searchSlug || '');
+          formData.append('paper', JSON.stringify(paper));
+          if (select.value) formData.append('group_id', select.value);
+          if (fileInput.files[0]) formData.append('pdf', fileInput.files[0]);
+          const resp = await fetch('/api/citations', {{
+            method: 'POST',
+            credentials: 'same-origin',
+            body: formData
+          }});
+          const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+          dialog.close();
+          if (!resp.ok || data.ok === false) {{
+            resolve({{ error: data.error || '请求失败' }});
+            return;
+          }}
+          resolve(data);
+        }};
+        form.addEventListener('submit', handler);
+        dialog.showModal();
+      }});
     }}
 
     function normalizeDoi(value) {{
@@ -634,11 +718,16 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       const paper = papers.find((item) => item.csv_index === index);
       if (!paper) return;
       try {{
-        const data = await apiPost('/api/citations', {{
-          search_slug: meta.slug || '',
-          paper
-        }});
-        showToast(data.message || '已加入 Citation 库。');
+        if (!readingGroups.length) {{
+          await loadReadingGroups();
+        }}
+        const data = await submitCitation(meta.slug || '', paper);
+        if (!data) return;
+        if (data.error) throw new Error(data.error);
+        if (data.reading_url) {{
+          window.open(data.reading_url, '_blank', 'noopener');
+        }}
+        showToast(data.message || '已加入深度阅读。');
       }} catch (error) {{
         showToast(error.message);
       }}
@@ -697,7 +786,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
           <div class="paper-meta">${{[doi, link].filter(Boolean).join(' · ')}}</div>
           <div class="content">${{esc(paper.content || '暂无内容')}}</div>
           <div class="actions">
-            <button class="action" type="button" onclick="addCitation(${{paper.csv_index}})">加入 Citation 库</button>
+            <button class="action" type="button" onclick="addCitation(${{paper.csv_index}})">加入深度阅读</button>
             <button class="${{expandClass}}" type="button" onclick="expandReferences(${{paper.csv_index}})">${{expandLabel}}</button>
           </div>
         </article>
@@ -759,6 +848,8 @@ def write_site(records: list[dict], output_path: str, meta: dict):
         expansionIndex = {{}};
       }}
     }}
+
+    loadReadingGroups().catch(() => {{}});
 
     input.addEventListener('input', (event) => render(event.target.value));
     renderKeywordFilters();
