@@ -852,6 +852,12 @@ def build_timeline_html():
       text-align: center; padding: 24px; color: var(--muted);
     }}
     @media (max-width: 720px) {{
+      .wrap {{ padding: 22px 14px 56px; }}
+      .hero {{ padding: 22px 18px; }}
+      .hero-links {{ width: 100%; }}
+      .hero-links a, .hero-links button {{ width: 100%; text-align: center; }}
+      .section-title {{ font-size: 24px; }}
+      .filters .tag {{ width: 100%; text-align: center; }}
       .timeline {{ padding-left: 18px; }}
       .card {{ margin-left: 20px; }}
       h2 {{ font-size: 20px; }}
@@ -955,6 +961,15 @@ def build_keywords_html():
     .kw-name {{ font-size:24px; line-height:1.25; margin-bottom:10px; }}
     .kw-count {{ color:#9c4f2f; font-weight:700; }}
     .empty {{ padding:24px; text-align:center; }}
+    @media (max-width: 720px) {{
+      .wrap {{ padding:22px 14px 56px; }}
+      .hero {{ padding:22px 18px; }}
+      .actions {{ width:100%; }}
+      .actions a {{ width:100%; text-align:center; }}
+      .grid {{ grid-template-columns:1fr; gap:14px; }}
+      .kw-card {{ padding:16px; }}
+      .kw-name {{ font-size:20px; }}
+    }}
   </style>
 </head>
 <body>
@@ -1043,6 +1058,16 @@ def build_keyword_detail_html(keyword: str):
     p {{ line-height:1.8; }}
     .links {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
     .empty {{ padding:24px; text-align:center; }}
+    @media (max-width: 720px) {{
+      .wrap {{ padding:22px 14px 56px; }}
+      .hero {{ padding:22px 18px; }}
+      .actions {{ width:100%; }}
+      .actions a {{ width:100%; text-align:center; }}
+      .card {{ padding:16px; }}
+      .links a, .links button {{ width:100%; text-align:center; }}
+      h1 {{ font-size:32px; }}
+      h2 {{ font-size:20px; }}
+    }}
   </style>
 </head>
 <body>
@@ -1242,6 +1267,17 @@ def build_library_html():
       padding:10px 14px; border-radius:999px; border:none; font:inherit; cursor:pointer;
     }}
     .empty {{ padding:24px; text-align:center; }}
+    @media (max-width: 720px) {{
+      .wrap {{ padding:22px 14px 56px; }}
+      .hero {{ padding:22px 18px; }}
+      .actions {{ width:100%; }}
+      .actions button, .hero a {{ width:100%; text-align:center; }}
+      .filters .tag, .tag-row .tag {{ width:100%; text-align:center; }}
+      .tag-editor input, .tag-editor button {{ width:100%; }}
+      .links a {{ width:100%; text-align:center; }}
+      h1 {{ font-size:32px; }}
+      h2 {{ font-size:20px; }}
+    }}
   </style>
 </head>
 <body>

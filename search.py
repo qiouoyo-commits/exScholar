@@ -513,9 +513,21 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       text-decoration: none;
     }}
     @media (max-width: 720px) {{
+      .wrap {{ padding: 22px 14px 56px; }}
+      .hero {{ padding: 22px 18px; }}
       .toolbar {{ grid-template-columns: 1fr; }}
       .count {{ min-height: 48px; }}
+      .topbar a.pill,
+      .actions button.action,
+      .actions a.pill {{
+        width: 100%;
+        text-align: center;
+      }}
+      .filters {{ gap: 8px; }}
+      .tag {{ width: 100%; text-align: center; }}
       .paper-title {{ font-size: 20px; }}
+      .card {{ padding: 16px; }}
+      .content {{ font-size: 15px; }}
     }}
   </style>
 </head>
