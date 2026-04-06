@@ -5,10 +5,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import shutil
 import time
+import traceback
 from datetime import datetime
 from difflib import SequenceMatcher
 from html import escape
@@ -18,6 +20,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 import requests
+import threading
 from dotenv import load_dotenv
 
 from search import build_json_records, build_site_url, write_csv, write_json, write_site
@@ -47,6 +50,8 @@ MOONSHOT_BASE_URL = (os.getenv("MOONSHOT_BASE_URL") or "https://api.moonshot.cn/
 MOONSHOT_ANALYSIS_MODEL = (os.getenv("MOONSHOT_ANALYSIS_MODEL") or "kimi-k2-turbo-preview").strip()
 
 SESSIONS: dict[str, dict] = {}
+ANALYSIS_JOBS: dict[str, dict] = {}
+ANALYSIS_JOBS_LOCK = threading.Lock()
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -91,6 +96,7 @@ def ensure_db():
                 source_search_slug TEXT,
                 source_csv_index INTEGER,
                 pdf_path TEXT,
+                pdf_sha256 TEXT,
                 reading_paper_id TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(doi),
@@ -106,6 +112,8 @@ def ensure_db():
             conn.execute("ALTER TABLE citations ADD COLUMN tags TEXT DEFAULT ''")
         if "pdf_path" not in columns:
             conn.execute("ALTER TABLE citations ADD COLUMN pdf_path TEXT")
+        if "pdf_sha256" not in columns:
+            conn.execute("ALTER TABLE citations ADD COLUMN pdf_sha256 TEXT")
         if "reading_paper_id" not in columns:
             conn.execute("ALTER TABLE citations ADD COLUMN reading_paper_id TEXT")
         conn.execute(
@@ -117,6 +125,23 @@ def ensure_db():
               AND matched_kw != ''
             """
         )
+        rows = conn.execute(
+            """
+            SELECT id, pdf_path
+            FROM citations
+            WHERE pdf_path IS NOT NULL
+              AND pdf_path != ''
+              AND (pdf_sha256 IS NULL OR pdf_sha256 = '')
+            """
+        ).fetchall()
+        for citation_id, pdf_path in rows:
+            pdf_abs = DATA_DIR / pdf_path
+            if not pdf_abs.exists():
+                continue
+            conn.execute(
+                "UPDATE citations SET pdf_sha256 = ? WHERE id = ?",
+                (compute_file_sha256(pdf_abs), citation_id),
+            )
         # Create reading_groups table
         conn.execute(
             """
@@ -230,6 +255,43 @@ def list_keyword_entries() -> list[dict]:
                     "source_slug": search_title,
                     "source_site_url": site_url,
                     "source_relative_dir": out_dir.relative_to(DATA_DIR).as_posix(),
+                    "source_kind": "search",
+                }
+            )
+    for citation in list_citations():
+        tags = [part.strip() for part in (citation.get("tags") or "").split(",") if part.strip()]
+        for keyword in tags:
+            key = keyword.lower()
+            entry = grouped.setdefault(
+                key,
+                {
+                    "keyword": keyword,
+                    "count": 0,
+                    "papers": [],
+                    "latest_date": "",
+                },
+            )
+            created_at = (citation.get("created_at") or "")[:10]
+            entry["count"] += 1
+            if created_at and created_at > (entry.get("latest_date") or ""):
+                entry["latest_date"] = created_at
+            entry["papers"].append(
+                {
+                    "title": citation.get("title") or "",
+                    "content": citation.get("abstract") or "",
+                    "matched_kw": keyword,
+                    "venue": citation.get("venue") or "",
+                    "year": citation.get("year") or "",
+                    "authors": citation.get("authors") or "",
+                    "doi": citation.get("doi") or "",
+                    "url": citation.get("url") or "",
+                    "paper_id": citation.get("reading_paper_id") or "",
+                    "csv_index": None,
+                    "source_date": created_at,
+                    "source_slug": "deep-reading",
+                    "source_site_url": f"/reading/{citation.get('reading_paper_id')}" if citation.get("reading_paper_id") else "/reading",
+                    "source_relative_dir": "",
+                    "source_kind": "deep_reading",
                 }
             )
     entries = sorted(grouped.values(), key=lambda item: ((item.get("latest_date") or ""), item["keyword"].lower()), reverse=True)
@@ -273,7 +335,7 @@ def get_source_matched_kw(meta: dict) -> str:
     return ""
 
 
-def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
+def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha256: str = None):
     ensure_db()
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     default_tags = (
@@ -286,8 +348,8 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
             """
             INSERT INTO citations (
                 title, doi, url, authors, year, venue, abstract, matched_kw, tags,
-                source_search_slug, source_csv_index, pdf_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_search_slug, source_csv_index, pdf_path, pdf_sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(doi) DO UPDATE SET
                 url=excluded.url,
                 authors=excluded.authors,
@@ -298,7 +360,8 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
                 tags=COALESCE(NULLIF(citations.tags, ''), excluded.tags),
                 source_search_slug=excluded.source_search_slug,
                 source_csv_index=excluded.source_csv_index,
-                pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path)
+                pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path),
+                pdf_sha256=COALESCE(excluded.pdf_sha256, citations.pdf_sha256)
             """,
             (
                 paper.get("title", ""),
@@ -313,6 +376,7 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
                 search_slug,
                 paper.get("csv_index"),
                 pdf_path,
+                pdf_sha256,
                 now,
             ),
         )
@@ -321,8 +385,8 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
                 """
                 INSERT INTO citations (
                     title, doi, url, authors, year, venue, abstract, matched_kw, tags,
-                    source_search_slug, source_csv_index, pdf_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_search_slug, source_csv_index, pdf_path, pdf_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(title, year) DO UPDATE SET
                     url=excluded.url,
                     authors=excluded.authors,
@@ -332,7 +396,8 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
                     tags=COALESCE(NULLIF(citations.tags, ''), excluded.tags),
                     source_search_slug=excluded.source_search_slug,
                     source_csv_index=excluded.source_csv_index,
-                    pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path)
+                    pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path),
+                    pdf_sha256=COALESCE(excluded.pdf_sha256, citations.pdf_sha256)
                 """,
                 (
                     paper.get("title", ""),
@@ -347,6 +412,7 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None):
                     search_slug,
                     paper.get("csv_index"),
                     pdf_path,
+                    pdf_sha256,
                     now,
                 ),
             )
@@ -372,7 +438,7 @@ def list_citations():
         rows = conn.execute(
             """
             SELECT id, title, doi, url, authors, year, venue, abstract,
-                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, pdf_sha256, reading_paper_id, created_at
             FROM citations
             ORDER BY created_at DESC, id DESC
             """
@@ -390,7 +456,7 @@ def get_citations_by_ids(ids: list[int]):
         rows = conn.execute(
             f"""
             SELECT id, title, doi, url, authors, year, venue, abstract,
-                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, pdf_sha256, reading_paper_id, created_at
             FROM citations
             WHERE id IN ({placeholders})
             ORDER BY created_at DESC, id DESC
@@ -407,11 +473,27 @@ def get_citation_by_id(citation_id: int):
         row = conn.execute(
             """
             SELECT id, title, doi, url, authors, year, venue, abstract,
-                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, reading_paper_id, created_at
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, pdf_sha256, reading_paper_id, created_at
             FROM citations
             WHERE id = ?
             """,
             (citation_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_citation_by_reading_paper_id(paper_id: str):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, title, doi, url, authors, year, venue, abstract,
+                   matched_kw, tags, source_search_slug, source_csv_index, pdf_path, pdf_sha256, reading_paper_id, created_at
+            FROM citations
+            WHERE reading_paper_id = ?
+            """,
+            (paper_id,),
         ).fetchone()
     return dict(row) if row else None
 
@@ -452,14 +534,269 @@ def update_citation_tags(citation_id: int, tags: str):
         conn.commit()
 
 
-def update_citation_pdf(citation_id: int, pdf_path: str):
+def extract_theme_keywords(theme_text: str) -> list[str]:
+    text = " ".join((theme_text or "").strip().split())
+    if not text:
+        return []
+    parts = re.split(r"[;,/|，；、]+", text)
+    keywords = []
+    for part in parts:
+        value = " ".join(part.strip().split())
+        if not value:
+            continue
+        keywords.append(value)
+    if not keywords and text:
+        keywords.append(text)
+    return keywords
+
+
+def merge_analysis_theme_into_citation(paper_id: str, analysis_payload: dict):
+    citation = get_citation_by_reading_paper_id(paper_id)
+    if not citation:
+        return
+    overview = (((analysis_payload or {}).get("modules") or {}).get("overview") or {}).get("data") or {}
+    theme_words = extract_theme_keywords(overview.get("research_theme") or "")
+    if not theme_words:
+        return
+    merged_tags = normalize_tags(
+        [part.strip() for part in (citation.get("tags") or "").split(",") if part.strip()] + theme_words
+    )
+    update_citation_tags(int(citation["id"]), merged_tags)
+    refreshed = get_citation_by_id(int(citation["id"])) or citation
+    workspace = reading_workspace_path(paper_id)
+    paper_json_path = workspace / "paper.json"
+    paper = read_json_file(paper_json_path, {})
+    if paper:
+        paper["keywords"] = [part.strip() for part in (refreshed.get("tags") or "").split(",") if part.strip()]
+        paper["updated_at"] = utc_now()
+        write_json_file(paper_json_path, paper)
+
+
+def load_reading_full_text(paper_id: str) -> str:
+    source_path = reading_workspace_path(paper_id) / "source" / "full_text.json"
+    payload = read_json_file(source_path, {})
+    text = (payload.get("text") or "").strip()
+    if text:
+        return text
+    content = payload.get("content") or {}
+    if isinstance(content, dict):
+        normalized = normalize_full_text_payload(content)
+        return normalized.get("text") or ""
+    return ""
+
+
+def build_question_answer_prompt(paper: dict, analysis: dict, extracted_text: str, question: str) -> str:
+    overview = (((analysis or {}).get("modules") or {}).get("overview") or {}).get("data") or {}
+    problem = (((analysis or {}).get("modules") or {}).get("problem") or {}).get("data") or {}
+    method = (((analysis or {}).get("modules") or {}).get("method") or {}).get("data") or {}
+    results = (((analysis or {}).get("modules") or {}).get("results") or {}).get("data") or {}
+    critique = (((analysis or {}).get("modules") or {}).get("critique") or {}).get("data") or {}
+    sample = (extracted_text or "")[:80000]
+    return f"""
+你是一个论文深度阅读助手。请基于论文内容回答用户问题。
+
+规则：
+- 全部回答使用中文。
+- 优先依据论文原文，其次参考已有结构化分析。
+- 如果论文中没有足够证据，请明确说“文中未明确说明”。
+- 不要编造实验结果、数字或结论。
+- 回答尽量具体、清楚，必要时分点。
+
+论文标题：{paper.get("title") or ""}
+作者：{", ".join(paper.get("authors") or [])}
+venue：{paper.get("venue") or ""}
+年份：{paper.get("year") or ""}
+DOI：{paper.get("doi") or ""}
+
+已有分析摘要：
+overview: {json.dumps(overview, ensure_ascii=False)}
+problem: {json.dumps(problem, ensure_ascii=False)}
+method: {json.dumps(method, ensure_ascii=False)}
+results: {json.dumps(results, ensure_ascii=False)}
+critique: {json.dumps(critique, ensure_ascii=False)}
+
+论文原文摘录：
+{sample}
+
+用户问题：
+{question}
+""".strip()
+
+
+def moonshot_answer_question(paper: dict, analysis: dict, extracted_text: str, question: str) -> str:
+    session = moonshot_session()
+    payload = {
+        "model": MOONSHOT_ANALYSIS_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是一个严谨的论文问答助手。只根据给定论文材料回答，输出中文。"},
+            {"role": "user", "content": build_question_answer_prompt(paper, analysis, extracted_text, question)},
+        ],
+        "temperature": moonshot_temperature(),
+    }
+    resp = session.post(
+        f"{MOONSHOT_BASE_URL}/chat/completions",
+        headers={**moonshot_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=180,
+    )
+    raise_for_moonshot(resp)
+    data = resp.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    if not content:
+        raise ValueError("模型没有返回问答内容")
+    return content
+
+
+def append_reading_question_history(paper_id: str, question: str, answer: str) -> dict:
+    path = reading_qa_history_path(paper_id)
+    history = read_json_file(path, [])
+    if not isinstance(history, list):
+        history = []
+    item = {
+        "id": f"qa_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(3)}",
+        "question": question,
+        "answer": answer,
+        "created_at": utc_now(),
+    }
+    history.append(item)
+    write_json_file(path, history)
+    return item
+
+
+def delete_reading_question_history_item(paper_id: str, qa_id: str) -> bool:
+    path = reading_qa_history_path(paper_id)
+    history = read_json_file(path, [])
+    if not isinstance(history, list):
+        history = []
+    kept = [item for item in history if str(item.get("id") or "") != qa_id]
+    if len(kept) == len(history):
+        return False
+    write_json_file(path, kept)
+    return True
+
+
+def save_manual_note(paper_id: str, module_name: str, content: str) -> dict:
+    allowed = {"overview", "problem", "method", "results", "critique"}
+    if module_name not in allowed:
+        raise ValueError("不支持的 Notes 模块")
+    path = reading_notes_path(paper_id)
+    notes = normalize_notes_payload(read_json_file(path, {}))
+    notes[module_name] = content
+    write_json_file(path, notes)
+    return {
+        "module": module_name,
+        "content": content,
+        "updated_at": utc_now(),
+    }
+
+
+def answer_reading_question(paper_id: str, question: str) -> dict:
+    bundle = load_reading_bundle(paper_id)
+    if not bundle:
+        raise ValueError("阅读工作区不存在")
+    text = load_reading_full_text(paper_id)
+    if not text:
+        raise ValueError("当前阅读页还没有可用的论文文本，请先完成一次深度分析。")
+    answer = moonshot_answer_question(bundle["paper"], bundle["analysis"], text, question)
+    return append_reading_question_history(paper_id, question, answer)
+
+
+def update_citation_pdf(citation_id: int, pdf_path: str, pdf_sha256: str = ""):
     ensure_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE citations SET pdf_path = ? WHERE id = ?",
-            (pdf_path, citation_id),
+            "UPDATE citations SET pdf_path = ?, pdf_sha256 = ? WHERE id = ?",
+            (pdf_path, pdf_sha256 or None, citation_id),
         )
         conn.commit()
+
+
+def update_citation_metadata(citation_id: int, metadata: dict):
+    ensure_db()
+    citation = get_citation_by_id(citation_id)
+    if not citation:
+        raise ValueError("Citation 不存在")
+    merged_tags = normalize_tags(citation.get("tags") or "")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE citations
+            SET title = ?,
+                doi = ?,
+                authors = ?,
+                year = ?,
+                venue = ?,
+                abstract = ?
+            WHERE id = ?
+            """,
+            (
+                (metadata.get("title") or citation.get("title") or "").strip(),
+                normalize_doi(metadata.get("doi") or citation.get("doi") or "") or None,
+                ", ".join(metadata.get("authors") or []) or citation.get("authors") or "",
+                str(metadata.get("year") or citation.get("year") or ""),
+                (metadata.get("venue") or citation.get("venue") or "").strip(),
+                (metadata.get("abstract") or citation.get("abstract") or "").strip(),
+                citation_id,
+            ),
+        )
+        conn.commit()
+
+
+def update_citation_reading_paper_id(citation_id: int, paper_id: str):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE citations SET reading_paper_id = ? WHERE id = ?",
+            (paper_id or None, citation_id),
+        )
+        conn.commit()
+
+
+def transfer_citation_groups(source_citation_id: int, target_citation_id: int):
+    for group in get_citation_groups(source_citation_id):
+        add_citation_to_group(target_citation_id, int(group["id"]))
+
+
+def delete_citation_group_links(citation_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM citation_group_links WHERE citation_id = ?", (citation_id,))
+        conn.commit()
+
+
+def delete_citation(citation_id: int):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM citations WHERE id = ?", (citation_id,))
+        conn.commit()
+
+
+def merge_citation_into_existing(source_citation_id: int, target_citation_id: int, metadata: dict | None = None):
+    source = get_citation_by_id(source_citation_id)
+    target = get_citation_by_id(target_citation_id)
+    if not source or not target:
+        raise ValueError("待合并文献不存在")
+    source_paper_id = (source.get("reading_paper_id") or "").strip()
+    transfer_citation_groups(source_citation_id, target_citation_id)
+    if source.get("pdf_path"):
+        update_citation_pdf(target_citation_id, source.get("pdf_path") or "", source.get("pdf_sha256") or "")
+    if metadata:
+        enriched = dict(target)
+        if not (enriched.get("doi") or "").strip() and (metadata.get("doi") or "").strip():
+            enriched["doi"] = metadata.get("doi")
+        if not (enriched.get("authors") or "").strip() and metadata.get("authors"):
+            enriched["authors"] = ", ".join(metadata.get("authors") or [])
+        if not (enriched.get("year") or "").strip() and (metadata.get("year") or "").strip():
+            enriched["year"] = metadata.get("year")
+        if not (enriched.get("venue") or "").strip() and (metadata.get("venue") or "").strip():
+            enriched["venue"] = metadata.get("venue")
+        if not (enriched.get("abstract") or "").strip() and (metadata.get("abstract") or "").strip():
+            enriched["abstract"] = metadata.get("abstract")
+        update_citation_metadata(target_citation_id, enriched)
+    if source_paper_id:
+        update_citation_reading_paper_id(target_citation_id, source_paper_id)
+    delete_citation(source_citation_id)
+    return get_citation_by_id(target_citation_id)
 
 
 def clear_citation_reading_link(citation_id: int):
@@ -580,21 +917,75 @@ def safe_file_stem(name: str, fallback: str = "paper") -> str:
     return value[:80] or fallback
 
 
-def store_uploaded_pdf(file_item, title: str = "") -> str:
-    if not file_item or not getattr(file_item, "file", None):
-        return ""
+def compute_stream_sha256(stream) -> str:
+    stream.seek(0)
+    digest = hashlib.sha256()
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    stream.seek(0)
+    return digest.hexdigest()
+
+
+def compute_file_sha256(path: Path) -> str:
+    with path.open("rb") as fh:
+        return compute_stream_sha256(fh)
+
+
+def find_existing_pdf_by_hash(pdf_sha256: str) -> dict | None:
+    ensure_db()
+    if not pdf_sha256:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, pdf_path, pdf_sha256
+            FROM citations
+            WHERE pdf_sha256 = ?
+              AND pdf_path IS NOT NULL
+              AND pdf_path != ''
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (pdf_sha256,),
+        ).fetchone()
+    if not row:
+        return None
+    payload = dict(row)
+    pdf_abs = DATA_DIR / payload["pdf_path"]
+    return payload if pdf_abs.exists() else None
+
+
+def store_uploaded_pdf(file_item, title: str = "") -> dict:
+    if file_item is None or not getattr(file_item, "file", None):
+        return {"pdf_path": "", "pdf_sha256": "", "reused": False}
     filename = (getattr(file_item, "filename", "") or "").strip()
     content_type = (getattr(file_item, "type", "") or "").lower()
     suffix = Path(filename).suffix.lower()
     if suffix != ".pdf" and content_type != "application/pdf":
         raise ValueError("仅支持上传 PDF 文件。")
+    pdf_sha256 = compute_stream_sha256(file_item.file)
+    existing = find_existing_pdf_by_hash(pdf_sha256)
+    if existing:
+        return {
+            "pdf_path": existing["pdf_path"],
+            "pdf_sha256": pdf_sha256,
+            "reused": True,
+        }
     stem = safe_file_stem(title or Path(filename).stem or "paper")
     unique_name = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}-{stem}.pdf"
     dest = LIBRARY_DIR / unique_name
     file_item.file.seek(0)
     with dest.open("wb") as fh:
         shutil.copyfileobj(file_item.file, fh)
-    return f"library/{unique_name}"
+    return {
+        "pdf_path": f"library/{unique_name}",
+        "pdf_sha256": pdf_sha256,
+        "reused": False,
+    }
 
 
 def citation_pdf_abspath(citation: dict | None) -> Path | None:
@@ -622,6 +1013,20 @@ def build_reading_paper_id(citation: dict) -> str:
 
 def reading_workspace_path(paper_id: str) -> Path:
     return READING_DIR / paper_id
+
+
+def reading_qa_history_path(paper_id: str) -> Path:
+    return reading_workspace_path(paper_id) / "qa_history.json"
+
+
+def reading_notes_path(paper_id: str) -> Path:
+    return reading_workspace_path(paper_id) / "notes.json"
+
+
+def normalize_notes_payload(payload) -> dict:
+    if isinstance(payload, dict):
+        return {str(key): str(value or "") for key, value in payload.items()}
+    return {}
 
 
 def default_analysis_payload(paper_id: str) -> dict:
@@ -701,11 +1106,17 @@ def ensure_reading_workspace_for_citation(citation_id: int):
 
     paper_json_path = workspace / "paper.json"
     analysis_json_path = workspace / "analysis.json"
+    qa_history_path = reading_qa_history_path(paper_id)
+    notes_path = reading_notes_path(paper_id)
+    source_pdf_path = f"/{library_pdf.relative_to(DATA_DIR).as_posix()}"
 
-    dest_pdf = source_dir / library_pdf.name
-    if not dest_pdf.exists():
-        shutil.copy2(library_pdf, dest_pdf)
-    source_pdf_path = f"/reading/{paper_id}/source/{dest_pdf.name}"
+    # Older workspaces may have copied the PDF into reading/source.
+    # Keep only derived artifacts there and reuse the single library copy.
+    for stale_pdf in source_dir.glob("*.pdf"):
+        try:
+            stale_pdf.unlink()
+        except Exception:
+            pass
 
     now = utc_now()
     paper_payload = {
@@ -729,6 +1140,7 @@ def ensure_reading_workspace_for_citation(citation_id: int):
         "status": {
             "ingestion": "completed" if source_pdf_path else "pending",
             "analysis": "pending",
+            "metadata": "completed" if citation.get("title") else "pending",
         },
         "created_at": citation.get("created_at") or now,
         "updated_at": now,
@@ -737,6 +1149,10 @@ def ensure_reading_workspace_for_citation(citation_id: int):
 
     if not analysis_json_path.exists():
         analysis_json_path.write_text(json.dumps(default_analysis_payload(paper_id), ensure_ascii=False, indent=2), encoding="utf-8")
+    if not qa_history_path.exists():
+        qa_history_path.write_text("[]", encoding="utf-8")
+    if not notes_path.exists():
+        notes_path.write_text("{}", encoding="utf-8")
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -758,16 +1174,22 @@ def load_reading_bundle(paper_id: str):
     workspace = reading_workspace_path(paper_id)
     paper_json_path = workspace / "paper.json"
     analysis_json_path = workspace / "analysis.json"
+    qa_history_path = reading_qa_history_path(paper_id)
+    notes_path = reading_notes_path(paper_id)
     if not paper_json_path.exists() or not analysis_json_path.exists():
         return None
     try:
         paper = json.loads(paper_json_path.read_text(encoding="utf-8"))
         analysis = json.loads(analysis_json_path.read_text(encoding="utf-8"))
+        qa_history = json.loads(qa_history_path.read_text(encoding="utf-8")) if qa_history_path.exists() else []
+        notes = json.loads(notes_path.read_text(encoding="utf-8")) if notes_path.exists() else {}
     except Exception:
         return None
     return {
         "paper": paper,
         "analysis": analysis,
+        "qa_history": qa_history if isinstance(qa_history, list) else [],
+        "notes": normalize_notes_payload(notes),
         "workspace": workspace,
     }
 
@@ -782,12 +1204,44 @@ def remove_reading_workspace_for_citation(citation_id: int):
     if not citation:
         raise ValueError("Citation 不存在")
     paper_id = (citation.get("reading_paper_id") or "").strip()
-    if not paper_id:
-        return False
-    workspace = reading_workspace_path(paper_id)
-    if workspace.exists():
-        shutil.rmtree(workspace, ignore_errors=True)
-    clear_citation_reading_link(citation_id)
+    pdf_rel = (citation.get("pdf_path") or "").strip()
+    pdf_sha256 = (citation.get("pdf_sha256") or "").strip()
+
+    if paper_id:
+        workspace = reading_workspace_path(paper_id)
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
+        with ANALYSIS_JOBS_LOCK:
+            ANALYSIS_JOBS.pop(paper_id, None)
+
+    should_delete_pdf = False
+    pdf_abs = None
+    if pdf_rel:
+        pdf_abs = DATA_DIR / pdf_rel
+        ensure_db()
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(1)
+                FROM citations
+                WHERE id != ?
+                  AND (
+                    pdf_path = ?
+                    OR (? != '' AND pdf_sha256 = ?)
+                  )
+                """,
+                (citation_id, pdf_rel, pdf_sha256, pdf_sha256),
+            ).fetchone()
+        should_delete_pdf = not bool((row or [0])[0])
+
+    delete_citation_group_links(citation_id)
+    delete_citation(citation_id)
+
+    if should_delete_pdf and pdf_abs and pdf_abs.exists():
+        try:
+            pdf_abs.unlink()
+        except Exception:
+            pass
     return True
 
 
@@ -848,14 +1302,14 @@ def match_existing_citation(title: str = "", doi: str = "", year: str = ""):
     return dict(row) if row else None
 
 
-def create_or_match_citation_from_metadata(metadata: dict, pdf_path: str = "", search_slug: str = ""):
+def create_or_match_citation_from_metadata(metadata: dict, pdf_path: str = "", pdf_sha256: str = "", search_slug: str = ""):
     title = (metadata.get("title") or "").strip()
     doi = normalize_doi(metadata.get("doi") or "")
     year = str(metadata.get("year") or "").strip()
     matched = match_existing_citation(title=title, doi=doi, year=year)
     if matched:
         if pdf_path:
-            update_citation_pdf(int(matched["id"]), pdf_path)
+            update_citation_pdf(int(matched["id"]), pdf_path, pdf_sha256)
         return get_citation_by_id(int(matched["id"])), True
     paper = {
         "title": title or (Path(pdf_path).stem if pdf_path else "Untitled Paper"),
@@ -869,7 +1323,12 @@ def create_or_match_citation_from_metadata(metadata: dict, pdf_path: str = "", s
         "csv_index": None,
         "tags": "",
     }
-    citation_id = upsert_citation(paper, (search_slug or "").strip(), pdf_path=pdf_path or None)
+    citation_id = upsert_citation(
+        paper,
+        (search_slug or "").strip(),
+        pdf_path=pdf_path or None,
+        pdf_sha256=pdf_sha256 or None,
+    )
     return get_citation_by_id(citation_id), bool(matched)
 
 
@@ -897,6 +1356,66 @@ def update_paper_status(paper_json_path: Path, *, ingestion: str | None = None, 
     return paper
 
 
+def update_paper_analysis_progress(
+    paper_json_path: Path,
+    *,
+    state: str | None = None,
+    progress: int | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+):
+    paper = read_json_file(paper_json_path, {})
+    status = paper.setdefault("status", {})
+    if state is not None:
+        status["analysis"] = state
+    if progress is not None:
+        status["analysis_progress"] = max(0, min(100, int(progress)))
+    if stage is not None:
+        status["analysis_stage"] = stage
+    if message is not None:
+        status["analysis_message"] = message
+    paper["updated_at"] = utc_now()
+    write_json_file(paper_json_path, paper)
+    return paper
+
+
+def update_paper_metadata_progress(
+    paper_json_path: Path,
+    *,
+    state: str | None = None,
+    message: str | None = None,
+):
+    paper = read_json_file(paper_json_path, {})
+    status = paper.setdefault("status", {})
+    if state is not None:
+        status["metadata"] = state
+    if message is not None:
+        status["metadata_message"] = message
+    paper["updated_at"] = utc_now()
+    write_json_file(paper_json_path, paper)
+    return paper
+
+
+def create_placeholder_citation_for_pdf(pdf_path: str, pdf_sha256: str = "") -> int:
+    stem = Path(pdf_path).stem if pdf_path else "untitled-paper"
+    paper = {
+        "title": stem,
+        "doi": "",
+        "url": "",
+        "authors": "",
+        "year": "",
+        "venue": "",
+        "content": "",
+        "matched_kw": "",
+        "csv_index": None,
+        "tags": "",
+    }
+    citation_id = upsert_citation(paper, "deep-reading-upload", pdf_path=pdf_path or None, pdf_sha256=pdf_sha256 or None)
+    if not citation_id:
+        raise ValueError("无法创建占位文献记录")
+    return citation_id
+
+
 def moonshot_headers() -> dict:
     if not MOONSHOT_API_KEY:
         raise ValueError("未配置 MOONSHOT_API_KEY")
@@ -909,6 +1428,28 @@ def moonshot_session():
     return session
 
 
+def moonshot_temperature() -> int | float:
+    model = (MOONSHOT_ANALYSIS_MODEL or "").strip().lower()
+    if model == "kimi-k2.5":
+        return 1
+    return 0.2
+
+
+def raise_for_moonshot(resp):
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            payload = resp.json()
+            detail = ((payload.get("error") or {}).get("message") or "").strip()
+        except Exception:
+            detail = (resp.text or "").strip()[:500]
+        if detail:
+            raise ValueError(detail) from exc
+        raise
+
+
 def moonshot_upload_pdf(pdf_path: Path) -> dict:
     session = moonshot_session()
     with pdf_path.open("rb") as fh:
@@ -919,7 +1460,7 @@ def moonshot_upload_pdf(pdf_path: Path) -> dict:
             data={"purpose": "file-extract"},
             timeout=120,
         )
-    resp.raise_for_status()
+    raise_for_moonshot(resp)
     return resp.json()
 
 
@@ -930,7 +1471,7 @@ def moonshot_get_file_content(file_id: str):
         headers=moonshot_headers(),
         timeout=120,
     )
-    resp.raise_for_status()
+    raise_for_moonshot(resp)
     content_type = (resp.headers.get("Content-Type") or "").lower()
     if "application/json" in content_type:
         return resp.json()
@@ -975,17 +1516,19 @@ def normalize_full_text_payload(raw_content):
 def build_metadata_extraction_prompt(extracted_text: str, filename: str = "") -> str:
     sample = extracted_text[:40000]
     return f"""
-You are extracting bibliographic metadata from an academic paper PDF.
-Return one JSON object only.
+你正在从一篇学术论文 PDF 中抽取书目信息。
+请只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
 
-Rules:
-- Use the PDF text as the primary source.
-- If unsure, use empty string.
-- authors must be an array of author names.
-- year should be a 4-digit year string if available.
-- doi should be normalized and not include https://doi.org/.
+规则：
+- 以 PDF 提取文本为唯一主要依据。
+- 如果不确定，返回空字符串。
+- `authors` 必须是作者姓名数组。
+- `year` 如果存在，必须是四位年份字符串。
+- `doi` 必须标准化，不能包含 `https://doi.org/` 前缀。
+- 除作者名、标题、venue、doi 等原始元数据外，不要额外翻译字段含义。
+- `abstract` 尽量保持与原文一致；如果原文是英文摘要，可以保留英文。
 
-Required schema:
+必须使用如下 schema：
 {{
   "title": "",
   "authors": [""],
@@ -995,9 +1538,9 @@ Required schema:
   "abstract": ""
 }}
 
-File name: {filename}
+文件名：{filename}
 
-PDF extracted text:
+PDF 提取文本：
 {sample}
 """.strip()
 
@@ -1007,10 +1550,10 @@ def moonshot_extract_metadata(extracted_text: str, filename: str = "") -> dict:
     payload = {
         "model": MOONSHOT_ANALYSIS_MODEL,
         "messages": [
-            {"role": "system", "content": "You extract academic paper metadata and return strict JSON only."},
+            {"role": "system", "content": "你负责抽取学术论文元数据。只返回严格合法的 JSON，不要输出任何额外说明。"},
             {"role": "user", "content": build_metadata_extraction_prompt(extracted_text, filename)},
         ],
-        "temperature": 0.1,
+        "temperature": moonshot_temperature(),
     }
     resp = session.post(
         f"{MOONSHOT_BASE_URL}/chat/completions",
@@ -1018,7 +1561,7 @@ def moonshot_extract_metadata(extracted_text: str, filename: str = "") -> dict:
         json=payload,
         timeout=120,
     )
-    resp.raise_for_status()
+    raise_for_moonshot(resp)
     data = resp.json()
     content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
     meta = extract_json_object(content)
@@ -1039,33 +1582,92 @@ def moonshot_extract_metadata(extracted_text: str, filename: str = "") -> dict:
     }
 
 
+def process_uploaded_pdf_metadata(citation_id: int, pdf_path: str, paper_id: str = ""):
+    citation = get_citation_by_id(citation_id)
+    if not citation:
+        return
+    workspace = reading_workspace_path(paper_id) if paper_id else None
+    paper_json_path = (workspace / "paper.json") if workspace else None
+    if paper_json_path and paper_json_path.exists():
+        update_paper_metadata_progress(paper_json_path, state="processing", message="正在识别 PDF 元数据。")
+    try:
+        file_meta = moonshot_upload_pdf(DATA_DIR / pdf_path)
+        file_id = file_meta.get("id") or file_meta.get("file_id") or ""
+        if not file_id:
+            raise ValueError("Moonshot files 接口未返回 file id")
+        raw_content = moonshot_get_file_content(file_id)
+        normalized = normalize_full_text_payload(raw_content)
+        metadata = moonshot_extract_metadata(normalized["text"], Path(pdf_path).name)
+        matched = match_existing_citation(
+            title=(metadata.get("title") or "").strip(),
+            doi=normalize_doi(metadata.get("doi") or ""),
+            year=str(metadata.get("year") or "").strip(),
+        )
+        target_citation_id = citation_id
+        if matched and int(matched["id"]) != citation_id:
+            merged = merge_citation_into_existing(citation_id, int(matched["id"]), metadata)
+            if merged:
+                target_citation_id = int(merged["id"])
+        else:
+            update_citation_metadata(citation_id, metadata)
+        if paper_id:
+            update_citation_reading_paper_id(target_citation_id, paper_id)
+        ensure_reading_workspace_for_citation(target_citation_id)
+        refreshed = get_citation_by_id(target_citation_id)
+        if paper_json_path and paper_json_path.exists() and refreshed:
+            paper = read_json_file(paper_json_path, {})
+            paper["title"] = refreshed.get("title") or paper.get("title") or ""
+            paper["authors"] = split_authors(refreshed.get("authors") or "")
+            paper["year"] = refreshed.get("year") or paper.get("year")
+            paper["venue"] = refreshed.get("venue") or paper.get("venue") or ""
+            paper["doi"] = refreshed.get("doi") or paper.get("doi")
+            paper["keywords"] = [part.strip() for part in (refreshed.get("tags") or "").split(",") if part.strip()]
+            paper["updated_at"] = utc_now()
+            write_json_file(paper_json_path, paper)
+            update_paper_metadata_progress(paper_json_path, state="completed", message="PDF 元数据识别完成。")
+    except Exception as exc:
+        if paper_json_path and paper_json_path.exists():
+            update_paper_metadata_progress(paper_json_path, state="failed", message=str(exc))
+
+
+def start_uploaded_pdf_metadata_job(citation_id: int, pdf_path: str, paper_id: str = ""):
+    thread = threading.Thread(
+        target=process_uploaded_pdf_metadata,
+        args=(citation_id, pdf_path, paper_id),
+        daemon=True,
+    )
+    thread.start()
+
+
 def build_single_call_prompt(paper: dict, extracted_text: str) -> str:
     sample = extracted_text[:120000]
     return f"""
-You are reading an academic paper PDF and must produce a single JSON object only.
+你正在阅读一篇学术论文 PDF，并且必须只输出一个 JSON 对象。
 
-Fill these top-level keys exactly:
+请严格输出以下顶层键：
 - overview
 - problem
 - method
 - results
 - critique
 
-Rules:
-- Output valid JSON only. No markdown fences.
-- Keep field names exactly as requested.
-- Use concise but information-dense academic summaries.
-- If evidence is missing, use empty string or empty array rather than inventing details.
-- Base every field on the provided PDF text.
+规则：
+- 只输出合法 JSON，不要输出 Markdown 代码块或解释。
+- 字段名必须与要求完全一致。
+- 所有自然语言内容一律用中文输出。
+- 专有名词、论文标题、方法名、缩写、数据集名、模型名可以保留英文原文。
+- 总结风格要简洁但信息密度高，偏学术写作。
+- 如果证据不足，用空字符串或空数组，不要编造。
+- 所有字段都必须基于提供的 PDF 文本。
 
-Paper metadata:
+论文元信息：
 title: {paper.get('title') or ''}
 authors: {', '.join(paper.get('authors') or [])}
 venue: {paper.get('venue') or ''}
 year: {paper.get('year') or ''}
 doi: {paper.get('doi') or ''}
 
-Required schema:
+必须使用如下 schema：
 {{
   "overview": {{
     "paper_type": "",
@@ -1118,7 +1720,9 @@ Required schema:
   }}
 }}
 
-PDF extracted text:
+请确保所有 `content`、`background`、`gap`、`importance`、`research_goal`、`claim`、`evidence`、`what_it_shows`、`why_it_matters`、`strengths`、`limitations` 等自然语言字段都输出中文。
+
+PDF 提取文本：
 {sample}
 """.strip()
 
@@ -1142,10 +1746,10 @@ def moonshot_generate_analysis(paper: dict, extracted_text: str) -> dict:
     payload = {
         "model": MOONSHOT_ANALYSIS_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a precise academic reading assistant that outputs strict JSON."},
+            {"role": "system", "content": "你是一个严谨的论文精读助手。你只输出严格合法的 JSON，并且所有自然语言分析内容都使用中文。"},
             {"role": "user", "content": build_single_call_prompt(paper, extracted_text)},
         ],
-        "temperature": 0.2,
+        "temperature": moonshot_temperature(),
     }
     resp = session.post(
         f"{MOONSHOT_BASE_URL}/chat/completions",
@@ -1153,7 +1757,7 @@ def moonshot_generate_analysis(paper: dict, extracted_text: str) -> dict:
         json=payload,
         timeout=240,
     )
-    resp.raise_for_status()
+    raise_for_moonshot(resp)
     data = resp.json()
     content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
     return extract_json_object(content)
@@ -1207,11 +1811,30 @@ def analyze_reading_paper(paper_id: str):
         raise ValueError("该阅读工作区缺少可访问的 PDF 文件")
 
     update_paper_status(paper_json_path, ingestion="processing", analysis="in_progress")
+    update_paper_analysis_progress(
+        paper_json_path,
+        state="in_progress",
+        progress=5,
+        stage="queued",
+        message="已进入分析队列。",
+    )
     try:
+        update_paper_analysis_progress(
+            paper_json_path,
+            progress=20,
+            stage="uploading_pdf",
+            message="正在上传 PDF 到 Moonshot。",
+        )
         file_meta = moonshot_upload_pdf(pdf_abs)
         file_id = file_meta.get("id") or file_meta.get("file_id") or ""
         if not file_id:
             raise ValueError("Moonshot files 接口未返回 file id")
+        update_paper_analysis_progress(
+            paper_json_path,
+            progress=45,
+            stage="extracting_text",
+            message="正在抽取 PDF 文本。",
+        )
         raw_content = moonshot_get_file_content(file_id)
         normalized = normalize_full_text_payload(raw_content)
 
@@ -1221,14 +1844,91 @@ def analyze_reading_paper(paper_id: str):
         write_json_file(full_text_json, {"file": file_meta, "content": normalized["raw"], "text": normalized["text"]})
         write_json_file(sections_json, {"sections": normalized["sections"]})
 
+        update_paper_analysis_progress(
+            paper_json_path,
+            progress=70,
+            stage="generating_analysis",
+            message="正在生成深度阅读结构化分析。",
+        )
         result = moonshot_generate_analysis(paper, normalized["text"])
         final_analysis = coerce_analysis_result(result, paper_id)
+        update_paper_analysis_progress(
+            paper_json_path,
+            progress=90,
+            stage="writing_results",
+            message="正在写入分析结果。",
+        )
         write_json_file(analysis_json_path, final_analysis)
+        merge_analysis_theme_into_citation(paper_id, final_analysis)
         update_paper_status(paper_json_path, ingestion="completed", analysis="completed")
+        update_paper_analysis_progress(
+            paper_json_path,
+            state="completed",
+            progress=100,
+            stage="completed",
+            message="分析完成。",
+        )
         return final_analysis
-    except Exception:
+    except Exception as exc:
         update_paper_status(paper_json_path, ingestion="completed", analysis="failed")
+        update_paper_analysis_progress(
+            paper_json_path,
+            state="failed",
+            progress=100,
+            stage="failed",
+            message=str(exc),
+        )
         raise
+
+
+def get_reading_status_payload(paper_id: str) -> dict:
+    bundle = load_reading_bundle(paper_id)
+    if not bundle:
+        raise ValueError("阅读工作区不存在")
+    paper = bundle["paper"]
+    status = paper.get("status") or {}
+    return {
+        "paper_id": paper_id,
+        "analysis": (status.get("analysis") or "pending").strip(),
+        "ingestion": (status.get("ingestion") or "pending").strip(),
+        "analysis_progress": int(status.get("analysis_progress") or 0),
+        "analysis_stage": status.get("analysis_stage") or "",
+        "analysis_message": status.get("analysis_message") or "",
+        "updated_at": paper.get("updated_at") or "",
+    }
+
+
+def run_analysis_job(paper_id: str):
+    with ANALYSIS_JOBS_LOCK:
+        ANALYSIS_JOBS[paper_id] = {"status": "running", "started_at": utc_now()}
+    try:
+        analyze_reading_paper(paper_id)
+        with ANALYSIS_JOBS_LOCK:
+            ANALYSIS_JOBS[paper_id] = {"status": "completed", "ended_at": utc_now()}
+    except Exception as exc:
+        with ANALYSIS_JOBS_LOCK:
+            ANALYSIS_JOBS[paper_id] = {"status": "failed", "ended_at": utc_now(), "error": str(exc)}
+
+
+def start_analysis_job(paper_id: str) -> dict:
+    payload = get_reading_status_payload(paper_id)
+    if payload["analysis"] == "in_progress":
+        return {"started": False, "status": payload}
+    bundle = load_reading_bundle(paper_id)
+    if not bundle:
+        raise ValueError("阅读工作区不存在")
+    paper_json_path = bundle["workspace"] / "paper.json"
+    update_paper_status(paper_json_path, analysis="in_progress")
+    update_paper_analysis_progress(
+        paper_json_path,
+        state="in_progress",
+        progress=2,
+        stage="queued",
+        message="任务已提交，等待后台开始分析。",
+    )
+    thread = threading.Thread(target=run_analysis_job, args=(paper_id,), daemon=True)
+    thread.start()
+    return {"started": True, "status": get_reading_status_payload(paper_id)}
 
 
 def reconstruct_abstract(inverted_index: dict | None) -> str:
@@ -1830,7 +2530,7 @@ def build_keywords_html():
       <div class="row">
         <div>
           <h1>Keywords</h1>
-          <div class="muted">这里汇总了所有命中词，并按最近新增论文的时间倒序排列。点击某个关键词即可进入该关键词下的论文列表。</div>
+          <div class="muted">这里汇总了所有关键词，并按最近新增论文的时间倒序排列。除了原始搜索命中词，也会展示深度阅读分析后回写到文献上的关键词。</div>
         </div>
         <div class="actions">
           <a href="/">返回时间线</a>
@@ -1853,16 +2553,22 @@ def build_keyword_detail_html(keyword: str):
     group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
     payload_json = json.dumps(entry["papers"], ensure_ascii=False).replace("</script>", "<\\/script>")
     for idx, paper in enumerate(entry["papers"], start=1):
+        source_kind = paper.get("source_kind") or "search"
         meta_parts = [
             f"CSV #{paper['csv_index']}" if paper.get("csv_index") else "",
             paper.get("venue") or "",
             str(paper.get("year") or ""),
             paper.get("authors") or "",
-            f"来源搜索：{paper['source_slug']}",
+            f"来源：{'深度阅读' if source_kind == 'deep_reading' else ('搜索 ' + str(paper.get('source_slug') or ''))}",
         ]
         meta_text = " · ".join(part for part in meta_parts if part)
         doi_text = f"DOI: {escape(paper['doi'])}" if paper.get("doi") else ""
         link_html = f'<a href="{paper["url"]}" target="_blank" rel="noreferrer">原文链接</a>' if paper.get("url") else ""
+        reading_link_html = (
+            f'<a href="{paper["source_site_url"]}" target="_blank" rel="noreferrer">打开阅读页</a>'
+            if source_kind == "deep_reading" and paper.get("source_site_url")
+            else ""
+        )
         cards.append(
             f"""
             <article class="card">
@@ -1883,6 +2589,7 @@ def build_keyword_detail_html(keyword: str):
               </div>
               <div class="links">
                 {link_html}
+                {reading_link_html}
                 <button class="action" type="button" onclick="addKeywordCitation({idx})">加入深度阅读</button>
                 <button class="action secondary" type="button" onclick="expandKeywordPaper({idx})">扩展搜索</button>
               </div>
@@ -1941,7 +2648,7 @@ def build_keyword_detail_html(keyword: str):
       <div class="row">
         <div>
           <h1>{escape(entry['keyword'])}</h1>
-          <div class="muted">共 {entry['count']} 篇论文。这里汇总了所有原始搜索中命中该关键词的论文。</div>
+          <div class="muted">共 {entry['count']} 篇论文。这里同时汇总原始搜索命中词，以及深度阅读分析后回写到文献上的关键词。</div>
         </div>
         <div class="actions">
           <a href="/keywords">返回 Keywords</a>
@@ -2158,6 +2865,8 @@ def build_reading_detail_html(paper_id: str):
     method = (modules.get("method") or {}).get("data") or {}
     results = (modules.get("results") or {}).get("data") or {}
     critique = (modules.get("critique") or {}).get("data") or {}
+    qa_history = bundle.get("qa_history") or []
+    notes = bundle.get("notes") or {}
 
     def render_list(items, empty="等待分析生成"):
         values = items or []
@@ -2171,10 +2880,27 @@ def build_reading_detail_html(paper_id: str):
         f"<li><strong>{escape(item.get('id') or '')}</strong> {escape(item.get('claim') or '')}<div>{escape(item.get('evidence') or '')}</div></li>"
         for item in (results.get("findings") or [])
     ) or "<li>等待分析生成</li>"
+    qa_history_html = "".join(
+        f"""
+        <article class="qa-item" data-qa-id="{escape(item.get("id") or "")}">
+          <div class="qa-meta">{escape(item.get("created_at") or "")}</div>
+          <div class="qa-q"><strong>问：</strong>{escape(item.get("question") or "")}</div>
+          <div class="qa-a"><strong>答：</strong>{escape(item.get("answer") or "").replace(chr(10), "<br>")}</div>
+          <div class="qa-toolbar"><button class="delete-qa" type="button" data-qa-id="{escape(item.get("id") or "")}">删除这条提问</button></div>
+        </article>
+        """
+        for item in reversed(qa_history)
+    ) or '<div class="meta" id="qa-empty">还没有提问记录，先问一个你关心的问题吧。</div>'
     pdf_path = ((paper.get("pdf") or {}).get("file_path") or "").strip()
     pdf_link = f'<a href="{escape(pdf_path)}" target="_blank" rel="noreferrer">打开 PDF</a>' if pdf_path else ""
     analysis_status = ((paper.get("status") or {}).get("analysis") or "pending").strip()
-    analyze_label = "重新分析" if analysis_status == "completed" else "开始分析"
+    analysis_progress = int(((paper.get("status") or {}).get("analysis_progress") or 0) or 0)
+    analysis_message = (paper.get("status") or {}).get("analysis_message") or ""
+    has_analysis_content = any(
+        bool(((modules.get(name) or {}).get("data") or {}))
+        for name in ("overview", "problem", "method", "results", "critique")
+    )
+    analyze_label = "重新分析" if analysis_status == "completed" or has_analysis_content else "开始分析"
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2191,8 +2917,26 @@ def build_reading_detail_html(paper_id: str):
     .actions, .meta, .grid {{ display:flex; gap:10px; flex-wrap:wrap; }}
     .actions a {{ display:inline-block; background:#9c4f2f; color:white; text-decoration:none; padding:10px 14px; border-radius:999px; }}
     .meta {{ color:#6f685c; line-height:1.8; font-size:14px; margin-top:8px; }}
+    .progress-shell {{ margin-top:14px; border:1px solid #e3d8c8; border-radius:16px; padding:12px 14px; background:#fffdfa; }}
+    .progress-row {{ display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; }}
+    .progress-track {{ width:100%; height:10px; border-radius:999px; background:#ead8ca; overflow:hidden; margin-top:10px; }}
+    .progress-bar {{ height:100%; width:0%; background:linear-gradient(90deg, #c8733f, #9c4f2f); }}
     .grid.cards {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }}
     .card {{ border:1px solid #e3d8c8; border-radius:18px; padding:14px; background:#fffdfa; }}
+    .qa-form {{ display:grid; gap:10px; }}
+    .qa-form textarea {{ width:100%; min-height:110px; resize:vertical; border:1px solid #d5cbba; border-radius:16px; padding:12px 14px; font:inherit; background:#fffdfa; }}
+    .qa-actions {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+    .qa-actions button {{ display:inline-block; background:#9c4f2f; color:white; text-decoration:none; padding:10px 14px; border-radius:999px; border:none; font:inherit; cursor:pointer; }}
+    .qa-list {{ display:grid; gap:12px; margin-top:16px; }}
+    .qa-item {{ border:1px solid #e3d8c8; border-radius:18px; padding:14px; background:#fffdfa; }}
+    .qa-meta {{ color:#8a7d6a; font-size:13px; margin-bottom:8px; }}
+    .qa-q, .qa-a {{ line-height:1.8; }}
+    .qa-a {{ margin-top:8px; }}
+    .qa-toolbar {{ margin-top:10px; }}
+    .qa-toolbar button, .note-box button {{ border:none; background:#6f6455; color:white; padding:8px 12px; border-radius:999px; cursor:pointer; font:inherit; }}
+    .note-box {{ margin-top:14px; border:1px solid #e3d8c8; border-radius:18px; padding:14px; background:#fffdfa; }}
+    .note-box textarea {{ width:100%; min-height:110px; resize:vertical; border:1px solid #d5cbba; border-radius:14px; padding:12px 14px; font:inherit; background:white; }}
+    .note-toolbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px; }}
     .cols {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
     h1 {{ margin:0 0 8px; font-size:42px; line-height:1.1; }}
     h2 {{ margin:0 0 10px; font-size:28px; }}
@@ -2209,6 +2953,14 @@ def build_reading_detail_html(paper_id: str):
       <h1>{escape(paper.get("title") or "Untitled Paper")}</h1>
       <div class="meta">{escape(", ".join(paper.get("authors") or []) or "未知作者")} · {escape(str(paper.get("venue") or "未知 venue"))} · {escape(str(paper.get("year") or "未知年份"))}</div>
       <div class="meta">Theme: {escape(overview.get("research_theme") or "待生成")} · DOI: {escape(paper.get("doi") or "无")} · Analysis: {escape(analysis_status)}</div>
+      <div class="progress-shell" id="analysis-progress-shell">
+        <div class="progress-row">
+          <strong id="analysis-stage">{escape(analysis_status)}</strong>
+          <span id="analysis-percent">{analysis_progress}%</span>
+        </div>
+        <div class="meta" id="analysis-message">{escape(analysis_message or "准备开始分析。")}</div>
+        <div class="progress-track"><div class="progress-bar" id="analysis-progress-bar" style="width:{analysis_progress}%;"></div></div>
+      </div>
     </section>
     <section class="section">
       <h2>Overview</h2>
@@ -2218,6 +2970,11 @@ def build_reading_detail_html(paper_id: str):
         <div class="card"><h3>Core Approach</h3><p>{escape(overview.get("core_approach") or "等待分析生成")}</p></div>
       </div>
       <div class="card" style="margin-top:12px;"><h3>Contributions</h3><ul>{render_list(overview.get("contributions"))}</ul></div>
+      <div class="note-box">
+        <h3>Overview Notes</h3>
+        <textarea class="module-note-input" data-module="overview" placeholder="手工记录你对 Overview 的阅读笔记...">{escape(notes.get("overview") or "")}</textarea>
+        <div class="note-toolbar"><button class="save-note" type="button" data-module="overview">保存 Notes</button><span class="meta module-note-status" data-module="overview">手工 Notes 会保存在当前论文下。</span></div>
+      </div>
     </section>
     <section class="section">
       <h2>Problem</h2>
@@ -2228,6 +2985,11 @@ def build_reading_detail_html(paper_id: str):
         <div class="card"><h3>Goal</h3><p>{escape(problem.get("research_goal") or "等待分析生成")}</p></div>
       </div>
       <div class="card" style="margin-top:12px;"><h3>Paper Logic</h3><ul>{logic}</ul></div>
+      <div class="note-box">
+        <h3>Problem Notes</h3>
+        <textarea class="module-note-input" data-module="problem" placeholder="手工记录你对 Problem 的阅读笔记...">{escape(notes.get("problem") or "")}</textarea>
+        <div class="note-toolbar"><button class="save-note" type="button" data-module="problem">保存 Notes</button><span class="meta module-note-status" data-module="problem">手工 Notes 会保存在当前论文下。</span></div>
+      </div>
     </section>
     <section class="section">
       <h2>Method</h2>
@@ -2238,11 +3000,21 @@ def build_reading_detail_html(paper_id: str):
         <div class="card"><h3>Evaluation</h3><p>{escape(method.get("evaluation_setup") or "等待分析生成")}</p></div>
       </div>
       <div class="card" style="margin-top:12px;"><h3>Pipeline</h3><ul>{render_list(method.get("pipeline"))}</ul></div>
+      <div class="note-box">
+        <h3>Method Notes</h3>
+        <textarea class="module-note-input" data-module="method" placeholder="手工记录你对 Method 的阅读笔记...">{escape(notes.get("method") or "")}</textarea>
+        <div class="note-toolbar"><button class="save-note" type="button" data-module="method">保存 Notes</button><span class="meta module-note-status" data-module="method">手工 Notes 会保存在当前论文下。</span></div>
+      </div>
     </section>
     <section class="section">
       <h2>Results</h2>
       <div class="card"><h3>Claim-Evidence Match</h3><p>{escape(results.get("claim_evidence_match") or "等待分析生成")}</p></div>
       <div class="card" style="margin-top:12px;"><h3>Findings</h3><ul>{findings}</ul></div>
+      <div class="note-box">
+        <h3>Results Notes</h3>
+        <textarea class="module-note-input" data-module="results" placeholder="手工记录你对 Results 的阅读笔记...">{escape(notes.get("results") or "")}</textarea>
+        <div class="note-toolbar"><button class="save-note" type="button" data-module="results">保存 Notes</button><span class="meta module-note-status" data-module="results">手工 Notes 会保存在当前论文下。</span></div>
+      </div>
     </section>
     <section class="section">
       <h2>Critique</h2>
@@ -2250,14 +3022,116 @@ def build_reading_detail_html(paper_id: str):
         <div class="card"><h3>Strengths</h3><ul>{render_list(critique.get("strengths"))}</ul></div>
         <div class="card"><h3>Limitations</h3><ul>{render_list(critique.get("limitations"))}</ul></div>
       </div>
+      <div class="note-box">
+        <h3>Critique Notes</h3>
+        <textarea class="module-note-input" data-module="critique" placeholder="手工记录你对 Critique 的阅读笔记...">{escape(notes.get("critique") or "")}</textarea>
+        <div class="note-toolbar"><button class="save-note" type="button" data-module="critique">保存 Notes</button><span class="meta module-note-status" data-module="critique">手工 Notes 会保存在当前论文下。</span></div>
+      </div>
+    </section>
+    <section class="section">
+      <h2>提问</h2>
+      <div class="qa-form">
+        <textarea id="qa-question" placeholder="比如：这篇论文的方法创新点是什么？实验设计有哪些局限？"></textarea>
+        <div class="qa-actions">
+          <button id="ask-question" type="button">提交问题</button>
+          <span class="meta" id="qa-status">提问内容会保存到当前论文的阅读历史中。</span>
+        </div>
+      </div>
+      <div class="qa-list" id="qa-history">{qa_history_html}</div>
     </section>
   </main>
   <script>
     const runBtn = document.getElementById('run-analysis');
+    const progressBar = document.getElementById('analysis-progress-bar');
+    const progressPercent = document.getElementById('analysis-percent');
+    const progressStage = document.getElementById('analysis-stage');
+    const progressMessage = document.getElementById('analysis-message');
+    let pollingTimer = null;
+    const askBtn = document.getElementById('ask-question');
+    const qaQuestion = document.getElementById('qa-question');
+    const qaStatus = document.getElementById('qa-status');
+    const qaHistory = document.getElementById('qa-history');
+    const noteButtons = Array.from(document.querySelectorAll('.save-note'));
+
+    function escapeHtml(value) {{
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }}
+
+    function appendQaItem(item) {{
+      if (!qaHistory) return;
+      const empty = document.getElementById('qa-empty');
+      if (empty) empty.remove();
+      const wrapper = document.createElement('article');
+      wrapper.className = 'qa-item';
+      wrapper.innerHTML = `
+        <div class="qa-meta">${{escapeHtml(item.created_at || '')}}</div>
+        <div class="qa-q"><strong>问：</strong>${{escapeHtml(item.question || '')}}</div>
+        <div class="qa-a"><strong>答：</strong>${{escapeHtml(item.answer || '').replaceAll('\\n', '<br>')}}</div>
+        <div class="qa-toolbar"><button class="delete-qa" type="button" data-qa-id="${{escapeHtml(item.id || '')}}">删除这条提问</button></div>
+      `;
+      qaHistory.prepend(wrapper);
+    }}
+
+    function renderStatus(payload) {{
+      const progress = Number(payload.analysis_progress || 0);
+      if (progressBar) progressBar.style.width = progress + '%';
+      if (progressPercent) progressPercent.textContent = progress + '%';
+      if (progressStage) progressStage.textContent = payload.analysis || 'pending';
+      if (progressMessage) progressMessage.textContent = payload.analysis_message || '准备开始分析。';
+      if (runBtn) {{
+        if (payload.analysis === 'in_progress') {{
+          runBtn.textContent = '分析中...';
+          runBtn.style.pointerEvents = 'none';
+          runBtn.style.opacity = '0.7';
+        }} else {{
+          runBtn.textContent = payload.analysis === 'completed' ? '重新分析' : '开始分析';
+          runBtn.style.pointerEvents = '';
+          runBtn.style.opacity = '';
+        }}
+      }}
+    }}
+
+    async function fetchStatus() {{
+      const resp = await fetch('/api/reading/{paper_id}/status', {{
+        credentials: 'same-origin'
+      }});
+      const data = await resp.json().catch(() => ({{ ok:false, error:'状态获取失败' }}));
+      if (!resp.ok || data.ok === false) {{
+        throw new Error(data.error || '状态获取失败');
+      }}
+      return data.status;
+    }}
+
+    async function pollStatus() {{
+      try {{
+        const status = await fetchStatus();
+        renderStatus(status);
+        if (status.analysis === 'in_progress') {{
+          pollingTimer = window.setTimeout(pollStatus, 2000);
+          return;
+        }}
+        pollingTimer = null;
+        if (status.analysis === 'completed') {{
+          window.location.reload();
+          return;
+        }}
+        if (status.analysis === 'failed') {{
+          alert(status.analysis_message || '分析失败');
+        }}
+      }} catch (error) {{
+        pollingTimer = window.setTimeout(pollStatus, 3000);
+      }}
+    }}
+
     if (runBtn) {{
       runBtn.addEventListener('click', async (event) => {{
         event.preventDefault();
-        runBtn.textContent = '分析中...';
+        renderStatus({{ analysis: 'in_progress', analysis_progress: 5, analysis_message: '已提交分析任务，正在排队。' }});
         const resp = await fetch('/api/reading/{paper_id}/analyze', {{
           method: 'POST',
           credentials: 'same-origin'
@@ -2265,12 +3139,101 @@ def build_reading_detail_html(paper_id: str):
         const data = await resp.json().catch(() => ({{ ok:false, error:'分析失败' }}));
         if (!resp.ok || data.ok === false) {{
           alert(data.error || '分析失败');
-          runBtn.textContent = '{analyze_label}';
+          renderStatus({{ analysis: '{analysis_status}', analysis_progress: {analysis_progress}, analysis_message: '{escape(analysis_message or "准备开始分析。")}' }});
           return;
         }}
-        window.location.reload();
+        renderStatus(data.status || {{ analysis: 'in_progress', analysis_progress: 5, analysis_message: '已提交分析任务。' }});
+        if (!pollingTimer) pollStatus();
+      }});
+      if ('{analysis_status}' === 'in_progress') {{
+        pollStatus();
+      }}
+    }}
+
+    if (askBtn && qaQuestion) {{
+      askBtn.addEventListener('click', async () => {{
+        const question = qaQuestion.value.trim();
+        if (!question) {{
+          alert('请先输入问题。');
+          return;
+        }}
+        askBtn.disabled = true;
+        askBtn.textContent = '回答中...';
+        if (qaStatus) qaStatus.textContent = '正在根据论文内容生成回答...';
+        const resp = await fetch('/api/reading/{paper_id}/questions', {{
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ question }})
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'提问失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '提问失败');
+          askBtn.disabled = false;
+          askBtn.textContent = '提交问题';
+          if (qaStatus) qaStatus.textContent = '提问内容会保存到当前论文的阅读历史中。';
+          return;
+        }}
+        appendQaItem(data.item || {{}});
+        qaQuestion.value = '';
+        askBtn.disabled = false;
+        askBtn.textContent = '提交问题';
+        if (qaStatus) qaStatus.textContent = '回答已保存到提问历史。';
       }});
     }}
+
+    if (qaHistory) {{
+      qaHistory.addEventListener('click', async (event) => {{
+        const btn = event.target.closest('.delete-qa');
+        if (!btn) return;
+        const qaId = btn.dataset.qaId || '';
+        if (!qaId) return;
+        if (!confirm('确定删除这条提问记录吗？')) return;
+        const resp = await fetch('/api/reading/{paper_id}/questions/' + encodeURIComponent(qaId), {{
+          method: 'DELETE',
+          credentials: 'same-origin'
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'删除失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '删除失败');
+          return;
+        }}
+        const item = btn.closest('.qa-item');
+        if (item) item.remove();
+        if (!qaHistory.querySelector('.qa-item')) {{
+          qaHistory.innerHTML = '<div class="meta" id="qa-empty">还没有提问记录，先问一个你关心的问题吧。</div>';
+        }}
+      }});
+    }}
+
+    noteButtons.forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const moduleName = button.dataset.module || '';
+        const input = document.querySelector('.module-note-input[data-module="' + moduleName + '"]');
+        const status = document.querySelector('.module-note-status[data-module="' + moduleName + '"]');
+        const content = input ? input.value : '';
+        button.disabled = true;
+        button.textContent = '保存中...';
+        if (status) status.textContent = '正在保存手工 Notes...';
+        const resp = await fetch('/api/reading/{paper_id}/notes', {{
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ module: moduleName, content }})
+        }});
+        const data = await resp.json().catch(() => ({{ ok:false, error:'保存失败' }}));
+        if (!resp.ok || data.ok === false) {{
+          alert(data.error || '保存失败');
+          button.disabled = false;
+          button.textContent = '保存 Notes';
+          if (status) status.textContent = '手工 Notes 会保存在当前论文下。';
+          return;
+        }}
+        button.disabled = false;
+        button.textContent = '保存 Notes';
+        if (status) status.textContent = 'Notes 已保存。';
+      }});
+    }});
   </script>
 </body>
 </html>"""
@@ -2300,13 +3263,14 @@ def build_library_html():
     cards = []
     for item in items:
         doi_text = f"DOI: {item['doi']}" if item.get("doi") else "无 DOI"
-        url_html = f'<a href="{item["url"]}" target="_blank" rel="noreferrer">原文链接</a>' if item.get("url") else ""
+        url_html = f'<a class="action-link action-link-secondary" href="{item["url"]}" target="_blank" rel="noreferrer">原文链接</a>' if item.get("url") else ""
         has_pdf = citation_has_pdf(item)
         reading_ready = bool(item.get("reading_paper_id")) and reading_json_ready(item.get("reading_paper_id"))
+        upload_label = "更新 PDF" if has_pdf else "上传 PDF"
         if has_pdf:
             reading_label = "打开深度阅读" if reading_ready else "生成深度阅读"
-            reading_button = f'<button class="deep-reading-link" type="button" data-id="{item["id"]}" data-paper-id="{item.get("reading_paper_id") or ""}" data-ready="{str(reading_ready).lower()}">{reading_label}</button>'
-            reading_hint = ""
+            reading_button = f'<button class="deep-reading-link action-link action-link-primary" type="button" data-id="{item["id"]}" data-paper-id="{item.get("reading_paper_id") or ""}" data-ready="{str(reading_ready).lower()}">{reading_label}</button>'
+            reading_hint = "已绑定 PDF，可直接进入深度阅读"
         else:
             reading_button = ""
             reading_hint = "上传 PDF 后可进入深度阅读"
@@ -2346,11 +3310,19 @@ def build_library_html():
               <p>{item.get("abstract") or "暂无摘要"}</p>
               <div class="links">
                 {url_html}
-                <button class="upload-pdf-link" type="button" data-id="{item["id"]}">上传 PDF</button>
+                <button class="upload-pdf-link action-link action-link-upload" type="button" data-id="{item["id"]}">{upload_label}</button>
                 <input class="upload-pdf-input" type="file" accept="application/pdf,.pdf" style="display:none;">
                 {reading_button}
-                <button class="remove-reading-link" type="button" data-id="{item["id"]}">移出深度阅读</button>
+                <button class="remove-reading-link action-link action-link-danger" type="button" data-id="{item["id"]}">删除深度阅读</button>
+              </div>
+              <div class="links-meta">
                 <span class="muted">{reading_hint}</span>
+              </div>
+              <div class="upload-progress" style="display:none; margin-top:10px;">
+                <div class="meta upload-progress-label">准备上传...</div>
+                <div style="width:100%; height:8px; border-radius:999px; background:#ead8ca; overflow:hidden; margin-top:6px;">
+                  <div class="upload-progress-bar" style="height:100%; width:0%; background:linear-gradient(90deg, #c8733f, #9c4f2f);"></div>
+                </div>
               </div>
             </article>
             """
@@ -2393,9 +3365,59 @@ def build_library_html():
     }}
     h2 {{ margin:8px 0; font-size:24px; line-height:1.3; }}
     p {{ line-height:1.8; }}
-    .links a, .hero a, .hero button {{
+    .hero a, .hero button {{
       display:inline-block; background:#9c4f2f; color:white; text-decoration:none;
       padding:10px 14px; border-radius:999px; border:none; font:inherit; cursor:pointer;
+    }}
+    .links {{
+      display:flex;
+      gap:12px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin-top:14px;
+    }}
+    .links-meta {{
+      margin-top:10px;
+    }}
+    .action-link {{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      min-height:46px;
+      padding:12px 18px;
+      border-radius:16px;
+      border:1px solid transparent;
+      font:inherit;
+      font-weight:700;
+      letter-spacing:0.02em;
+      text-decoration:none;
+      cursor:pointer;
+      transition:transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+    }}
+    .action-link:hover {{
+      transform:translateY(-1px);
+      box-shadow:0 10px 20px rgba(76,50,28,0.12);
+    }}
+    .action-link-secondary {{
+      background:#fffaf3;
+      color:#7a4a2a;
+      border-color:#d6b89b;
+    }}
+    .action-link-upload {{
+      background:#fff;
+      color:#8a4e22;
+      border:2px dashed #c8733f;
+      box-shadow:inset 0 0 0 1px rgba(200,115,63,0.08);
+    }}
+    .action-link-primary {{
+      background:linear-gradient(135deg, #a6522d, #d06d3b);
+      color:white;
+      box-shadow:0 14px 28px rgba(156,79,47,0.22);
+    }}
+    .action-link-danger {{
+      background:#fff4f1;
+      color:#b33a2f;
+      border-color:#e2a49a;
     }}
     .empty {{ padding:24px; text-align:center; }}
     @media (max-width: 720px) {{
@@ -2405,7 +3427,7 @@ def build_library_html():
       .actions button, .hero a {{ width:100%; text-align:center; }}
       .filters .tag, .tag-row .tag {{ width:100%; text-align:center; }}
       .tag-editor input, .tag-editor button {{ width:100%; }}
-      .links a {{ width:100%; text-align:center; }}
+      .links .action-link {{ width:100%; text-align:center; }}
       h1 {{ font-size:32px; }}
       h2 {{ font-size:20px; }}
     }}
@@ -2431,6 +3453,12 @@ def build_library_html():
             </select>
             <input type="file" id="reading-pdf" accept="application/pdf,.pdf">
             <button id="reading-upload-btn" type="button">上传并生成阅读页</button>
+            <div id="reading-upload-progress" style="display:none; grid-column:1 / -1;">
+              <div class="meta" id="reading-upload-progress-label">准备上传...</div>
+              <div style="width:100%; height:8px; border-radius:999px; background:#ead8ca; overflow:hidden; margin-top:6px;">
+                <div id="reading-upload-progress-bar" style="height:100%; width:0%; background:linear-gradient(90deg, #c8733f, #9c4f2f);"></div>
+              </div>
+            </div>
           </div>
           <div id="group-management" style="display:none; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#faf8f5;">
             <div style="font-weight:600; margin-bottom:8px;">Reading Groups</div>
@@ -2572,6 +3600,43 @@ def build_library_html():
     const newGroupNameInput = document.getElementById('new-group-name');
     const newGroupDescInput = document.getElementById('new-group-desc');
     const readingUploadBtn = document.getElementById('reading-upload-btn');
+    const readingUploadProgress = document.getElementById('reading-upload-progress');
+    const readingUploadProgressBar = document.getElementById('reading-upload-progress-bar');
+    const readingUploadProgressLabel = document.getElementById('reading-upload-progress-label');
+
+    function setProgress(container, bar, label, percent, text) {{
+      if (container) container.style.display = 'block';
+      if (bar) bar.style.width = Math.max(0, Math.min(100, Number(percent || 0))) + '%';
+      if (label) label.textContent = text || '处理中...';
+    }}
+
+    function uploadWithProgress(url, formData, onProgress) {{
+      return new Promise((resolve, reject) => {{
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.withCredentials = true;
+        xhr.upload.addEventListener('progress', (event) => {{
+          if (!event.lengthComputable) return;
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onProgress(percent, percent < 100 ? `正在上传 PDF... ${{percent}}%` : '上传完成，等待服务器处理...');
+        }});
+        xhr.onload = () => {{
+          let data = null;
+          try {{
+            data = JSON.parse(xhr.responseText || '{{}}');
+          }} catch (error) {{
+            data = {{ ok: false, error: '响应解析失败' }};
+          }}
+          if (xhr.status >= 200 && xhr.status < 300 && data.ok !== false) {{
+            resolve(data);
+            return;
+          }}
+          reject(new Error((data && data.error) || '上传失败'));
+        }};
+        xhr.onerror = () => reject(new Error('网络错误，上传失败'));
+        xhr.send(formData);
+      }});
+    }}
 
     async function loadGroups() {{
       const resp = await fetch('/api/reading-groups', {{ credentials: 'same-origin' }});
@@ -2667,20 +3732,26 @@ def build_library_html():
         if (!file) return;
         const card = input.closest('.card');
         const citationId = card.dataset.citationId;
+        const progressBox = card.querySelector('.upload-progress');
+        const progressBar = card.querySelector('.upload-progress-bar');
+        const progressLabel = card.querySelector('.upload-progress-label');
         const formData = new FormData();
         formData.append('pdf', file);
-        const resp = await fetch('/api/citations/' + citationId + '/pdf', {{
-          method: 'POST',
-          credentials: 'same-origin',
-          body: formData
-        }});
-        const data = await resp.json().catch(() => ({{ ok:false, error:'上传失败' }}));
-        if (!resp.ok || data.ok === false) {{
-          alert(data.error || '上传失败');
+        try {{
+          const data = await uploadWithProgress('/api/citations/' + citationId + '/pdf', formData, (percent, text) => {{
+            setProgress(progressBox, progressBar, progressLabel, percent, text);
+          }});
+          setProgress(progressBox, progressBar, progressLabel, 100, 'PDF 已上传并绑定文献。');
+          if (data.reading_url) {{
+            window.location.href = data.reading_url;
+            return;
+          }}
+          window.location.reload();
+        }} catch (error) {{
+          alert(error.message || '上传失败');
           input.value = '';
           return;
         }}
-        window.location.reload();
       }});
     }});
 
@@ -2709,7 +3780,7 @@ def build_library_html():
     document.querySelectorAll('.remove-reading-link').forEach((btn) => {{
       btn.addEventListener('click', async () => {{
         const citationId = btn.dataset.id;
-        if (!confirm('确定将该文献移出深度阅读吗？不会删除文献记录本身。')) return;
+        if (!confirm('确定删除这篇深度阅读文献吗？相关的阅读页、分析、提问、Notes、分组关联与独占 PDF 都会一起删除。')) return;
         const resp = await fetch('/api/citations/' + citationId + '/reading', {{
           method: 'DELETE',
           credentials: 'same-origin'
@@ -2734,17 +3805,20 @@ def build_library_html():
         }}
         if (groupId) formData.append('group_id', groupId);
         formData.append('pdf', pdfFile);
-        const resp = await fetch('/api/reading/upload', {{
-          method: 'POST',
-          credentials: 'same-origin',
-          body: formData
-        }});
-        const data = await resp.json().catch(() => ({{ ok:false, error:'上传失败' }}));
-        if (!resp.ok || data.ok === false) {{
-          alert(data.error || '上传失败');
+        try {{
+          const data = await uploadWithProgress('/api/reading/upload', formData, (percent, text) => {{
+            setProgress(readingUploadProgress, readingUploadProgressBar, readingUploadProgressLabel, percent, text);
+          }});
+          setProgress(readingUploadProgress, readingUploadProgressBar, readingUploadProgressLabel, 100, '上传完成，正在跳转阅读页。');
+          if (data.reading_url) {{
+            window.location.href = data.reading_url;
+            return;
+          }}
+          window.location.reload();
+        }} catch (error) {{
+          alert(error.message || '上传失败');
           return;
         }}
-        window.location.reload();
       }});
     }}
   </script>
@@ -2839,6 +3913,23 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_header("Location", "/login")
             self.end_headers()
 
+    def handle_server_error(self, exc: Exception):
+        error_log = Path("/tmp/exscholar-serve-errors.log")
+        message = (
+            f"[{utc_now()}] {self.command} {self.path}\n"
+            f"{traceback.format_exc()}\n"
+        )
+        try:
+            error_log.parent.mkdir(parents=True, exist_ok=True)
+            with error_log.open("a", encoding="utf-8") as fh:
+                fh.write(message)
+        except Exception:
+            pass
+        if self.path.startswith("/api/"):
+            self.send_json({"ok": False, "error": f"server_error: {exc}"}, status=500)
+        else:
+            self.send_html("<!doctype html><html lang='zh-CN'><body><h1>Server Error</h1></body></html>", status=500)
+
     def do_GET(self):
         if self.path == "/api/auth/status":
             self.send_json({"ok": True, "authenticated": self.is_authenticated(), "require_password": require_password()})
@@ -2870,7 +3961,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_html(build_keyword_detail_html(keyword))
             return
 
-        if self.path in ("/library", "/reading"):
+        if self.path in ("/library", "/library/", "/reading", "/reading/"):
             self.send_html(build_library_html())
             return
 
@@ -2883,6 +3974,20 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     return
                 self.send_html("<!doctype html><html lang='zh-CN'><body><h1>该阅读页缺少可访问的 PDF，暂时不能打开。</h1></body></html>", status=404)
                 return
+
+        if self.path.startswith("/api/reading/") and self.path.endswith("/status"):
+            paper_id = unquote(self.path[len("/api/reading/"):]).strip().strip("/")
+            paper_id = paper_id[:-len("/status")].rstrip("/") if paper_id.endswith("/status") else paper_id
+            if not paper_id:
+                self.send_json({"ok": False, "error": "paper id 不合法"}, status=400)
+                return
+            try:
+                status_payload = get_reading_status_payload(paper_id)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=404)
+                return
+            self.send_json({"ok": True, "status": status_payload})
+            return
 
         if self.path == "/api/citations":
             self.send_json({"ok": True, "items": list_citations_with_groups()})
@@ -2899,6 +4004,12 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        try:
+            self._do_POST_impl()
+        except Exception as exc:
+            self.handle_server_error(exc)
+
+    def _do_POST_impl(self):
         if self.path == "/api/auth/login":
             data = self.parse_body()
             password = data.get("password", "")
@@ -2954,11 +4065,18 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "missing_title"}, status=400)
                 return
             try:
-                pdf_path = store_uploaded_pdf(data.get("pdf"), paper.get("title") or "")
+                pdf_record = store_uploaded_pdf(data.get("pdf"), paper.get("title") or "")
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
                 return
-            citation_id = upsert_citation(paper, search_slug, pdf_path=pdf_path or None)
+            pdf_path = pdf_record.get("pdf_path") or ""
+            pdf_sha256 = pdf_record.get("pdf_sha256") or ""
+            citation_id = upsert_citation(
+                paper,
+                search_slug,
+                pdf_path=pdf_path or None,
+                pdf_sha256=pdf_sha256 or None,
+            )
             reading_url = ""
             if group_id_raw not in (None, ""):
                 try:
@@ -2973,7 +4091,6 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     add_citation_to_group(citation_id, group_id)
             if pdf_path and citation_id:
                 reading = ensure_reading_workspace_for_citation(citation_id)
-                analyze_reading_paper(reading["paper_id"])
                 reading_url = reading["reading_url"]
             self.send_json(
                 {
@@ -2981,6 +4098,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     "message": "已加入深度阅读。",
                     "citation_id": citation_id,
                     "pdf_path": pdf_path or "",
+                    "pdf_reused": bool(pdf_record.get("reused")),
                     "reading_url": reading_url,
                 }
             )
@@ -3040,25 +4158,22 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/reading/upload":
             data = self.parse_body()
             try:
-                pdf_path = store_uploaded_pdf(data.get("pdf"), (data.get("title") or "").strip())
+                pdf_record = store_uploaded_pdf(data.get("pdf"), (data.get("title") or "").strip())
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
                 return
+            pdf_path = pdf_record.get("pdf_path") or ""
+            pdf_sha256 = pdf_record.get("pdf_sha256") or ""
             if not pdf_path:
                 self.send_json({"ok": False, "error": "缺少 PDF 文件"}, status=400)
                 return
-            try:
-                file_meta = moonshot_upload_pdf(DATA_DIR / pdf_path)
-                file_id = file_meta.get("id") or file_meta.get("file_id") or ""
-                if not file_id:
-                    raise ValueError("Moonshot files 接口未返回 file id")
-                raw_content = moonshot_get_file_content(file_id)
-                normalized = normalize_full_text_payload(raw_content)
-                metadata = moonshot_extract_metadata(normalized["text"], Path(pdf_path).name)
-            except Exception as exc:
-                self.send_json({"ok": False, "error": f"PDF 元信息识别失败: {exc}"}, status=500)
-                return
-            citation, matched = create_or_match_citation_from_metadata(metadata, pdf_path=pdf_path)
+            existing = find_existing_pdf_by_hash(pdf_sha256) if pdf_sha256 else None
+            citation = get_citation_by_id(int(existing["id"])) if existing else None
+            matched = bool(citation)
+            metadata = {}
+            if not citation:
+                citation_id = create_placeholder_citation_for_pdf(pdf_path, pdf_sha256)
+                citation = get_citation_by_id(citation_id)
             if not citation:
                 self.send_json({"ok": False, "error": "无法创建文献记录"}, status=500)
                 return
@@ -3068,16 +4183,24 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     add_citation_to_group(int(citation["id"]), int(group_id_raw))
                 except Exception:
                     pass
-            reading = ensure_reading_workspace_for_citation(int(citation["id"]))
-            analyze_reading_paper(reading["paper_id"])
+            try:
+                reading = ensure_reading_workspace_for_citation(int(citation["id"]))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"创建阅读工作区失败: {exc}"}, status=500)
+                return
+            if not matched:
+                start_uploaded_pdf_metadata_job(int(citation["id"]), pdf_path, reading["paper_id"])
             self.send_json(
                 {
                     "ok": True,
                     "citation_id": citation["id"],
                     "matched_existing": matched,
                     "metadata": metadata,
+                    "pdf_path": pdf_path,
+                    "pdf_reused": bool(pdf_record.get("reused")),
                     "reading_url": reading["reading_url"],
                     "paper_id": reading["paper_id"],
+                    "message": "PDF 已上传，元数据正在后台识别。",
                 }
             )
             return
@@ -3095,22 +4218,32 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "Citation 不存在"}, status=404)
                 return
             try:
-                pdf_path = store_uploaded_pdf(data.get("pdf"), citation.get("title") or "")
+                pdf_record = store_uploaded_pdf(data.get("pdf"), citation.get("title") or "")
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
                 return
+            pdf_path = pdf_record.get("pdf_path") or ""
+            pdf_sha256 = pdf_record.get("pdf_sha256") or ""
             if not pdf_path:
                 self.send_json({"ok": False, "error": "缺少 PDF 文件"}, status=400)
                 return
-            update_citation_pdf(citation_id, pdf_path)
+            update_citation_pdf(citation_id, pdf_path, pdf_sha256)
             citation = get_citation_by_id(citation_id)
             reading_url = ""
-            if citation and citation.get("reading_paper_id"):
+            if citation:
                 try:
                     reading_url = ensure_reading_workspace_for_citation(citation_id)["reading_url"]
                 except Exception:
                     reading_url = ""
-            self.send_json({"ok": True, "message": "PDF 已绑定到该文献。", "pdf_path": pdf_path, "reading_url": reading_url})
+            self.send_json(
+                {
+                    "ok": True,
+                    "message": "PDF 已绑定到该文献。",
+                    "pdf_path": pdf_path,
+                    "pdf_reused": bool(pdf_record.get("reused")),
+                    "reading_url": reading_url,
+                }
+            )
             return
 
         if self.path.startswith("/api/citations/") and "/groups/" in self.path:
@@ -3146,11 +4279,6 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=400)
                 return
-            try:
-                analyze_reading_paper(reading["paper_id"])
-            except Exception as exc:
-                self.send_json({"ok": False, "error": f"分析失败: {exc}"}, status=500)
-                return
             self.send_json({"ok": True, "reading_url": reading["reading_url"], "paper_id": reading["paper_id"]})
             return
 
@@ -3161,11 +4289,54 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "paper id 不合法"}, status=400)
                 return
             try:
-                analyze_reading_paper(paper_id)
+                result = start_analysis_job(paper_id)
             except Exception as exc:
                 self.send_json({"ok": False, "error": f"分析失败: {exc}"}, status=500)
                 return
-            self.send_json({"ok": True, "message": "分析完成。"})
+            self.send_json(
+                {
+                    "ok": True,
+                    "message": "分析任务已启动。" if result.get("started") else "分析任务已在运行。",
+                    "started": bool(result.get("started")),
+                    "status": result.get("status") or {},
+                }
+            )
+            return
+
+        if self.path.startswith("/api/reading/") and self.path.endswith("/questions"):
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            paper_id = parts[2] if len(parts) >= 4 else ""
+            if not paper_id:
+                self.send_json({"ok": False, "error": "paper id 不合法"}, status=400)
+                return
+            data = self.parse_body()
+            question = " ".join(str(data.get("question") or "").split())
+            if not question:
+                self.send_json({"ok": False, "error": "问题不能为空"}, status=400)
+                return
+            try:
+                item = answer_reading_question(paper_id, question)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"提问失败: {exc}"}, status=500)
+                return
+            self.send_json({"ok": True, "item": item})
+            return
+
+        if self.path.startswith("/api/reading/") and self.path.endswith("/notes"):
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            paper_id = parts[2] if len(parts) >= 4 else ""
+            if not paper_id:
+                self.send_json({"ok": False, "error": "paper id 不合法"}, status=400)
+                return
+            data = self.parse_body()
+            module_name = (data.get("module") or "").strip()
+            content = str(data.get("content") or "")
+            try:
+                item = save_manual_note(paper_id, module_name, content)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"保存 Notes 失败: {exc}"}, status=400)
+                return
+            self.send_json({"ok": True, "item": item})
             return
 
         if self.path == "/api/papers/expand-references":
@@ -3186,6 +4357,12 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         self.send_json({"ok": False, "error": "not_found"}, status=404)
 
     def do_DELETE(self):
+        try:
+            self._do_DELETE_impl()
+        except Exception as exc:
+            self.handle_server_error(exc)
+
+    def _do_DELETE_impl(self):
         if not self.is_authenticated():
             self.reject_unauthorized()
             return
@@ -3227,7 +4404,21 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "Citation 不存在"}, status=404)
                 return
             removed = remove_reading_workspace_for_citation(citation_id)
-            self.send_json({"ok": True, "message": "已移出深度阅读。", "removed": removed})
+            self.send_json({"ok": True, "message": "已删除该深度阅读文献及其相关数据。", "removed": removed})
+            return
+
+        if self.path.startswith("/api/reading/") and "/questions/" in self.path:
+            parts = [part for part in self.path.strip("/").split("/") if part]
+            paper_id = parts[2] if len(parts) >= 5 else ""
+            qa_id = parts[4] if len(parts) >= 5 else ""
+            if not paper_id or not qa_id:
+                self.send_json({"ok": False, "error": "路径参数不合法"}, status=400)
+                return
+            removed = delete_reading_question_history_item(paper_id, qa_id)
+            if not removed:
+                self.send_json({"ok": False, "error": "提问记录不存在"}, status=404)
+                return
+            self.send_json({"ok": True, "message": "提问记录已删除。"})
             return
 
         self.send_json({"ok": False, "error": "not_found"}, status=404)
