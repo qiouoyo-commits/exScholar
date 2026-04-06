@@ -1891,9 +1891,11 @@ def get_reading_status_payload(paper_id: str) -> dict:
         "paper_id": paper_id,
         "analysis": (status.get("analysis") or "pending").strip(),
         "ingestion": (status.get("ingestion") or "pending").strip(),
+        "metadata": (status.get("metadata") or "pending").strip(),
         "analysis_progress": int(status.get("analysis_progress") or 0),
         "analysis_stage": status.get("analysis_stage") or "",
         "analysis_message": status.get("analysis_message") or "",
+        "metadata_message": status.get("metadata_message") or "",
         "updated_at": paper.get("updated_at") or "",
     }
 
@@ -2893,6 +2895,8 @@ def build_reading_detail_html(paper_id: str):
     ) or '<div class="meta" id="qa-empty">还没有提问记录，先问一个你关心的问题吧。</div>'
     pdf_path = ((paper.get("pdf") or {}).get("file_path") or "").strip()
     pdf_link = f'<a href="{escape(pdf_path)}" target="_blank" rel="noreferrer">打开 PDF</a>' if pdf_path else ""
+    metadata_status = ((paper.get("status") or {}).get("metadata") or "pending").strip()
+    metadata_message = (paper.get("status") or {}).get("metadata_message") or ""
     analysis_status = ((paper.get("status") or {}).get("analysis") or "pending").strip()
     analysis_progress = int(((paper.get("status") or {}).get("analysis_progress") or 0) or 0)
     analysis_message = (paper.get("status") or {}).get("analysis_message") or ""
@@ -2953,6 +2957,13 @@ def build_reading_detail_html(paper_id: str):
       <h1>{escape(paper.get("title") or "Untitled Paper")}</h1>
       <div class="meta">{escape(", ".join(paper.get("authors") or []) or "未知作者")} · {escape(str(paper.get("venue") or "未知 venue"))} · {escape(str(paper.get("year") or "未知年份"))}</div>
       <div class="meta">Theme: {escape(overview.get("research_theme") or "待生成")} · DOI: {escape(paper.get("doi") or "无")} · Analysis: {escape(analysis_status)}</div>
+      <div class="progress-shell" id="metadata-progress-shell">
+        <div class="progress-row">
+          <strong>元数据识别</strong>
+          <span id="metadata-stage">{escape(metadata_status)}</span>
+        </div>
+        <div class="meta" id="metadata-message">{escape(metadata_message or "等待元数据识别。")}</div>
+      </div>
       <div class="progress-shell" id="analysis-progress-shell">
         <div class="progress-row">
           <strong id="analysis-stage">{escape(analysis_status)}</strong>
@@ -3046,7 +3057,10 @@ def build_reading_detail_html(paper_id: str):
     const progressPercent = document.getElementById('analysis-percent');
     const progressStage = document.getElementById('analysis-stage');
     const progressMessage = document.getElementById('analysis-message');
+    const metadataStage = document.getElementById('metadata-stage');
+    const metadataMessage = document.getElementById('metadata-message');
     let pollingTimer = null;
+    let lastMetadataState = '{metadata_status}';
     const askBtn = document.getElementById('ask-question');
     const qaQuestion = document.getElementById('qa-question');
     const qaStatus = document.getElementById('qa-status');
@@ -3078,6 +3092,8 @@ def build_reading_detail_html(paper_id: str):
     }}
 
     function renderStatus(payload) {{
+      if (metadataStage) metadataStage.textContent = payload.metadata || 'pending';
+      if (metadataMessage) metadataMessage.textContent = payload.metadata_message || '等待元数据识别。';
       const progress = Number(payload.analysis_progress || 0);
       if (progressBar) progressBar.style.width = progress + '%';
       if (progressPercent) progressPercent.textContent = progress + '%';
@@ -3101,6 +3117,11 @@ def build_reading_detail_html(paper_id: str):
         credentials: 'same-origin'
       }});
       const data = await resp.json().catch(() => ({{ ok:false, error:'状态获取失败' }}));
+      if (resp.status === 401) {{
+        const error = new Error(data.error || 'unauthorized');
+        error.code = 'unauthorized';
+        throw error;
+      }}
       if (!resp.ok || data.ok === false) {{
         throw new Error(data.error || '状态获取失败');
       }}
@@ -3110,8 +3131,14 @@ def build_reading_detail_html(paper_id: str):
     async function pollStatus() {{
       try {{
         const status = await fetchStatus();
+        const previousMetadataState = lastMetadataState;
+        lastMetadataState = status.metadata || 'pending';
         renderStatus(status);
-        if (status.analysis === 'in_progress') {{
+        if (previousMetadataState === 'processing' && status.metadata === 'completed') {{
+          window.location.reload();
+          return;
+        }}
+        if (status.analysis === 'in_progress' || status.metadata === 'processing') {{
           pollingTimer = window.setTimeout(pollStatus, 2000);
           return;
         }}
@@ -3124,6 +3151,10 @@ def build_reading_detail_html(paper_id: str):
           alert(status.analysis_message || '分析失败');
         }}
       }} catch (error) {{
+        if (error && error.code === 'unauthorized') {{
+          window.location.href = '/login';
+          return;
+        }}
         pollingTimer = window.setTimeout(pollStatus, 3000);
       }}
     }}
@@ -3145,7 +3176,7 @@ def build_reading_detail_html(paper_id: str):
         renderStatus(data.status || {{ analysis: 'in_progress', analysis_progress: 5, analysis_message: '已提交分析任务。' }});
         if (!pollingTimer) pollStatus();
       }});
-      if ('{analysis_status}' === 'in_progress') {{
+      if ('{analysis_status}' === 'in_progress' || '{metadata_status}' === 'processing') {{
         pollStatus();
       }}
     }}
