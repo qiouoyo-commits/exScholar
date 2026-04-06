@@ -929,7 +929,10 @@ class AsyncAbstractFetcher:
         self.stats_map[json_file]['total_papers'] += len(papers)
 
         # 过滤得到没有摘要的论文
-        filted_papers = [paper for paper in papers if ('abstract' not in paper and paper.get('type', '') != 'Editorship')]
+        filted_papers = [
+            paper for paper in papers
+            if (not paper.get('abstract') and paper.get('type', '') != 'Editorship')
+        ]
         if len(filted_papers) == 0:
             return 0, len(filted_papers)
         

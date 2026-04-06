@@ -16,7 +16,7 @@ from utils import info_by_dir
 
 if __name__ == "__main__":
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description='CCF DBLP 爬虫程序')
+    parser = argparse.ArgumentParser(description='exScholar 程序')
     parser.add_argument('-ccf', type=str, default='b', help='CCF 等级 (默认: b)')
     parser.add_argument('-c', '--classification', type=str, default='conf', help='论文分类类型, 可选值: conf, journal')
     parser.add_argument('-m', '--max-concurrent', type=int, default=20, help='最大并发数 (默认: 20)')
@@ -46,7 +46,7 @@ if __name__ == "__main__":
     )
     
     logging.info("=" * 60)
-    logging.info("🚀 开始运行 CCF DBLP 爬虫程序")
+    logging.info("🚀 开始运行 exScholar 程序")
     logging.info(f"📁 数据保存目录: {data_dir}")
     logging.info(f"📝 日志保存目录: {log_dir}")
     logging.info(f"📋 分类: {classification}, CCF等级: {ccf}")
