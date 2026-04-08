@@ -2,7 +2,7 @@
 search.py — 基于关键词的轻量级 DBLP 论文搜索 + 摘要获取 + CSV 导出
 
 用法：
-  python search.py \
+  python -m app.pipeline.search \
     --keywords "physiological notification;biosignal alert" \
     --venues chi,uist,cscw \
     --slug physio-ui \
@@ -40,9 +40,8 @@ from urllib.parse import quote
 
 from dotenv import load_dotenv
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(ROOT_DIR)
-load_dotenv(os.path.join(ROOT_DIR, ".env.local"))
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env.local")
 
 DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
 
@@ -228,7 +227,7 @@ def fetch_abstracts_for_papers(papers: list[dict], tmp_dir: str, max_concurrent:
     无代理模式：并发数 2，每次请求间随机延迟 2-4 秒。
     100 篇预计耗时 10-20 分钟。
     """
-    from crawler.fetch_abstract import AsyncAbstractFetcher
+    from .crawler.fetch_abstract import AsyncAbstractFetcher
 
     os.makedirs(tmp_dir, exist_ok=True)
     tmp_file = os.path.join(tmp_dir, "batch.json")

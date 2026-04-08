@@ -9,9 +9,7 @@ DBLP API 论文获取模块
 3. 更高效的I/O处理
 """
 
-import os
 import re
-import sys
 import json
 import requests
 import logging
@@ -28,14 +26,8 @@ from fake_useragent import UserAgent
 from bs4 import BeautifulSoup
 from typing import Literal
 
-
-# 添加项目根目录到路径
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(ROOT_DIR)
-
-# 导入CCF A类会议规则
-from config.special_rules import get_special_rules
-from config.venue import get_venue_name, get_all_venue_by_rule
+from ..config.special_rules import get_special_rules
+from ..config.venue import get_venue_name, get_all_venue_by_rule
 
 class DBLPMetaFetcher:
     """DBLP论文获取器"""

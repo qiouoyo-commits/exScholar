@@ -7,17 +7,14 @@ import random
 import time
 import requests
 from dotenv import load_dotenv
+from pathlib import Path
 
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, BrowserContext
 
-# 加载环境变量
-load_dotenv('.env.local')
-
-# 添加项目根目录到路径
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT_DIR)
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / '.env.local')
 
 class ProxyPool:
     """代理池管理器 - 支持代理失效时自动降级到本机地址"""

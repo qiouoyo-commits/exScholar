@@ -9,13 +9,6 @@ AsyncAbstractFetcher: 异步摘要获取器
 - 支持多种方式获取摘要
 """
 
-import os
-import sys
-
-# 添加项目根目录到路径
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT_DIR)
-
 import json
 import logging
 import time
@@ -30,12 +23,10 @@ from fake_useragent import UserAgent
 from bs4 import BeautifulSoup
 from typing import Literal
 
-from driver import PlaywrightDriver, ProxyPool
-from crawler.fetch_meta import DBLPMetaFetcher
-
-# 导入CCF A类会议规则
-from utils import suppress_all_output, info_by_dir
-from config.venue import get_all_venue_by_rule
+from ..driver import PlaywrightDriver, ProxyPool
+from .fetch_meta import DBLPMetaFetcher
+from ...common.utils import suppress_all_output, info_by_dir
+from ..config.venue import get_all_venue_by_rule
 
 
 class AsyncAbstractFetcher:

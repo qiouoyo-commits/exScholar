@@ -6,4 +6,4 @@ if ! command -v oc-conda-run >/dev/null 2>&1; then
   exit 1
 fi
 
-exec oc-conda-run -- python /home/ubuntu/tools/exScholar/search.py "$@"
+exec oc-conda-run -- python -m app.pipeline.search "$@"

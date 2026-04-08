@@ -108,7 +108,7 @@ oc-conda-run -- python -m playwright install chromium
 如需排查问题或直接执行 Python 命令，再退回到：
 
 ```bash
-oc-conda-run -- python /home/ubuntu/tools/exScholar/search.py ...
+oc-conda-run -- python -m app.pipeline.search ...
 ```
 
 参数说明：
@@ -125,7 +125,7 @@ oc-conda-run -- python /home/ubuntu/tools/exScholar/search.py ...
 如果用户要求跑主爬虫而不是关键词搜索，也同样使用 `oc-conda-run`：
 
 ```bash
-oc-conda-run -- python /home/ubuntu/tools/exScholar/main.py -ccf a -c conf -m 20 -p 10
+oc-conda-run -- python -m app.pipeline.main -ccf a -c conf -m 20 -p 10
 ```
 
 ### 分步反馈规则
