@@ -31,13 +31,17 @@ from app.openclaw.ingest import (
     DEFAULT_OPENCLAW_MODEL,
     OpenClawIngestError,
     answer_question_from_text,
+    compose_research_plan,
     extract_metadata_from_text,
     extract_pdf_bundle,
+    refine_research_plan,
     generate_analysis_from_text,
+    plan_research_request,
+    validate_research_plan,
 )
-from app.pipeline.search import build_json_records, build_site_url, write_csv, write_json, write_site
+from app.pipeline.search import build_json_records, build_site_url, run_topic_search, write_csv, write_json, write_site
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[3]
 load_dotenv(ROOT_DIR / ".env.local")
 
 HOST = os.getenv("SITE_SERVER_HOST", "0.0.0.0").strip() or "0.0.0.0"
@@ -50,6 +54,7 @@ LIBRARY_DIR = DATA_DIR / "library"
 READING_DIR = DATA_DIR / "reading"
 DB_PATH = ROOT_DIR / "data" / "citation_library.sqlite3"
 OPENCLAW_JOBS_DIR = DATA_DIR / "openclaw_jobs"
+RESEARCH_JOBS_DIR = DATA_DIR / "research_jobs"
 OPENCLAW_INGEST_MODEL = (os.getenv("OPENCLAW_INGEST_MODEL") or DEFAULT_OPENCLAW_MODEL).strip()
 OPENCLAW_INGEST_CHECK_MODEL = (os.getenv("OPENCLAW_INGEST_CHECK_MODEL") or DEFAULT_OPENCLAW_CHECK_MODEL).strip()
 OPENCLAW_INGEST_FALLBACK_MODEL = (os.getenv("OPENCLAW_INGEST_FALLBACK_MODEL") or DEFAULT_OPENCLAW_FALLBACK_MODEL).strip()
@@ -62,11 +67,14 @@ SESSION_COOKIE = "ccf_site_session"
 PBKDF2_ITERATIONS = 200_000
 REFERENCE_LIMIT = int((os.getenv("REFERENCE_EXPAND_LIMIT") or "20").strip() or "20")
 AI4SCHOLAR_API_KEY = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
+MAX_CONCURRENT_RESEARCH_JOBS = int((os.getenv("MAX_CONCURRENT_RESEARCH_JOBS") or "2").strip() or "2")
 
 SESSIONS: dict[str, dict] = {}
 BATCH_READING_JOB: dict[str, object] = {"status": "idle", "running": False}
 BATCH_READING_JOB_LOCK = threading.Lock()
 OPENCLAW_JOB_LOCK = threading.Lock()
+RESEARCH_JOB_LOCK = threading.Lock()
+RESEARCH_JOB_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_RESEARCH_JOBS)
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):

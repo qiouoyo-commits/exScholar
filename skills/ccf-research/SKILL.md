@@ -88,6 +88,7 @@ metadata:
 - 仓库固定入口为 `/home/ubuntu/tools/exScholar/run_search.sh`，关键词搜索优先走这个脚本
 - 静态站点固定服务端口为 `38128`，公开基址由 `.env.local` 中的 `PUBLIC_SITE_BASE_URL` 控制
 - 不要直接使用系统默认 `python` 或 base 环境的 Python 3.13；该环境下摘要依赖 `aiohttp` 可能不可用
+- 关键词搜索现在会自动进入 exScholar 的共享 research 并发槽位；如果网页端已有任务在跑，这里会先排队再开始
 - 首次使用前确保已安装 Playwright 浏览器：
 
 ```bash

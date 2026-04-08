@@ -7,7 +7,7 @@
 - 按关键词搜索 DBLP 论文
 - 浏览摘要和导出结果
 - 基于已有论文继续做参考文献扩展
-- 上传单篇或多篇 PDF
+- 上传一个或多个 PDF
 - 自动识别元数据并创建阅读工作区
 - 自动生成论文结构化分析
 - 在阅读页继续提问并保存问答历史
@@ -106,7 +106,7 @@ python -m app.openclaw.intake_cli --wait --json /path/a.pdf /path/b.pdf
 - `/keywords`
   所有关键词索引
 - `/reading`
-  阅读库，支持上传 PDF、批量处理、筛选和分组
+  阅读库，支持通过 OpenClaw 上传一个或多个 PDF、批量处理、筛选和分组
 - `/reading/<paper_id>`
   单篇论文阅读页，可识别元数据、重新分析和问答
 
@@ -114,14 +114,27 @@ python -m app.openclaw.intake_cli --wait --json /path/a.pdf /path/b.pdf
 
 当前这些入口都统一走 `app.openclaw`：
 
-- `/reading` 单篇上传 PDF
-- `/reading` 批量上传 PDF
+- `/reading` 页面唯一的 PDF 上传入口
 - 阅读页手动识别元数据
 - 阅读页开始分析 / 重新分析
 - 阅读页问答
 - `/reading` 一键补全未完成项
 - 本地 CLI
 - 微信附件触发
+
+这条链路会自动：
+
+- 按 PDF 哈希去重
+- 尝试匹配已有文献
+- 将识别出的重复文献合并到现有 citation
+
+## 搜索并发
+
+网页 Research 和 OpenClaw `ccf-research` skill 共用同一套搜索并发控制：
+
+- 默认最多同时运行 `2` 个搜索任务
+- 超出的任务会自动排队
+- 同一天重复使用相同 `slug` 时，会自动生成 `-2`、`-3` 后缀，避免覆盖已有搜索结果
 
 ## 数据目录
 

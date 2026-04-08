@@ -70,14 +70,15 @@
 
 已接管的入口：
 
-- `/reading` 页面单篇上传 PDF
-- `/reading` 页面批量上传 PDF
+- `/reading` 页面唯一的 PDF 上传入口
 - 阅读页手动识别元数据
 - 阅读页开始分析 / 重新分析
 - 阅读页问答
 - `/reading` 页面一键补全未完成项
 - 本地 CLI
 - 微信附件触发
+
+当前 `/reading` 不再保留独立的“普通上传并生成阅读页”接口，网页端只走 `/api/openclaw-intake/upload`。底层去重和合并逻辑在 [app/site/core/jobs.py](/home/ubuntu/tools/exScholar/app/site/core/jobs.py) 的 `start_openclaw_intake_job(...)`。
 
 默认模型策略：
 
@@ -93,12 +94,31 @@
 - `OPENCLAW_CONFIG_PATH`
 - `~/.openclaw/openclaw.json`
 
+## 当前搜索并发模型
+
+网页 Research 和 OpenClaw `ccf-research` skill 现在共享同一套并发槽位，不再是两条互相绕开的执行链路。
+
+- 默认并发上限：`MAX_CONCURRENT_RESEARCH_JOBS=2`
+- 控制入口：
+  [app/pipeline/search.py](/home/ubuntu/tools/exScholar/app/pipeline/search.py)
+- 网页 job 状态层：
+  [app/site/core/research_jobs.py](/home/ubuntu/tools/exScholar/app/site/core/research_jobs.py)
+- skill 说明：
+  [skills/ccf-research/SKILL.md](/home/ubuntu/tools/exScholar/skills/ccf-research/SKILL.md)
+
+实现方式是把“真实限流”下沉到 `run_topic_search(...)`，通过文件锁做跨进程槽位控制，所以：
+
+- 网页按钮触发的 research 会受限流
+- OpenClaw skill 直接调用 `run_search.sh` 也会受限流
+- 同日同 `slug` 的搜索会自动避让成 `slug-2`、`slug-3`，避免覆盖已有目录
+
 ## 开发边界
 
 建议默认遵守这些约定：
 
 - 新业务逻辑不要回写到根目录
 - `data/` 只放运行产物，不放源码
+- 不要把运行产物写到 `app/data/`
 - 站点数据结构变更时尽量兼容已有 SQLite、`data/library/`、`data/reading/`
 - 只是改网页文案或样式时，优先只改 [pages.py](/home/ubuntu/tools/exScholar/app/site/ui/pages.py)
 - 只是改模型策略时，优先只改 [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)

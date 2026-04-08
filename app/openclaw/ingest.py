@@ -10,6 +10,18 @@ DEFAULT_OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 DEFAULT_OPENCLAW_MODEL = "joybuilder-plan/DeepSeek-V3.2"
 DEFAULT_OPENCLAW_CHECK_MODEL = "joybuilder-plan/GLM-5"
 DEFAULT_OPENCLAW_FALLBACK_MODEL = "joybuilder-plan/Kimi-K2.5"
+DEFAULT_RESEARCH_TOP = 100
+ALLOWED_RESEARCH_VENUES = [
+    "chi", "uist", "cscw", "ubicomp",
+    "aaai", "nips", "acl", "cvpr", "iccv", "icml", "ijcai", "iclr", "emnlp", "naacl", "coling", "eccv",
+    "asplos", "osdi", "sosp", "eurosys", "usenix_atc", "fast", "isca", "micro", "hpca",
+    "ccs", "sp", "uss", "ndss", "crypto", "eurocrypt",
+    "sigmod", "kdd", "icde", "sigir", "vldb",
+    "sigcomm", "mobicom", "infocom", "nsdi",
+    "icse", "fse_esec", "ase", "issta",
+    "siggraph", "mm", "vis",
+    "stoc", "focs", "soda",
+]
 
 
 class OpenClawIngestError(RuntimeError):
@@ -191,6 +203,87 @@ def _analysis_is_usable(payload: dict) -> bool:
     if any(key not in payload for key in required_keys):
         return False
     return any(_has_meaningful_text(payload.get(key)) for key in required_keys)
+
+
+def _safe_slug(value: str, fallback: str = "research-topic") -> str:
+    chars: list[str] = []
+    for ch in (value or "").strip().lower():
+        if ch.isalnum():
+            chars.append(ch)
+        elif chars and chars[-1] != "-":
+            chars.append("-")
+    slug = "".join(chars).strip("-")
+    return (slug[:60] or fallback).strip("-") or fallback
+
+
+def _normalize_research_plan_payload(payload: dict) -> dict:
+    keywords = payload.get("keywords") or []
+    if isinstance(keywords, str):
+        keywords = [part.strip() for part in keywords.split(";") if part.strip()]
+    elif isinstance(keywords, list):
+        keywords = [" ".join(str(item).strip().split()) for item in keywords if str(item).strip()]
+    else:
+        keywords = []
+    keywords = keywords[:6]
+
+    venues = payload.get("venues") or []
+    if isinstance(venues, str):
+        venues = [part.strip().lower() for part in venues.replace(";", ",").split(",") if part.strip()]
+    elif isinstance(venues, list):
+        venues = [str(item).strip().lower() for item in venues if str(item).strip()]
+    else:
+        venues = []
+    allowed = set(ALLOWED_RESEARCH_VENUES)
+    deduped_venues = []
+    seen = set()
+    for venue in venues:
+        if venue not in allowed or venue in seen:
+            continue
+        deduped_venues.append(venue)
+        seen.add(venue)
+    venues = deduped_venues[:8]
+
+    raw_year_from = payload.get("year_from")
+    try:
+        year_from = int(str(raw_year_from).strip()) if str(raw_year_from).strip() else 0
+    except Exception:
+        year_from = 0
+    if year_from < 0:
+        year_from = 0
+    if year_from > 2100:
+        year_from = 0
+
+    raw_top = payload.get("top")
+    try:
+        top = int(str(raw_top).strip()) if str(raw_top).strip() else DEFAULT_RESEARCH_TOP
+    except Exception:
+        top = DEFAULT_RESEARCH_TOP
+    top = min(max(top, 5), 200)
+
+    slug_source = " ".join(
+        part for part in [
+            str(payload.get("slug") or "").strip(),
+            str(payload.get("summary") or "").strip(),
+            keywords[0] if keywords else "",
+        ] if part
+    )
+
+    return {
+        "summary": " ".join(str(payload.get("summary") or "").split()),
+        "slug": _safe_slug(slug_source or "research-topic"),
+        "keywords": keywords,
+        "venues": venues,
+        "year_from": year_from,
+        "top": top,
+        "fetch_abstract": bool(payload.get("fetch_abstract", True)),
+        "notes": " ".join(str(payload.get("notes") or "").split()),
+    }
+
+
+def _research_plan_is_usable(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("keywords")) and bool(payload.get("slug"))
 
 
 def _review_prompt(
@@ -415,6 +508,403 @@ def extract_pdf_bundle(pdf_path: str | Path) -> dict:
         "pages": pages,
         "page_count": len(reader.pages),
         "sections": sections,
+    }
+
+
+def _research_plan_prompt(requirement_text: str) -> str:
+    allowed_venues = ", ".join(ALLOWED_RESEARCH_VENUES)
+    return f"""
+你是一个论文 research 规划器。用户会用自然语言描述研究方向，你需要把它转换成 exScholar 可直接执行的搜索参数。
+
+只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+规则：
+- `keywords` 是英文关键词组数组，每组用于一次独立标题搜索，优先使用名词短语。
+- 关键词要覆盖同义表述，但不要过宽；建议 2 到 4 组。
+- `venues` 必须从允许列表里选，最多 6 到 8 个。
+- `slug` 只能包含英文小写字母、数字和连字符。
+- `year_from` 用四位年份；如果用户没有限制，返回 0。
+- `fetch_abstract` 默认 true，除非用户明确只要快速看标题。
+- `top` 默认 100；如果用户明显只想快速浏览，可以降到 30 或 50。
+- 不要编造用户没表达过的非常具体技术细节。
+
+允许 venues：
+{allowed_venues}
+
+返回 schema：
+{{
+  "summary": "",
+  "slug": "",
+  "keywords": ["", ""],
+  "venues": ["chi", "uist"],
+  "year_from": 0,
+  "top": 100,
+  "fetch_abstract": true,
+  "notes": ""
+}}
+
+用户需求：
+{requirement_text}
+""".strip()
+
+
+def _research_refine_prompt(requirement_text: str, current_plan: dict, modify_request: str) -> str:
+    allowed_venues = ", ".join(ALLOWED_RESEARCH_VENUES)
+    current_plan_json = json.dumps(_normalize_research_plan_payload(current_plan or {}), ensure_ascii=False, indent=2)
+    return f"""
+你是一个论文 research 规划器。现在已经有一份 exScholar 搜索方案，用户又用自然语言提出修改要求。你的任务是基于现有方案进行修改。
+
+只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+规则：
+- 保留用户没有要求改动的合理部分。
+- 按修改要求更新 `keywords`、`venues`、`year_from`、`slug`、`top`、`fetch_abstract`。
+- `keywords` 仍然应该是英文关键词组数组。
+- `venues` 必须从允许列表里选。
+- `slug` 只能包含英文小写字母、数字和连字符。
+- 不要忽略用户显式提出的限制。
+- 如果用户要求缩小范围，就收紧；如果要求扩展，就增加相关同义表述或 venues。
+
+允许 venues：
+{allowed_venues}
+
+当前方案：
+{current_plan_json}
+
+原始需求：
+{requirement_text}
+
+用户修改要求：
+{modify_request}
+
+返回 schema：
+{{
+  "summary": "",
+  "slug": "",
+  "keywords": ["", ""],
+  "venues": ["chi", "uist"],
+  "year_from": 0,
+  "top": 100,
+  "fetch_abstract": true,
+  "notes": ""
+}}
+""".strip()
+
+
+def _research_compose_prompt(current_prompt: str, current_plan: dict, latest_input: str) -> str:
+    allowed_venues = ", ".join(ALLOWED_RESEARCH_VENUES)
+    current_plan_json = json.dumps(_normalize_research_plan_payload(current_plan or {}), ensure_ascii=False, indent=2)
+    return f"""
+你是一个论文 research 规划器。用户当前已经有一份 exScholar 搜索方案，但这次只给了你一段新的输入。
+你需要判断这段输入到底是在：
+
+- `create`：表达一个全新的研究需求，应该重新生成方案
+- `revise`：在当前方案基础上做补充、删减或约束修改
+
+只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+规则：
+- 如果新输入明显是一个新话题、新研究方向、新领域、新目标，请选择 `create`
+- 如果新输入更像是在缩小范围、扩大范围、改 venues、改年份、补关键词、强调排除项，请选择 `revise`
+- `plan` 必须是最终可执行的方案
+- `prompt` 必须是最终用于代表该方案的 research 需求文本
+- `venues` 必须从允许列表里选
+- `slug` 只能包含英文小写字母、数字和连字符
+- `keywords` 必须是英文关键词组数组
+
+允许 venues：
+{allowed_venues}
+
+当前需求：
+{current_prompt}
+
+当前方案：
+{current_plan_json}
+
+用户这次输入：
+{latest_input}
+
+返回 schema：
+{{
+  "mode": "create",
+  "prompt": "",
+  "message": "",
+  "plan": {{
+    "summary": "",
+    "slug": "",
+    "keywords": ["", ""],
+    "venues": ["chi", "uist"],
+    "year_from": 0,
+    "top": 100,
+    "fetch_abstract": true,
+    "notes": ""
+  }}
+}}
+""".strip()
+
+
+def plan_research_request(
+    requirement_text: str,
+    *,
+    model_id: str = DEFAULT_OPENCLAW_MODEL,
+    reviewer_model_id: str | None = DEFAULT_OPENCLAW_CHECK_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+) -> dict:
+    text = " ".join(str(requirement_text or "").split())
+    if not text:
+        raise OpenClawIngestError("研究需求不能为空。")
+
+    def _run_generation(target_model_id: str) -> dict:
+        payload = _request_json_payload(
+            model_id=target_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责把自然语言研究需求转换为 exScholar 搜索参数。只返回严格合法的 JSON。",
+                },
+                {"role": "user", "content": _research_plan_prompt(text)},
+            ],
+            config_path=config_path,
+            timeout=180,
+            attempts=2,
+        )
+        return _normalize_research_plan_payload(payload)
+
+    primary_error = None
+    try:
+        primary = _run_generation(model_id)
+        if _research_plan_is_usable(primary):
+            review = _review_candidate(
+                task_name="论文 research 搜索方案",
+                source_text=text,
+                candidate_payload=primary,
+                criteria_text="必须给出可执行的 keywords 和 slug。venues 只能来自允许列表，year_from 应该合理，不能过度臆测用户意图。",
+                review_model_id=reviewer_model_id,
+                config_path=config_path,
+            )
+            corrected = review.get("corrected_json")
+            if review.get("pass"):
+                if isinstance(corrected, dict):
+                    normalized = _normalize_research_plan_payload(corrected)
+                    if _research_plan_is_usable(normalized):
+                        return normalized
+                return primary
+        else:
+            review = {"pass": False, "issues": ["主模型没有生成可执行的搜索方案。"], "reason": "", "corrected_json": None}
+    except Exception as exc:
+        primary_error = exc
+        review = {"pass": False, "issues": [str(exc)], "reason": "主模型规划失败。", "corrected_json": None}
+
+    if not fallback_model_id:
+        detail = "; ".join(str(item) for item in review.get("issues") or [] if str(item).strip())
+        if primary_error:
+            raise OpenClawIngestError(f"research 方案生成失败: {detail or str(primary_error)}")
+        raise OpenClawIngestError(f"research 方案未通过检查: {detail or '结果不符合要求'}")
+
+    fallback = _run_generation(fallback_model_id)
+    if not _research_plan_is_usable(fallback):
+        raise OpenClawIngestError("Kimi 回退后仍未得到可执行的 research 方案。")
+    return fallback
+
+
+def refine_research_plan(
+    requirement_text: str,
+    current_plan: dict,
+    modify_request: str,
+    *,
+    model_id: str = DEFAULT_OPENCLAW_MODEL,
+    reviewer_model_id: str | None = DEFAULT_OPENCLAW_CHECK_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+) -> dict:
+    requirement = " ".join(str(requirement_text or "").split())
+    modify = " ".join(str(modify_request or "").split())
+    if not requirement:
+        raise OpenClawIngestError("原始 research 需求不能为空。")
+    if not isinstance(current_plan, dict) or not _research_plan_is_usable(_normalize_research_plan_payload(current_plan)):
+        raise OpenClawIngestError("当前方案不可用，无法执行自然语言修改。")
+    if not modify:
+        raise OpenClawIngestError("修改要求不能为空。")
+
+    def _run_generation(target_model_id: str) -> dict:
+        payload = _request_json_payload(
+            model_id=target_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责根据自然语言修改要求更新 exScholar 搜索方案。只返回严格合法的 JSON。",
+                },
+                {"role": "user", "content": _research_refine_prompt(requirement, current_plan, modify)},
+            ],
+            config_path=config_path,
+            timeout=180,
+            attempts=2,
+        )
+        return _normalize_research_plan_payload(payload)
+
+    primary_error = None
+    try:
+        primary = _run_generation(model_id)
+        if _research_plan_is_usable(primary):
+            review = _review_candidate(
+                task_name="更新后的论文 research 搜索方案",
+                source_text=f"原始需求：{requirement}\n修改要求：{modify}",
+                candidate_payload=primary,
+                criteria_text="必须尊重用户的修改要求，且给出可执行的 keywords 和 slug。venues 只能来自允许列表。",
+                review_model_id=reviewer_model_id,
+                config_path=config_path,
+            )
+            corrected = review.get("corrected_json")
+            if review.get("pass"):
+                if isinstance(corrected, dict):
+                    normalized = _normalize_research_plan_payload(corrected)
+                    if _research_plan_is_usable(normalized):
+                        return normalized
+                return primary
+        else:
+            review = {"pass": False, "issues": ["主模型没有生成可执行的更新方案。"], "reason": "", "corrected_json": None}
+    except Exception as exc:
+        primary_error = exc
+        review = {"pass": False, "issues": [str(exc)], "reason": "主模型更新方案失败。", "corrected_json": None}
+
+    if not fallback_model_id:
+        detail = "; ".join(str(item) for item in review.get("issues") or [] if str(item).strip())
+        if primary_error:
+            raise OpenClawIngestError(f"research 方案修改失败: {detail or str(primary_error)}")
+        raise OpenClawIngestError(f"research 方案修改未通过检查: {detail or '结果不符合要求'}")
+
+    fallback = _run_generation(fallback_model_id)
+    if not _research_plan_is_usable(fallback):
+        raise OpenClawIngestError("Kimi 回退后仍未得到可执行的更新方案。")
+    return fallback
+
+
+def validate_research_plan(
+    requirement_text: str,
+    current_plan: dict,
+    *,
+    reviewer_model_id: str | None = DEFAULT_OPENCLAW_CHECK_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+) -> dict:
+    requirement = " ".join(str(requirement_text or "").split())
+    normalized = _normalize_research_plan_payload(current_plan or {})
+    if not requirement:
+        raise OpenClawIngestError("原始 research 需求不能为空。")
+    if not _research_plan_is_usable(normalized):
+        raise OpenClawIngestError("当前方案不可用，无法验证。")
+
+    review = _review_candidate(
+        task_name="手动编辑后的论文 research 搜索方案",
+        source_text=requirement,
+        candidate_payload=normalized,
+        criteria_text="检查这份手工编辑方案是否仍然可执行、是否符合原始需求方向、venues 是否在允许列表中、slug 是否合法、keywords 是否适合标题检索。如有必要可直接修正。",
+        review_model_id=reviewer_model_id,
+        config_path=config_path,
+    )
+    corrected = review.get("corrected_json")
+    if isinstance(corrected, dict):
+        normalized_corrected = _normalize_research_plan_payload(corrected)
+        if _research_plan_is_usable(normalized_corrected):
+            return normalized_corrected
+    if review.get("pass"):
+        return normalized
+
+    if not fallback_model_id:
+        detail = "; ".join(str(item) for item in review.get("issues") or [] if str(item).strip())
+        raise OpenClawIngestError(f"research 方案验证未通过: {detail or '结果不符合要求'}")
+
+    fallback = refine_research_plan(
+        requirement,
+        normalized,
+        "请在尽量保留当前手工编辑意图的前提下，把这份方案修正为可执行且合理的 exScholar 搜索方案。",
+        model_id=fallback_model_id,
+        reviewer_model_id=reviewer_model_id,
+        fallback_model_id=None,
+        config_path=config_path,
+    )
+    if not _research_plan_is_usable(fallback):
+        raise OpenClawIngestError("模型验证后仍未得到可执行的方案。")
+    return fallback
+
+
+def compose_research_plan(
+    latest_input: str,
+    *,
+    current_prompt: str = "",
+    current_plan: dict | None = None,
+    model_id: str = DEFAULT_OPENCLAW_MODEL,
+    reviewer_model_id: str | None = DEFAULT_OPENCLAW_CHECK_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+) -> dict:
+    latest = " ".join(str(latest_input or "").split())
+    current_prompt = " ".join(str(current_prompt or "").split())
+    normalized_current_plan = _normalize_research_plan_payload(current_plan or {}) if current_plan else {}
+
+    if not latest:
+        raise OpenClawIngestError("research 输入不能为空。")
+
+    if not normalized_current_plan or not _research_plan_is_usable(normalized_current_plan) or not current_prompt:
+        plan = plan_research_request(
+            latest,
+            model_id=model_id,
+            reviewer_model_id=reviewer_model_id,
+            fallback_model_id=fallback_model_id,
+            config_path=config_path,
+        )
+        return {
+            "mode": "create",
+            "prompt": latest,
+            "message": "已根据新的 research 需求生成方案。",
+            "plan": plan,
+        }
+
+    def _run_generation(target_model_id: str) -> dict:
+        return _request_json_payload(
+            model_id=target_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责判断用户输入是在创建新 research 方案还是修改当前方案，并输出最终可执行方案。只返回严格合法的 JSON。",
+                },
+                {
+                    "role": "user",
+                    "content": _research_compose_prompt(current_prompt, normalized_current_plan, latest),
+                },
+            ],
+            config_path=config_path,
+            timeout=180,
+            attempts=2,
+        )
+
+    raw = None
+    try:
+        raw = _run_generation(model_id)
+    except Exception:
+        if not fallback_model_id:
+            raise
+        raw = _run_generation(fallback_model_id)
+
+    mode = str(raw.get("mode") or "").strip().lower()
+    if mode not in {"create", "revise"}:
+        mode = "revise"
+    prompt = " ".join(str(raw.get("prompt") or "").split()) or (latest if mode == "create" else current_prompt)
+    message = " ".join(str(raw.get("message") or "").split())
+    candidate_plan = _normalize_research_plan_payload(raw.get("plan") or {})
+    validated_plan = validate_research_plan(
+        prompt,
+        candidate_plan,
+        reviewer_model_id=reviewer_model_id,
+        fallback_model_id=fallback_model_id,
+        config_path=config_path,
+    )
+    return {
+        "mode": mode,
+        "prompt": prompt,
+        "message": message or ("已重新生成方案。" if mode == "create" else "已基于当前方案更新。"),
+        "plan": validated_plan,
     }
 
 

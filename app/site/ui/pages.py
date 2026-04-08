@@ -106,6 +106,40 @@ def build_timeline_html():
     }}
     .section {{ margin-top: 26px; }}
     .section-title {{ margin: 0 0 12px; font-size: 28px; }}
+    .research-panel {{
+      margin-top: 22px; border: 1px solid var(--line); background: var(--panel);
+      border-radius: 24px; padding: 20px; box-shadow: 0 12px 28px rgba(76, 50, 28, 0.06);
+    }}
+    .research-panel textarea {{
+      width: 100%; min-height: 120px; resize: vertical; border: 1px solid var(--line);
+      border-radius: 18px; padding: 14px 16px; font: inherit; background: rgba(255,255,255,0.85);
+      color: var(--ink);
+    }}
+    .research-editor {{
+      margin-top: 14px; border: 1px solid var(--line); border-radius: 18px; padding: 14px;
+      background: rgba(255,255,255,0.48);
+    }}
+    .research-editor-grid {{
+      display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px; margin-top:10px;
+    }}
+    .research-editor input, .research-editor textarea {{
+      width:100%; border:1px solid var(--line); border-radius:14px; padding:10px 12px; font:inherit; background:white; color:var(--ink);
+    }}
+    .research-editor label {{ display:block; color:var(--muted); font-size:14px; }}
+    .research-editor .checkbox {{ display:flex; align-items:center; gap:8px; margin-top:8px; color:var(--muted); }}
+    .research-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }}
+    .research-actions button {{
+      color:white; background:var(--accent); text-decoration:none; padding:10px 14px;
+      border:none; border-radius:999px; font:inherit; cursor:pointer;
+    }}
+    .research-status, .research-job {{
+      margin-top: 14px; border: 1px solid var(--line); border-radius: 18px; padding: 14px;
+      background: rgba(255,255,255,0.55);
+    }}
+    .research-job-links {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }}
+    .research-job-links a {{
+      color:white; background:var(--accent); text-decoration:none; padding:8px 12px; border-radius:999px;
+    }}
     .filters {{ display:flex; gap:10px; flex-wrap:wrap; margin: 10px 0 0; }}
     .filters .tag {{
       border:none; border-radius:999px; background:var(--accent-soft); color:var(--muted);
@@ -175,6 +209,44 @@ def build_timeline_html():
         </div>
       </div>
     </section>
+    <section class="research-panel">
+      <h2 class="section-title">Natural Language Research</h2>
+      <div class="sub">直接输入 research 需求；如果当前已经有方案，也可以继续在同一个输入框里写“缩小到 CHI/UbiComp”“年份改成 2023 起”这类修改。模型会自动判断这是重新生成还是修改当前方案。</div>
+      <textarea id="research-prompt" placeholder="第一次输入完整需求；已有方案后继续在这里输入修改要求或一个全新的需求。"></textarea>
+      <div class="research-actions">
+        <button id="research-compose" type="button">生成或更新方案</button>
+        <button id="research-submit" type="button">按当前方案开始 Research</button>
+      </div>
+      <div id="research-editor" class="research-editor" style="display:none;">
+        <div class="sub">你也可以直接手动编辑当前方案；系统会在执行前自动调用模型复核这份手工编辑结果。</div>
+        <div class="research-editor-grid">
+          <label>Slug
+            <input id="research-edit-slug" type="text" placeholder="research-slug">
+          </label>
+          <label>Year From
+            <input id="research-edit-year-from" type="number" placeholder="0">
+          </label>
+          <label>Top
+            <input id="research-edit-top" type="number" placeholder="100">
+          </label>
+          <label>Venues
+            <input id="research-edit-venues" type="text" placeholder="chi,uist,cscw">
+          </label>
+        </div>
+        <label style="display:block; margin-top:10px;">Keywords
+          <textarea id="research-edit-keywords" placeholder="每行一组英文关键词"></textarea>
+        </label>
+        <label style="display:block; margin-top:10px;">Notes
+          <textarea id="research-edit-notes" placeholder="可选备注"></textarea>
+        </label>
+        <label class="checkbox">
+          <input id="research-edit-fetch-abstract" type="checkbox" checked>
+          <span>抓取摘要</span>
+        </label>
+      </div>
+      <div id="research-status" class="research-status" style="display:none;"></div>
+      <div id="research-jobs" class="research-jobs"></div>
+    </section>
     <section class="section">
       <h2 class="section-title">原始搜索</h2>
       <div class="timeline">{original_body}</div>
@@ -198,6 +270,236 @@ def build_timeline_html():
     }}
     const expansionFilterButtons = Array.from(document.querySelectorAll('[data-expansion-filter]'));
     const expansionEntries = Array.from(document.querySelectorAll('#expansion-timeline .entry[data-matched-kw]'));
+    const researchPrompt = document.getElementById('research-prompt');
+    const researchCompose = document.getElementById('research-compose');
+    const researchEditor = document.getElementById('research-editor');
+    const researchEditSlug = document.getElementById('research-edit-slug');
+    const researchEditYearFrom = document.getElementById('research-edit-year-from');
+    const researchEditTop = document.getElementById('research-edit-top');
+    const researchEditVenues = document.getElementById('research-edit-venues');
+    const researchEditKeywords = document.getElementById('research-edit-keywords');
+    const researchEditNotes = document.getElementById('research-edit-notes');
+    const researchEditFetchAbstract = document.getElementById('research-edit-fetch-abstract');
+    const researchSubmit = document.getElementById('research-submit');
+    const researchStatus = document.getElementById('research-status');
+    const researchJobs = document.getElementById('research-jobs');
+    let activeResearchJobId = '';
+    let previewResearchPlan = null;
+    let previewResearchPrompt = '';
+
+    function esc(value) {{
+      return (value || '').toString()
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }}
+
+    function renderResearchStatus(job) {{
+      if (!researchStatus) return;
+      if (!job) {{
+        researchStatus.style.display = 'none';
+        researchStatus.innerHTML = '';
+        return;
+      }}
+      const plan = job.plan || {{}};
+      const links = [];
+      if (job.site_relative_url) links.push(`<a href="${{job.site_relative_url}}" target="_blank" rel="noreferrer">结果网页</a>`);
+      if (job.site_url && job.site_url !== job.site_relative_url) links.push(`<a href="${{job.site_url}}" target="_blank" rel="noreferrer">绝对链接</a>`);
+      if (job.csv_url) links.push(`<a href="${{job.csv_url}}" target="_blank" rel="noreferrer">CSV</a>`);
+      if (job.json_url) links.push(`<a href="${{job.json_url}}" target="_blank" rel="noreferrer">JSON</a>`);
+      researchStatus.style.display = 'block';
+      researchStatus.innerHTML = `
+        <div><strong>状态：</strong>${{esc(job.status || '')}}</div>
+        <div style="margin-top:6px;"><strong>当前步骤：</strong>${{esc(job.step_message || '')}}</div>
+        <div style="margin-top:6px;"><strong>方案：</strong>${{esc((plan.keywords || []).join(' ; '))}}${{plan.venues && plan.venues.length ? ` | venues: ${{esc(plan.venues.join(', '))}}` : ''}}</div>
+        <div style="margin-top:6px;"><strong>slug：</strong>${{esc(plan.slug || '')}}${{plan.year_from ? ` | year_from: ${{esc(plan.year_from)}}` : ''}}</div>
+        ${{links.length ? `<div class="research-job-links">${{links.join('')}}</div>` : ''}}
+      `;
+    }}
+
+    function renderResearchPreview(plan, prompt, message) {{
+      previewResearchPlan = plan || null;
+      previewResearchPrompt = prompt || '';
+      if (researchEditor) researchEditor.style.display = previewResearchPlan ? 'block' : 'none';
+      if (previewResearchPlan) {{
+        if (researchEditSlug) researchEditSlug.value = previewResearchPlan.slug || '';
+        if (researchEditYearFrom) researchEditYearFrom.value = previewResearchPlan.year_from || 0;
+        if (researchEditTop) researchEditTop.value = previewResearchPlan.top || 100;
+        if (researchEditVenues) researchEditVenues.value = (previewResearchPlan.venues || []).join(',');
+        if (researchEditKeywords) researchEditKeywords.value = (previewResearchPlan.keywords || []).join('\\n');
+        if (researchEditNotes) researchEditNotes.value = previewResearchPlan.notes || '';
+        if (researchEditFetchAbstract) researchEditFetchAbstract.checked = Boolean(previewResearchPlan.fetch_abstract);
+      }}
+      renderResearchStatus({{
+        status: 'preview',
+        step_message: message || '已生成 research 方案预览，确认后可直接开始执行。',
+        plan: plan || {{}},
+        prompt: prompt || '',
+      }});
+    }}
+
+    function collectManualResearchPlan() {{
+      return {{
+        slug: researchEditSlug ? researchEditSlug.value.trim() : '',
+        year_from: researchEditYearFrom ? Number(researchEditYearFrom.value || 0) : 0,
+        top: researchEditTop ? Number(researchEditTop.value || 100) : 100,
+        venues: researchEditVenues ? researchEditVenues.value.split(',').map((item) => item.trim()).filter(Boolean) : [],
+        keywords: researchEditKeywords ? researchEditKeywords.value.split('\\n').map((item) => item.trim()).filter(Boolean) : [],
+        notes: researchEditNotes ? researchEditNotes.value.trim() : '',
+        fetch_abstract: researchEditFetchAbstract ? Boolean(researchEditFetchAbstract.checked) : true,
+        summary: previewResearchPlan && previewResearchPlan.summary ? previewResearchPlan.summary : '',
+      }};
+    }}
+
+    function renderResearchJobs(items) {{
+      if (!researchJobs) return;
+      if (!items || !items.length) {{
+        researchJobs.innerHTML = '';
+        return;
+      }}
+      researchJobs.innerHTML = items.map((job) => {{
+        const plan = job.plan || {{}};
+        const links = [];
+        if (job.site_relative_url) links.push(`<a href="${{job.site_relative_url}}" target="_blank" rel="noreferrer">结果网页</a>`);
+        if (job.csv_url) links.push(`<a href="${{job.csv_url}}" target="_blank" rel="noreferrer">CSV</a>`);
+        return `
+          <div class="research-job">
+            <div><strong>${{esc(job.prompt || '')}}</strong></div>
+            <div class="meta">状态：${{esc(job.status || '')}} · ${{esc(job.step_message || '')}}</div>
+            <div class="meta">slug：${{esc(plan.slug || '')}} · 关键词：${{esc((plan.keywords || []).join(' ; '))}}</div>
+            ${{links.length ? `<div class="research-job-links">${{links.join('')}}</div>` : ''}}
+          </div>
+        `;
+      }}).join('');
+    }}
+
+    async function fetchResearchJobs() {{
+      const resp = await fetch('/api/research/jobs', {{ credentials: 'same-origin' }});
+      const data = await resp.json().catch(() => ({{ ok: false, jobs: [] }}));
+      if (!resp.ok || data.ok === false) return [];
+      renderResearchJobs(data.jobs || []);
+      return data.jobs || [];
+    }}
+
+    async function pollResearchJob(jobId) {{
+      activeResearchJobId = jobId;
+      while (activeResearchJobId === jobId) {{
+        const resp = await fetch('/api/research/jobs/' + encodeURIComponent(jobId), {{ credentials: 'same-origin' }});
+        const data = await resp.json().catch(() => ({{ ok: false }}));
+        if (!resp.ok || data.ok === false) break;
+        const job = data.job || null;
+        renderResearchStatus(job);
+        await fetchResearchJobs();
+        if (!job || ['completed', 'failed'].includes(job.status)) {{
+          break;
+        }}
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }}
+    }}
+
+    if (researchCompose) {{
+      researchCompose.addEventListener('click', async () => {{
+        const latestInput = (researchPrompt && researchPrompt.value || '').trim();
+        if (!latestInput) {{
+          renderResearchStatus({{ status: 'invalid', step_message: '请先输入 research 内容。', plan: {{}} }});
+          return;
+        }}
+        researchCompose.disabled = true;
+        if (researchSubmit) researchSubmit.disabled = true;
+        renderResearchStatus({{
+          status: 'planning',
+          step_message: previewResearchPlan ? '正在判断是修改当前方案还是重新生成。' : '正在生成 research 方案预览。',
+          plan: previewResearchPlan || {{}}
+        }});
+        try {{
+          const resp = await fetch('/api/research/plan/compose', {{
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              input: latestInput,
+              current_prompt: previewResearchPrompt,
+              plan: previewResearchPlan
+            }})
+          }});
+          const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+          if (!resp.ok || data.ok === false) {{
+            throw new Error(data.error || '请求失败');
+          }}
+          renderResearchPreview(data.plan || {{}}, data.prompt || latestInput, data.message || '方案已更新。');
+          if (researchPrompt) researchPrompt.value = '';
+        }} catch (error) {{
+          previewResearchPlan = null;
+          renderResearchStatus({{ status: 'failed', step_message: error.message, plan: {{}} }});
+        }} finally {{
+          researchCompose.disabled = false;
+          if (researchSubmit) researchSubmit.disabled = false;
+        }}
+      }});
+    }}
+
+    if (researchSubmit) {{
+      researchSubmit.addEventListener('click', async () => {{
+        const prompt = (researchPrompt && researchPrompt.value || '').trim();
+        const effectivePrompt = previewResearchPrompt || prompt;
+        if (!effectivePrompt) {{
+          renderResearchStatus({{ status: 'invalid', step_message: '请先输入 research 需求。', plan: {{}} }});
+          return;
+        }}
+        researchSubmit.disabled = true;
+        if (researchCompose) researchCompose.disabled = true;
+        renderResearchStatus({{
+          status: 'queued',
+          step_message: previewResearchPlan ? '正在验证当前方案，然后启动 Research。' : '未检测到预览方案，正在自动生成并执行。',
+          plan: previewResearchPlan || {{}}
+        }});
+        try {{
+          let validatedPlan = previewResearchPlan;
+          if (previewResearchPlan) {{
+            const manualPlan = collectManualResearchPlan();
+            const validateResp = await fetch('/api/research/plan/validate', {{
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{
+                prompt: effectivePrompt,
+                plan: manualPlan
+              }})
+            }});
+            const validateData = await validateResp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+            if (!validateResp.ok || validateData.ok === false) {{
+              throw new Error(validateData.error || '方案验证失败');
+            }}
+            validatedPlan = validateData.plan || manualPlan;
+            renderResearchPreview(validatedPlan, effectivePrompt, '当前手工编辑方案已通过模型复核，开始执行 Research。');
+          }}
+          const resp = await fetch('/api/research/jobs', {{
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ prompt: effectivePrompt, plan: validatedPlan }})
+          }});
+          const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+          if (!resp.ok || data.ok === false) {{
+            throw new Error(data.error || '请求失败');
+          }}
+          renderResearchStatus(data.job || null);
+          await fetchResearchJobs();
+          previewResearchPlan = null;
+          previewResearchPrompt = '';
+          if (data.job_id) {{
+            pollResearchJob(data.job_id);
+          }}
+        }} catch (error) {{
+          renderResearchStatus({{ status: 'failed', step_message: error.message, plan: previewResearchPlan || {{}} }});
+        }} finally {{
+          researchSubmit.disabled = false;
+          if (researchCompose) researchCompose.disabled = false;
+        }}
+      }});
+      fetchResearchJobs().catch(() => {{}});
+    }}
     expansionFilterButtons.forEach((button) => {{
       button.addEventListener('click', () => {{
         const filter = button.dataset.expansionFilter || 'all';
@@ -1276,29 +1578,14 @@ def build_library_html():
             <div class="meta" id="batch-message" style="margin-top:6px;">尚未启动批处理。</div>
             <div class="meta" id="batch-progress" style="margin-top:6px;">已处理 0 / 0</div>
           </div>
-          <div id="reading-upload" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#faf8f5;">
-            <div style="grid-column:1 / -1; color:#6f685c; font-size:14px;">上传 PDF 后会自动识别标题、作者、Venue、年份与 DOI，并创建或匹配到现有文献。</div>
-            <select id="reading-group">
-              <option value="">暂不加入 Group</option>
-              {upload_group_options}
-            </select>
-            <input type="file" id="reading-pdf" accept="application/pdf,.pdf">
-            <button id="reading-upload-btn" type="button">上传并生成阅读页</button>
-            <div id="reading-upload-progress" style="display:none; grid-column:1 / -1;">
-              <div class="meta" id="reading-upload-progress-label">准备上传...</div>
-              <div style="width:100%; height:8px; border-radius:999px; background:#ead8ca; overflow:hidden; margin-top:6px;">
-                <div id="reading-upload-progress-bar" style="height:100%; width:0%; background:linear-gradient(90deg, #c8733f, #9c4f2f);"></div>
-              </div>
-            </div>
-          </div>
           <div id="openclaw-batch-upload" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#f8f4ee;">
-            <div style="grid-column:1 / -1; color:#6f685c; font-size:14px;">`app.openclaw`：主模型 `{escape(OPENCLAW_INGEST_MODEL)}` 先读取，检查模型 `{escape(OPENCLAW_INGEST_CHECK_MODEL)}` 复核；如果不符合要求，则回退到 `{escape(OPENCLAW_INGEST_FALLBACK_MODEL)}` 继续读取。</div>
+            <div style="grid-column:1 / -1; color:#6f685c; font-size:14px;">上传一个或多个 PDF 后会统一走 `app.openclaw` 链路：主模型 `{escape(OPENCLAW_INGEST_MODEL)}` 先读取，检查模型 `{escape(OPENCLAW_INGEST_CHECK_MODEL)}` 复核；如果不符合要求，则回退到 `{escape(OPENCLAW_INGEST_FALLBACK_MODEL)}` 继续读取。系统会自动按 PDF 哈希和识别到的文献信息复用或合并到现有记录。</div>
             <select id="openclaw-group">
               <option value="">暂不加入 Group</option>
               {upload_group_options}
             </select>
             <input type="file" id="openclaw-pdfs" accept="application/pdf,.pdf" multiple>
-            <button id="openclaw-upload-btn" type="button">批量交给 OpenClaw Addon</button>
+            <button id="openclaw-upload-btn" type="button">交给 OpenClaw 处理 PDF</button>
             <div id="openclaw-upload-progress" style="display:none; grid-column:1 / -1;">
               <div class="meta" id="openclaw-upload-progress-label">准备上传...</div>
               <div style="width:100%; height:8px; border-radius:999px; background:#ead8ca; overflow:hidden; margin-top:6px;">
@@ -1307,7 +1594,7 @@ def build_library_html():
             </div>
             <div id="openclaw-job-status" style="display:none; grid-column:1 / -1; padding:12px; border-radius:12px; background:#fffaf5; border:1px solid #e3d5c3;">
               <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:center;">
-                <strong>OpenClaw Addon 批量导入</strong>
+                <strong>OpenClaw PDF 导入</strong>
                 <span class="meta" id="openclaw-job-stage">idle</span>
               </div>
               <div class="meta" id="openclaw-job-message" style="margin-top:6px;">尚未启动任务。</div>
@@ -1453,10 +1740,6 @@ def build_library_html():
     const createGroupBtn = document.getElementById('create-group');
     const newGroupNameInput = document.getElementById('new-group-name');
     const newGroupDescInput = document.getElementById('new-group-desc');
-    const readingUploadBtn = document.getElementById('reading-upload-btn');
-    const readingUploadProgress = document.getElementById('reading-upload-progress');
-    const readingUploadProgressBar = document.getElementById('reading-upload-progress-bar');
-    const readingUploadProgressLabel = document.getElementById('reading-upload-progress-label');
     const openclawUploadBtn = document.getElementById('openclaw-upload-btn');
     const openclawUploadProgress = document.getElementById('openclaw-upload-progress');
     const openclawUploadProgressBar = document.getElementById('openclaw-upload-progress-bar');
@@ -1569,7 +1852,7 @@ def build_library_html():
       }}
       if (openclawUploadBtn) {{
         openclawUploadBtn.disabled = !!job.running;
-        openclawUploadBtn.textContent = job.running ? 'OpenClaw Addon 处理中...' : '批量交给 OpenClaw Addon';
+        openclawUploadBtn.textContent = job.running ? 'OpenClaw 正在处理 PDF...' : '交给 OpenClaw 处理 PDF';
       }}
     }}
 
@@ -1768,34 +2051,6 @@ def build_library_html():
       }});
     }});
 
-    if (readingUploadBtn) {{
-      readingUploadBtn.addEventListener('click', async () => {{
-        const formData = new FormData();
-        const groupId = document.getElementById('reading-group').value;
-        const pdfFile = document.getElementById('reading-pdf').files[0];
-        if (!pdfFile) {{
-          alert('请先选择 PDF。');
-          return;
-        }}
-        if (groupId) formData.append('group_id', groupId);
-        formData.append('pdf', pdfFile);
-        try {{
-          const data = await uploadWithProgress('/api/reading/upload', formData, (percent, text) => {{
-            setProgress(readingUploadProgress, readingUploadProgressBar, readingUploadProgressLabel, percent, text);
-          }});
-          setProgress(readingUploadProgress, readingUploadProgressBar, readingUploadProgressLabel, 100, '上传完成，正在跳转阅读页。');
-          if (data.reading_url) {{
-            window.location.href = data.reading_url;
-            return;
-          }}
-          window.location.reload();
-        }} catch (error) {{
-          alert(error.message || '上传失败');
-          return;
-        }}
-      }});
-    }}
-
     if (openclawUploadBtn) {{
       openclawUploadBtn.addEventListener('click', async () => {{
         const files = Array.from((document.getElementById('openclaw-pdfs').files || []));
@@ -1811,13 +2066,13 @@ def build_library_html():
           const data = await uploadWithProgress('/api/openclaw-intake/upload', formData, (percent, text) => {{
             setProgress(openclawUploadProgress, openclawUploadProgressBar, openclawUploadProgressLabel, percent, text);
           }});
-          setProgress(openclawUploadProgress, openclawUploadProgressBar, openclawUploadProgressLabel, 100, 'PDF 已提交到 OpenClaw，正在后台处理。');
+          setProgress(openclawUploadProgress, openclawUploadProgressBar, openclawUploadProgressLabel, 100, 'PDF 已提交到 OpenClaw，正在后台处理与合并。');
           openclawCurrentJobId = data.job_id || '';
           renderOpenClawJob(data.job || {{}});
           if (openclawPollingTimer) window.clearTimeout(openclawPollingTimer);
           pollOpenClawJob().catch(() => {{}});
         }} catch (error) {{
-          alert(error.message || 'OpenClaw 批量导入失败');
+          alert(error.message || 'OpenClaw PDF 导入失败');
         }}
       }});
     }}

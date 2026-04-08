@@ -31,8 +31,11 @@ import time
 import random
 import asyncio
 import argparse
+import secrets
 import requests
 import logging
+import shutil
+import fcntl
 from datetime import date
 from pathlib import Path
 from html import escape
@@ -42,6 +45,9 @@ from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / ".env.local")
+MAX_CONCURRENT_RESEARCH_JOBS = max(1, int((os.getenv("MAX_CONCURRENT_RESEARCH_JOBS") or "2").strip() or "2"))
+RESEARCH_RUNTIME_DIR = ROOT_DIR / "data" / "research_runtime"
+RESEARCH_SLOT_DIR = RESEARCH_RUNTIME_DIR / "slots"
 
 DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
 
@@ -93,6 +99,72 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str:
         for pos in positions:
             words[pos] = word
     return " ".join(words[i] for i in sorted(words))
+
+
+def _ensure_research_slot_dir():
+    RESEARCH_SLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _slot_state_path(slot_index: int) -> Path:
+    return RESEARCH_SLOT_DIR / f"slot_{slot_index}.json"
+
+
+def _acquire_research_slot(owner_id: str, status_callback=None, poll_interval: float = 2.0):
+    _ensure_research_slot_dir()
+    wait_started_at = None
+    while True:
+        for slot_index in range(MAX_CONCURRENT_RESEARCH_JOBS):
+            lock_path = RESEARCH_SLOT_DIR / f"slot_{slot_index}.lock"
+            lock_file = open(lock_path, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_file.close()
+                continue
+
+            state = {
+                "owner_id": owner_id,
+                "slot_index": slot_index,
+                "pid": os.getpid(),
+                "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            _slot_state_path(slot_index).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            return slot_index, lock_file
+
+        if wait_started_at is None:
+            wait_started_at = time.time()
+        waited_seconds = max(0, int(time.time() - wait_started_at))
+        if callable(status_callback):
+            status_callback(
+                "queued",
+                f"搜索任务正在排队，当前最多同时运行 {MAX_CONCURRENT_RESEARCH_JOBS} 个任务，已等待 {waited_seconds} 秒。",
+                waited_seconds=waited_seconds,
+                max_concurrent_jobs=MAX_CONCURRENT_RESEARCH_JOBS,
+            )
+        time.sleep(poll_interval)
+
+
+def _release_research_slot(slot_index: int, lock_file):
+    try:
+        _slot_state_path(slot_index).unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def _build_search_output_dir(slug: str) -> tuple[str, str]:
+    dated_slug = f"{date.today().isoformat()}_{slug}"
+    base_dir = Path(ROOT_DIR) / "data" / "searches"
+    out_dir = base_dir / dated_slug
+    suffix = 2
+    while out_dir.exists():
+        dated_slug = f"{date.today().isoformat()}_{slug}-{suffix}"
+        out_dir = base_dir / dated_slug
+        suffix += 1
+    return dated_slug, str(out_dir)
 
 
 def openalex_search(keywords: str, venue: str | None, top: int, year_from: int) -> list[dict]:
@@ -879,6 +951,197 @@ def build_site_url(out_dir: str, site_path: str) -> str:
     return Path(site_path).resolve().as_uri()
 
 
+def run_topic_search(
+    *,
+    keywords: list[str],
+    venues: list[str] | None,
+    slug: str,
+    top: int = 100,
+    year_from: int = 0,
+    fetch_abstract: bool = True,
+    progress_callback=None,
+) -> dict:
+    keyword_groups = [k.strip() for k in (keywords or []) if str(k).strip()]
+    if not keyword_groups:
+        raise ValueError("至少需要一组关键词。")
+
+    venue_list = [v.strip() for v in (venues or []) if str(v).strip()]
+    search_venues = venue_list or [None]
+    slug = (slug or "").strip()
+    if not slug:
+        raise ValueError("slug 不能为空。")
+
+    dated_slug, out_dir = _build_search_output_dir(slug)
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "papers.csv")
+    json_path = os.path.join(out_dir, "papers.json")
+    meta_path = os.path.join(out_dir, "search.json")
+    site_path = os.path.join(out_dir, "site", "index.html")
+    tmp_dir = os.path.join(ROOT_DIR, "data", "tmp_search", f"{date.today().isoformat()}_{slug}_{int(time.time() * 1000)}_{secrets.token_hex(2)}")
+
+    def report(stage: str, message: str, **extra):
+        if callable(progress_callback):
+            progress_callback(stage, message, extra)
+
+    slot_index = None
+    slot_lock = None
+    owner_id = f"{slug}-{os.getpid()}-{int(time.time() * 1000)}-{secrets.token_hex(2)}"
+    try:
+        slot_index, slot_lock = _acquire_research_slot(owner_id, status_callback=report)
+        report(
+            "searching",
+            f"开始搜索，共 {len(keyword_groups)} 组关键词 × {len(search_venues)} 个范围。",
+            keywords=keyword_groups,
+            venues=[v for v in search_venues if v],
+            slot_index=slot_index,
+            max_concurrent_jobs=MAX_CONCURRENT_RESEARCH_JOBS,
+        )
+
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "slug": slug,
+                    "keywords": keyword_groups,
+                    "venues": [v for v in search_venues if v],
+                    "top_per_group": top,
+                    "year_from": year_from,
+                    "fetch_abstract": fetch_abstract,
+                    "date": date.today().isoformat(),
+                    "output_slug": dated_slug,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        all_papers: list[dict] = []
+        seen_keys: set[str] = set()
+        hit_counts: dict[str, int] = {}
+
+        dblp_ok = True
+        for kw in keyword_groups:
+            kw_hits = 0
+            for venue in search_venues:
+                label = venue or "全局"
+                print(f"[search] '{kw}'  venue={label} ...")
+                if dblp_ok:
+                    papers = dblp_search(kw, venue, top, year_from)
+                    if papers is None:
+                        dblp_ok = False
+                        print("[search] DBLP 不可用，切换到 OpenAlex 搜索引擎")
+                if not dblp_ok:
+                    papers = openalex_search(kw, venue, top, year_from)
+                new = 0
+                for p in papers:
+                    key = p.get("key") or p.get("title", "")
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        p["_matched_kw"] = kw
+                        all_papers.append(p)
+                        new += 1
+                kw_hits += new
+                print(f"[search]   命中 {len(papers)} 篇，新增 {new} 篇（去重后）")
+                report(
+                    "searching",
+                    f"关键词“{kw}”在 {label} 中命中 {len(papers)} 篇，新增 {new} 篇。",
+                    keyword=kw,
+                    venue=venue or "",
+                    hit_count=len(papers),
+                    added_count=new,
+                    slot_index=slot_index,
+                )
+                if len(search_venues) > 1 or len(keyword_groups) > 1:
+                    time.sleep(random.uniform(1.0, 2.0))
+            hit_counts[kw] = kw_hits
+
+        all_papers.sort(key=lambda p: -(p.get("year") or 0))
+        total = len(all_papers)
+        print(f"\n[search] 合并去重后共 {total} 篇")
+        for kw, n in hit_counts.items():
+            print(f"  '{kw}': {n} 篇")
+        report("search_completed", f"搜索完成，合并去重后共 {total} 篇。", total_papers=total, hit_counts=hit_counts, slot_index=slot_index)
+
+        if fetch_abstract:
+            has_abstract = sum(1 for p in all_papers if p.get("abstract"))
+            need = total - has_abstract
+            if need > 0:
+                est_min = round(need * 3 / 60)
+                print(f"\n[search] 开始爬取摘要（{need} 篇，预计约 {est_min} 分钟）...")
+                report(
+                    "fetching_abstracts",
+                    f"开始爬取摘要，共 {need} 篇，预计约 {est_min} 分钟。",
+                    total_papers=total,
+                    pending_abstracts=need,
+                    estimated_minutes=est_min,
+                    slot_index=slot_index,
+                )
+                all_papers = fetch_abstracts_for_papers(all_papers, tmp_dir)
+                fetched = sum(1 for p in all_papers if p.get("abstract"))
+                print(f"[search] 摘要爬取完成：{fetched}/{total} 篇获得摘要")
+                report(
+                    "abstracts_completed",
+                    f"摘要获取完成：{fetched}/{total} 篇获得摘要。",
+                    abstract_success=fetched,
+                    total_papers=total,
+                    slot_index=slot_index,
+                )
+            else:
+                print("[search] 所有论文已有摘要，跳过爬取")
+                report("abstracts_completed", "所有论文已有摘要，跳过爬取。", abstract_success=total, total_papers=total, slot_index=slot_index)
+        else:
+            print("[search] 已跳过摘要爬取（--no-abstract）")
+            report("abstracts_skipped", "已按要求跳过摘要爬取。", total_papers=total, slot_index=slot_index)
+
+        output_meta = {
+            "slug": slug,
+            "keywords": keyword_groups,
+            "venues": [v for v in search_venues if v],
+            "top_per_group": top,
+            "year_from": year_from,
+            "fetch_abstract": fetch_abstract,
+            "date": date.today().isoformat(),
+            "output_slug": dated_slug,
+            "total_papers": total,
+        }
+
+        write_csv(all_papers, csv_path)
+        json_records = build_json_records(all_papers)
+        write_json(json_records, json_path, output_meta)
+        write_site(json_records, site_path, output_meta)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(output_meta, f, ensure_ascii=False, indent=2)
+
+        site_url = build_site_url(out_dir, site_path)
+        report(
+            "completed",
+            "搜索结果、JSON 和静态网页已生成。",
+            site_url=site_url,
+            csv_path=csv_path,
+            json_path=json_path,
+            site_path=site_path,
+            total_papers=total,
+            slot_index=slot_index,
+        )
+        return {
+            "out_dir": out_dir,
+            "csv_path": csv_path,
+            "json_path": json_path,
+            "meta_path": meta_path,
+            "site_path": site_path,
+            "site_url": site_url,
+            "records": json_records,
+            "papers": all_papers,
+            "meta": output_meta,
+            "hit_counts": hit_counts,
+            "total_papers": total,
+        }
+    finally:
+        if os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if slot_lock is not None and slot_index is not None:
+            _release_research_slot(slot_index, slot_lock)
+
+
 def main():
     parser = argparse.ArgumentParser(description="DBLP 关键词搜索 → CSV")
     parser.add_argument("--keywords", required=True,
@@ -895,106 +1158,20 @@ def main():
                         help="跳过摘要爬取（默认会爬取摘要）")
     args = parser.parse_args()
 
-    # 输出目录：data/searches/YYYY-MM-DD_<slug>/
-    out_dir = os.path.join(ROOT_DIR, "data", "searches",
-                           f"{date.today().isoformat()}_{args.slug}")
-    os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, "papers.csv")
-    json_path = os.path.join(out_dir, "papers.json")
-    meta_path = os.path.join(out_dir, "search.json")
-    site_path = os.path.join(out_dir, "site", "index.html")
-    tmp_dir = os.path.join(ROOT_DIR, "data", "tmp_search")
-
-    venues = [v.strip() for v in args.venues.split(",") if v.strip()] if args.venues else [None]
-    keyword_groups = [k.strip() for k in args.keywords.split(";") if k.strip()]
-
-    # 保存搜索参数
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "slug": args.slug,
-            "keywords": keyword_groups,
-            "venues": [v for v in venues if v],
-            "top_per_group": args.top,
-            "year_from": args.year_from,
-            "fetch_abstract": not args.no_abstract,
-            "date": date.today().isoformat(),
-        }, f, ensure_ascii=False, indent=2)
-
-    # 搜索
-    all_papers: list[dict] = []
-    seen_keys: set[str] = set()
-    hit_counts: dict[str, int] = {}
-
-    dblp_ok = True  # track whether DBLP is reachable
-    for kw in keyword_groups:
-        kw_hits = 0
-        for venue in venues:
-            label = venue or "全局"
-            print(f"[search] '{kw}'  venue={label} ...")
-            if dblp_ok:
-                papers = dblp_search(kw, venue, args.top, args.year_from)
-                if papers is None:
-                    dblp_ok = False
-                    print("[search] DBLP 不可用，切换到 OpenAlex 搜索引擎")
-            if not dblp_ok:
-                papers = openalex_search(kw, venue, args.top, args.year_from)
-            new = 0
-            for p in papers:
-                key = p.get("key") or p.get("title", "")
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    p["_matched_kw"] = kw
-                    all_papers.append(p)
-                    new += 1
-            kw_hits += new
-            print(f"[search]   命中 {len(papers)} 篇，新增 {new} 篇（去重后）")
-            if len(venues) > 1 or len(keyword_groups) > 1:
-                time.sleep(random.uniform(1.0, 2.0))
-        hit_counts[kw] = kw_hits
-
-    all_papers.sort(key=lambda p: -(p.get("year") or 0))
-    total = len(all_papers)
-    print(f"\n[search] 合并去重后共 {total} 篇")
-    for kw, n in hit_counts.items():
-        print(f"  '{kw}': {n} 篇")
-
-    # 摘要
-    if not args.no_abstract:
-        has_abstract = sum(1 for p in all_papers if p.get("abstract"))
-        need = total - has_abstract
-        if need > 0:
-            est_min = round(need * 3 / 60)
-            print(f"\n[search] 开始爬取摘要（{need} 篇，预计约 {est_min} 分钟）...")
-            all_papers = fetch_abstracts_for_papers(all_papers, tmp_dir)
-            fetched = sum(1 for p in all_papers if p.get("abstract"))
-            print(f"[search] 摘要爬取完成：{fetched}/{total} 篇获得摘要")
-        else:
-            print("[search] 所有论文已有摘要，跳过爬取")
-    else:
-        print("[search] 已跳过摘要爬取（--no-abstract）")
-
-    output_meta = {
-        "slug": args.slug,
-        "keywords": keyword_groups,
-        "venues": [v for v in venues if v],
-        "top_per_group": args.top,
-        "year_from": args.year_from,
-        "fetch_abstract": not args.no_abstract,
-        "date": date.today().isoformat(),
-        "total_papers": total,
-    }
-
-    write_csv(all_papers, csv_path)
-    json_records = build_json_records(all_papers)
-    write_json(json_records, json_path, output_meta)
-    write_site(json_records, site_path, output_meta)
-    site_url = build_site_url(out_dir, site_path)
-    print(f"\n[search] 完成。输出目录: {out_dir}")
-    print(f"  papers.csv : {csv_path}")
-    print(f"  papers.json: {json_path}")
-    print(f"  search.json: {meta_path}")
-    print(f"  site.html  : {site_path}")
-    print(f"  site_url   : {site_url}")
+    result = run_topic_search(
+        keywords=[k.strip() for k in args.keywords.split(";") if k.strip()],
+        venues=[v.strip() for v in args.venues.split(",") if v.strip()],
+        slug=args.slug,
+        top=args.top,
+        year_from=args.year_from,
+        fetch_abstract=not args.no_abstract,
+    )
+    print(f"\n[search] 完成。输出目录: {result['out_dir']}")
+    print(f"  papers.csv : {result['csv_path']}")
+    print(f"  papers.json: {result['json_path']}")
+    print(f"  search.json: {result['meta_path']}")
+    print(f"  site.html  : {result['site_path']}")
+    print(f"  site_url   : {result['site_url']}")
 
 
 if __name__ == "__main__":

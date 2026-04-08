@@ -8,3 +8,4 @@ from .reading import *
 from .shared import *
 from .jobs import *
 from .references import *
+from .research_jobs import *

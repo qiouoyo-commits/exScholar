@@ -347,59 +347,27 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         return files
 
     def _handle_openclaw_post(self) -> bool:
-        if self.path == "/api/openclaw-intake/upload":
-            data = self.parse_body()
-            files = self._collect_uploaded_files(data)
-            if not files:
-                self.send_json({"ok": False, "error": "请至少上传一个 PDF 文件"}, status=400)
-                return True
-            try:
-                job = start_openclaw_intake_job(files, data.get("group_id"))
-            except (ValueError, OpenClawIngestError) as exc:
-                self.send_json({"ok": False, "error": str(exc)}, status=400)
-                return True
-            except Exception as exc:
-                self.send_json({"ok": False, "error": f"OpenClaw 批量导入启动失败: {exc}"}, status=500)
-                return True
-            self.send_json(
-                {
-                    "ok": True,
-                    "job_id": job["id"],
-                    "job": job,
-                    "message": f"已提交 {len(job.get('items') or [])} 个 PDF 到 OpenClaw 导入队列。",
-                }
-            )
-            return True
-
-        if self.path != "/api/reading/upload":
+        if self.path != "/api/openclaw-intake/upload":
             return False
         data = self.parse_body()
-        file_item = data.get("pdf")
-        if not file_item or not getattr(file_item, "filename", None):
-            self.send_json({"ok": False, "error": "请上传一个 PDF 文件"}, status=400)
+        files = self._collect_uploaded_files(data)
+        if not files:
+            self.send_json({"ok": False, "error": "请至少上传一个 PDF 文件"}, status=400)
             return True
         try:
-            job = start_openclaw_intake_job([file_item], data.get("group_id"))
+            job = start_openclaw_intake_job(files, data.get("group_id"))
         except (ValueError, OpenClawIngestError) as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return True
         except Exception as exc:
-            self.send_json({"ok": False, "error": f"OpenClaw 上传处理失败: {exc}"}, status=500)
+            self.send_json({"ok": False, "error": f"OpenClaw PDF 导入启动失败: {exc}"}, status=500)
             return True
-        first_item = (job.get("items") or [{}])[0]
         self.send_json(
             {
                 "ok": True,
-                "citation_id": first_item.get("citation_id"),
-                "matched_existing": bool(first_item.get("pdf_reused")),
-                "metadata": first_item.get("metadata") or {},
-                "pdf_path": first_item.get("pdf_path") or "",
-                "pdf_reused": bool(first_item.get("pdf_reused")),
-                "reading_url": first_item.get("reading_url") or "",
-                "paper_id": first_item.get("paper_id") or "",
                 "job_id": job["id"],
                 "job": job,
-                "message": "PDF 已提交到 OpenClaw Addon，元数据识别与论文分析正在后台处理。",
+                "message": f"已提交 {len(job.get('items') or [])} 个 PDF 到 OpenClaw 导入队列，系统会自动复用或合并现有记录。",
             }
         )
         return True
@@ -520,6 +488,128 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "site_url": site_url})
         return True
 
+    def _handle_research_post(self) -> bool:
+        if self.path == "/api/research/plan/compose":
+            data = self.parse_body()
+            latest_input = " ".join(str(data.get("input") or "").split())
+            current_prompt = " ".join(str(data.get("current_prompt") or "").split())
+            plan = data.get("plan")
+            if isinstance(plan, str):
+                try:
+                    plan = json.loads(plan)
+                except Exception:
+                    plan = None
+            if not latest_input:
+                self.send_json({"ok": False, "error": "请输入 research 内容"}, status=400)
+                return True
+            try:
+                payload = compose_research_plan_request(latest_input, current_prompt=current_prompt, current_plan=plan if isinstance(plan, dict) else None)
+            except (ValueError, OpenClawIngestError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return True
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"research 方案生成失败: {exc}"}, status=500)
+                return True
+            self.send_json({"ok": True, **payload})
+            return True
+
+        if self.path == "/api/research/plan/validate":
+            data = self.parse_body()
+            prompt = " ".join(str(data.get("prompt") or "").split())
+            plan = data.get("plan")
+            if isinstance(plan, str):
+                try:
+                    plan = json.loads(plan)
+                except Exception:
+                    plan = None
+            if not prompt:
+                self.send_json({"ok": False, "error": "缺少原始 research 需求"}, status=400)
+                return True
+            if not isinstance(plan, dict):
+                self.send_json({"ok": False, "error": "缺少当前 research 方案"}, status=400)
+                return True
+            try:
+                validated = verify_research_plan(prompt, plan)
+            except (ValueError, OpenClawIngestError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return True
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"research 方案验证失败: {exc}"}, status=500)
+                return True
+            self.send_json({"ok": True, "plan": validated, "prompt": prompt})
+            return True
+
+        if self.path == "/api/research/plan/revise":
+            data = self.parse_body()
+            prompt = " ".join(str(data.get("prompt") or "").split())
+            modify_request = " ".join(str(data.get("modify_request") or "").split())
+            plan = data.get("plan")
+            if isinstance(plan, str):
+                try:
+                    plan = json.loads(plan)
+                except Exception:
+                    plan = None
+            if not prompt:
+                self.send_json({"ok": False, "error": "缺少原始 research 需求"}, status=400)
+                return True
+            if not isinstance(plan, dict):
+                self.send_json({"ok": False, "error": "缺少当前 research 方案"}, status=400)
+                return True
+            if not modify_request:
+                self.send_json({"ok": False, "error": "请输入修改要求"}, status=400)
+                return True
+            try:
+                revised = revise_research_plan(prompt, plan, modify_request)
+            except (ValueError, OpenClawIngestError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return True
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"research 方案修改失败: {exc}"}, status=500)
+                return True
+            self.send_json({"ok": True, "plan": revised, "prompt": prompt, "modify_request": modify_request})
+            return True
+
+        if self.path == "/api/research/plan":
+            data = self.parse_body()
+            prompt = " ".join(str(data.get("prompt") or "").split())
+            if not prompt:
+                self.send_json({"ok": False, "error": "请输入 research 需求"}, status=400)
+                return True
+            try:
+                plan = preview_research_plan(prompt)
+            except (ValueError, OpenClawIngestError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return True
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"research 方案生成失败: {exc}"}, status=500)
+                return True
+            self.send_json({"ok": True, "plan": plan, "prompt": prompt})
+            return True
+
+        if self.path != "/api/research/jobs":
+            return False
+        data = self.parse_body()
+        prompt = " ".join(str(data.get("prompt") or "").split())
+        if not prompt:
+            self.send_json({"ok": False, "error": "请输入 research 需求"}, status=400)
+            return True
+        plan = data.get("plan")
+        if isinstance(plan, str):
+            try:
+                plan = json.loads(plan)
+            except Exception:
+                plan = None
+        try:
+            job = start_research_job_with_plan(prompt, plan if isinstance(plan, dict) else None)
+        except (ValueError, OpenClawIngestError) as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return True
+        except Exception as exc:
+            self.send_json({"ok": False, "error": f"research 任务启动失败: {exc}"}, status=500)
+            return True
+        self.send_json({"ok": True, "job": job, "job_id": job["id"]})
+        return True
+
     def _handle_group_delete(self) -> bool:
         if not self.path.startswith("/api/reading-groups/"):
             return False
@@ -635,6 +725,22 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "jobs": list_openclaw_jobs()})
             return
 
+        if self.path == "/api/research/jobs":
+            self.send_json({"ok": True, "jobs": list_research_jobs()})
+            return
+
+        if self.path.startswith("/api/research/jobs/"):
+            job_id = unquote(self.path[len("/api/research/jobs/"):]).strip().strip("/")
+            if not job_id:
+                self.send_json({"ok": False, "error": "job id 不合法"}, status=400)
+                return
+            job = load_research_job(job_id)
+            if not job:
+                self.send_json({"ok": False, "error": "任务不存在"}, status=404)
+                return
+            self.send_json({"ok": True, "job": job})
+            return
+
         if self.path.startswith("/api/openclaw-intake/jobs/"):
             job_id = unquote(self.path[len("/api/openclaw-intake/jobs/"):]).strip().strip("/")
             if not job_id:
@@ -692,6 +798,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         for handler in (
             self._handle_citation_post,
             self._handle_group_post,
+            self._handle_research_post,
             self._handle_openclaw_post,
             self._handle_reading_post,
             self._handle_reference_post,
