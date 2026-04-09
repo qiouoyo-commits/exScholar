@@ -7,7 +7,8 @@
 - [ccf-research/SKILL.md](/home/ubuntu/tools/exScholar/skills/ccf-research/SKILL.md)
   - 用途：按研究主题搜索论文，生成搜索结果网页、CSV、JSON
   - 主要触发：普通“找论文 / 查论文 / 搜论文 / 读文献”
-  - 当前链路：智能建议检索词 -> 生成 research plan -> 执行搜索 -> 标题/摘要相关性复核 -> autotag
+  - 当前链路：智能建议检索词 -> 生成 research plan -> 执行搜索 -> 低结果自动补扩 -> 标题/摘要相关性复核 -> autotag
+  - 当前规划会对“影响因素 / 决定因素 / 预测因素 / 作用机制”这类中文需求优先改写成更像学术标题的名词短语
 - [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
   - 用途：从论文截图中识别论文并加入当天 `Picsearch` timeline，也支持 Google Scholar 页面截图批量补链接
   - 主口令：`picsearch`

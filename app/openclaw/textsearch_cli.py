@@ -4,7 +4,7 @@ import json
 import sys
 
 from app.openclaw._cli_utils import wait_for_job
-from app.openclaw import split_textsearch_inputs
+from app.openclaw import model_http_transport_mode, split_textsearch_inputs
 from app.site.core import ensure_db, openclaw_default_username, start_openclaw_textsearch_job, user_context
 
 
@@ -43,6 +43,7 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"username={username}")
+        print(f"model_http={model_http_transport_mode()}")
         print(f"job_id={job['id']}")
         print(f"status={job.get('status')}")
         print(f"running={job.get('running')}")
@@ -55,6 +56,8 @@ def main() -> int:
             print(f"- {(item.get('status') or '')}: {paper.get('title') or item.get('title_query') or ''}")
             if item.get("source"):
                 print(f"  source={item['source']}")
+            if item.get("failure_reason"):
+                print(f"  failure_reason={item['failure_reason']}")
             if url:
                 print(f"  url={url}")
             if item.get("error"):

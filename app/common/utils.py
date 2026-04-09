@@ -1,13 +1,29 @@
 import json
 import os
 import re
+import threading
 import time
 from difflib import SequenceMatcher
 
+import requests
 from contextlib import contextmanager
 from pathlib import Path
 
 from prettytable import PrettyTable
+
+
+_NO_PROXY_SESSION = None
+_NO_PROXY_SESSION_LOCK = threading.Lock()
+
+
+def get_no_proxy_session() -> requests.Session:
+    global _NO_PROXY_SESSION
+    with _NO_PROXY_SESSION_LOCK:
+        if _NO_PROXY_SESSION is None:
+            session = requests.Session()
+            session.trust_env = False
+            _NO_PROXY_SESSION = session
+    return _NO_PROXY_SESSION
 
 
 @contextmanager

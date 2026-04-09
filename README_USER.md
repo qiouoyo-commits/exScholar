@@ -1,6 +1,6 @@
 # exScholar 用户使用说明
 
-这份文档面向部署和日常使用 exScholar 的用户，覆盖安装、账号配置、网页使用、CLI 使用和服务管理。
+这份文档面向部署和日常使用 exScholar 的用户，覆盖安装、账号配置、网页使用、CLI 使用和服务管理。当前项目默认以云服务器部署为主：网站和 OpenClaw 网关都常驻运行在同一台云主机上。
 
 为避免文档和单台机器路径绑定，下面统一使用两个占位写法：
 
@@ -91,6 +91,14 @@ OPENCLAW_ANALYTICS_PYTHON=<openclaw-python>
 
 推荐使用 user-level systemd 服务。
 
+当前默认服务形态：
+
+- `exscholar-site.service`
+  - 提供 exScholar 网站和 API
+- `openclaw-gateway.service`
+  - 提供 OpenClaw 对话网关
+- 两者通常一起运行在同一台云服务器上
+
 启动或重启：
 
 ```bash
@@ -145,6 +153,16 @@ http://<your-host>:38128/
 Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 自然语言 research 当前会先生成建议检索词，再执行搜索；结果页会补充相关性等级和自动标签，方便快速筛选高相关论文。
 如果你在 OpenClaw 对话里做普通主题搜论文，这条链也会被 `ccf-research` skill 复用。
+对“影响因素 / 决定因素 / 预测因素 / 作用机制”这类中文需求，系统会优先改写成更像论文标题和摘要里常见的英文名词短语，减少“impact analysis / effects assessment”这类解释型检索表达。
+为了控制噪声和模型开销，单次自然语言 research 最终默认最多保留 200 篇结果；如果第一次召回少于约 80 篇，系统会自动补充建议检索词再重试一轮。
+搜索执行中，页面会实时显示当前正在检索的关键词 / venue，以及当前累计找到的论文数。
+如果某个 `关键词 × venue` 组合的 DBLP 请求临时失败，系统只会对当前组合回退到 OpenAlex，不会让整轮搜索都放弃 DBLP；相关 fallback 记录会写入结果目录的 `search.json`。
+搜索结果页和 Keywords 页中的“扩展搜索”现在也会走后台 job：
+
+- 点击后会立即进入队列
+- 页面会显示当前步骤提示
+- 前端会轮询等待结果
+- 如果单次请求或整体等待超时，会明确提示你稍后重试或回到时间线查看结果
 
 ### 6.2 PDF 上传
 

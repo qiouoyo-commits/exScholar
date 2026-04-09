@@ -187,6 +187,10 @@ def current_research_jobs_dir() -> Path:
     return current_data_dir() / "research_jobs"
 
 
+def current_reference_jobs_dir() -> Path:
+    return current_data_dir() / "reference_jobs"
+
+
 def ensure_user_data_dirs(username: str) -> Path:
     normalized = sanitize_username(username)
     if not normalized:
@@ -200,6 +204,7 @@ def ensure_user_data_dirs(username: str) -> Path:
         "reading",
         "openclaw_jobs",
         "research_jobs",
+        "reference_jobs",
     ):
         (user_root / relative).mkdir(parents=True, exist_ok=True)
     return user_root
@@ -213,6 +218,7 @@ READING_DIR = DynamicPath(current_reading_dir)
 DB_PATH = DynamicPath(current_db_path)
 OPENCLAW_JOBS_DIR = DynamicPath(current_openclaw_jobs_dir)
 RESEARCH_JOBS_DIR = DynamicPath(current_research_jobs_dir)
+REFERENCE_JOBS_DIR = DynamicPath(current_reference_jobs_dir)
 
 
 def _session_expiry_cutoff(now: float | None = None) -> float:

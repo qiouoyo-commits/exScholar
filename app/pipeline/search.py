@@ -37,6 +37,7 @@ import requests
 import logging
 import shutil
 import fcntl
+from collections import OrderedDict
 from datetime import date
 from pathlib import Path
 from html import escape
@@ -47,6 +48,7 @@ from dotenv import load_dotenv
 ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / ".env.local")
 MAX_CONCURRENT_RESEARCH_JOBS = max(1, int((os.getenv("MAX_CONCURRENT_RESEARCH_JOBS") or "2").strip() or "2"))
+MAX_TOTAL_SEARCH_RESULTS = 200
 DATA_DIR = Path((os.getenv("EXSCHOLAR_DATA_DIR") or str(ROOT_DIR / "data")).strip())
 SEARCHES_BASE_DIR = Path((os.getenv("EXSCHOLAR_SEARCHES_DIR") or str(DATA_DIR / "searches")).strip())
 TMP_SEARCH_BASE_DIR = Path((os.getenv("EXSCHOLAR_TMP_SEARCH_DIR") or str(DATA_DIR / "tmp_search")).strip())
@@ -182,6 +184,68 @@ def _get_no_proxy_session():
     return NO_PROXY_SESSION
 
 
+def _is_retryable_dblp_error(exc) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError, requests.exceptions.SSLError)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        if response is None:
+            return True
+        status = int(response.status_code or 0)
+        return status in {408, 409, 425, 429} or status >= 500
+    return False
+
+
+def _dblp_request_json(params: dict) -> dict:
+    global _DBLP_PROXIES
+    if _DBLP_PROXIES is False:
+        _DBLP_PROXIES = _detect_http_proxy()
+        if _DBLP_PROXIES:
+            print(f"[search] 检测到可用 HTTP 代理: {list(_DBLP_PROXIES.values())[0]}")
+
+    direct_session = _get_no_proxy_session()
+    last_err = None
+
+    attempt_routes: list[tuple[str, dict | None]] = [("direct", None)]
+    if _DBLP_PROXIES:
+        attempt_routes.append(("proxy", _DBLP_PROXIES))
+    attempt_routes.extend([("direct", None)])
+    if _DBLP_PROXIES:
+        attempt_routes.append(("proxy", _DBLP_PROXIES))
+
+    for attempt_index, (route_name, proxies) in enumerate(attempt_routes, start=1):
+        try:
+            if proxies:
+                resp = requests.get(
+                    DBLP_SEARCH_URL,
+                    params=params,
+                    timeout=15,
+                    headers={"User-Agent": "exscholar-search/1.0"},
+                    proxies=proxies,
+                )
+            else:
+                resp = direct_session.get(
+                    DBLP_SEARCH_URL,
+                    params=params,
+                    timeout=15,
+                    headers={"User-Agent": "exscholar-search/1.0"},
+                )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            last_err = exc
+            retryable = _is_retryable_dblp_error(exc)
+            print(
+                f"[search] DBLP attempt {attempt_index}/{len(attempt_routes)} "
+                f"via {route_name} failed: {type(exc).__name__}: {exc}"
+            )
+            if not retryable:
+                break
+            if attempt_index < len(attempt_routes):
+                time.sleep(min(6.0, 1.5 * attempt_index + random.uniform(0.2, 0.8)))
+    raise last_err or RuntimeError("DBLP request failed")
+
+
 def _reconstruct_abstract(inverted_index: dict | None) -> str:
     """Reconstruct abstract text from OpenAlex abstract_inverted_index."""
     if not inverted_index:
@@ -201,8 +265,28 @@ def _slot_state_path(slot_index: int) -> Path:
     return RESEARCH_SLOT_DIR / f"slot_{slot_index}.json"
 
 
+def _cleanup_stale_research_slot_state():
+    _ensure_research_slot_dir()
+    for slot_index in range(MAX_CONCURRENT_RESEARCH_JOBS):
+        state_path = _slot_state_path(slot_index)
+        if not state_path.exists():
+            continue
+        lock_path = RESEARCH_SLOT_DIR / f"slot_{slot_index}.lock"
+        lock_file = open(lock_path, "a+", encoding="utf-8")
+        try:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            state_path.unlink(missing_ok=True)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
 def _acquire_research_slot(owner_id: str, status_callback=None, poll_interval: float = 2.0):
     _ensure_research_slot_dir()
+    _cleanup_stale_research_slot_state()
     wait_started_at = None
     while True:
         for slot_index in range(MAX_CONCURRENT_RESEARCH_JOBS):
@@ -328,7 +412,7 @@ def openalex_search(keywords: str, venue: str | None, top: int, year_from: int) 
     return papers
 
 
-def dblp_search(keywords: str, venue: str | None, top: int, year_from: int) -> list[dict]:
+def dblp_search(keywords: str, venue: str | None, top: int, year_from: int, diagnostics: dict | None = None) -> list[dict]:
     """调用 DBLP search API，返回论文列表（只匹配标题）。"""
     query = keywords
     if venue:
@@ -336,27 +420,18 @@ def dblp_search(keywords: str, venue: str | None, top: int, year_from: int) -> l
 
     params = {"q": query, "format": "json", "h": min(top, 1000), "f": 0, "c": 0}
 
-    global _DBLP_PROXIES
-    if _DBLP_PROXIES is False:
-        _DBLP_PROXIES = _detect_http_proxy()
-        if _DBLP_PROXIES:
-            print(f"[search] 检测到可用 HTTP 代理: {list(_DBLP_PROXIES.values())[0]}")
-
-    last_err = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(DBLP_SEARCH_URL, params=params, timeout=15,
-                                headers={"User-Agent": "exscholar-search/1.0"},
-                                proxies=_DBLP_PROXIES or {})
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-    else:
-        print(f"[search] DBLP 请求失败: {last_err}，自动切换到 OpenAlex...")
+    try:
+        data = _dblp_request_json(params)
+        if isinstance(diagnostics, dict):
+            diagnostics["engine"] = "dblp"
+            diagnostics["fallback"] = False
+    except Exception as e:
+        if isinstance(diagnostics, dict):
+            diagnostics["engine"] = "openalex"
+            diagnostics["fallback"] = True
+            diagnostics["error_type"] = type(e).__name__
+            diagnostics["error"] = str(e)
+        print(f"[search] DBLP 请求失败: {e}，自动切换到 OpenAlex...")
         return None  # signal caller to fallback
 
     hits = data.get("result", {}).get("hits", {}).get("hit", []) or []
@@ -512,12 +587,17 @@ def write_site(records: list[dict], output_path: str, meta: dict):
         return text[:limit].rstrip() + " ..."
 
     def render_initial_card(paper: dict) -> str:
+        authors = paper.get("authors") or ""
+        if isinstance(authors, list):
+            authors_text = ", ".join(str(item).strip() for item in authors if str(item).strip())
+        else:
+            authors_text = str(authors).strip()
         line_meta = " · ".join(
             item for item in [
                 f"CSV #{paper.get('csv_index')}" + (f" · 命中词：{paper.get('matched_kw')}" if paper.get("matched_kw") else ""),
                 paper.get("venue") or "",
                 str(paper.get("year") or ""),
-                paper.get("authors") or "",
+                authors_text,
             ] if item
         )
         review_meta = " · ".join(
@@ -1081,10 +1161,12 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     }}
 
     function uniqueAutotags() {{
+      const hasHigh = papers.some((paper) => text(paper.relevance_label).trim().toLowerCase() === 'high');
+      const targetLabel = hasHigh ? 'high' : 'medium';
       const values = [];
       const seen = new Set();
       for (const paper of papers) {{
-        if (text(paper.relevance_label).trim().toLowerCase() !== 'high') continue;
+        if (text(paper.relevance_label).trim().toLowerCase() !== targetLabel) continue;
         for (const tag of (paper.autotags || [])) {{
           const value = text(tag).trim();
           if (!value) continue;
@@ -1109,6 +1191,53 @@ def write_site(records: list[dict], output_path: str, meta: dict):
         throw new Error(data.error || '请求失败');
       }}
       return data;
+    }}
+
+    async function apiGet(path) {{
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let resp;
+      try {{
+        resp = await fetch(path, {{
+          credentials: 'same-origin',
+          signal: controller.signal
+        }});
+      }} catch (error) {{
+        if (error && error.name === 'AbortError') {{
+          throw new Error('扩展搜索请求超时，请稍后重试');
+        }}
+        throw error;
+      }} finally {{
+        clearTimeout(timer);
+      }}
+      const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+      if (!resp.ok || data.ok === false) {{
+        throw new Error(data.error || '请求失败');
+      }}
+      return data;
+    }}
+
+    function sleep(ms) {{
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }}
+
+    async function waitReferenceExpansionJob(jobId) {{
+      const deadline = Date.now() + 20 * 60 * 1000;
+      while (Date.now() < deadline) {{
+        const data = await apiGet(`/api/papers/expand-references/jobs/${{encodeURIComponent(jobId)}}`);
+        const job = data.job || {{}};
+        const status = text(job.status).trim().toLowerCase();
+        if (status === 'completed') return job;
+        if (status === 'failed') {{
+          throw new Error(job.error || job.step_message || '扩展搜索失败');
+        }}
+        const message = text(job.step_message).trim();
+        if (message) {{
+          showToast(message);
+        }}
+        await sleep(1200);
+      }}
+      throw new Error('扩展搜索等待超时，请稍后到时间线中查看结果');
     }}
 
     async function addCitation(index) {{
@@ -1139,18 +1268,26 @@ def write_site(records: list[dict], output_path: str, meta: dict):
         window.open(expansionIndex[doi].site_url, '_blank', 'noopener');
         return;
       }}
-      showToast('正在执行延展搜索，请稍等...');
+      showToast('已进入扩展搜索队列，正在准备结果...');
       try {{
-        const data = await apiPost('/api/papers/expand-references', {{
+        const started = await apiPost('/api/papers/expand-references', {{
           search_slug: meta.slug || '',
           paper
         }});
-        if (doi && data.site_url) {{
-          expansionIndex[doi] = {{ site_url: data.site_url }};
+        const job = started.job || {{}};
+        if (!job.id) {{
+          throw new Error('扩展搜索任务创建失败');
+        }}
+        const finished = job.status === 'completed' ? job : await waitReferenceExpansionJob(job.id);
+        if (doi && finished.site_url) {{
+          expansionIndex[doi] = {{ site_url: finished.site_url }};
+        }}
+        if (!finished.site_url) {{
+          throw new Error('扩展搜索结果未生成链接');
         }}
         showToast('延展搜索页面已生成，正在打开...');
         render(input.value);
-        window.open(data.site_url, '_blank', 'noopener');
+        window.open(finished.site_url, '_blank', 'noopener');
       }} catch (error) {{
         showToast(error.message);
       }}
@@ -1353,7 +1490,70 @@ def build_site_url(out_dir: str, site_path: str) -> str:
         relative_dir = quote(relative_dir.replace(os.sep, "/"))
         return f"{base_url}/{relative_dir}/site/"
 
-    return Path(site_path).resolve().as_uri()
+    try:
+        relative_dir = Path(out_dir).resolve().relative_to(DATA_DIR.resolve()).as_posix()
+        return f"/{quote(relative_dir, safe='/')}/site/"
+    except Exception:
+        return ""
+
+
+def cap_papers_with_bucket_coverage(papers: list[dict], limit: int) -> tuple[list[dict], dict]:
+    if len(papers) <= limit:
+        return papers, {
+            "strategy": "full",
+            "limit": limit,
+            "input_total": len(papers),
+            "output_total": len(papers),
+            "bucket_count": 0,
+        }
+
+    buckets: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
+    for paper in papers:
+        bucket_key = (
+            str(paper.get("_matched_kw") or paper.get("matched_kw") or "").strip(),
+            str(paper.get("_matched_venue") or paper.get("matched_venue") or "").strip(),
+        )
+        buckets.setdefault(bucket_key, []).append(paper)
+
+    selected: list[dict] = []
+    bucket_index = 0
+    bucket_items = list(buckets.items())
+    while len(selected) < limit:
+        progressed = False
+        for _, bucket_papers in bucket_items:
+            if bucket_index < len(bucket_papers):
+                selected.append(bucket_papers[bucket_index])
+                progressed = True
+                if len(selected) >= limit:
+                    break
+        if not progressed:
+            break
+        bucket_index += 1
+
+    kw_coverage = sorted(
+        {
+            str(paper.get("_matched_kw") or paper.get("matched_kw") or "").strip()
+            for paper in selected
+            if str(paper.get("_matched_kw") or paper.get("matched_kw") or "").strip()
+        }
+    )
+    venue_coverage = sorted(
+        {
+            str(paper.get("_matched_venue") or paper.get("matched_venue") or "").strip()
+            for paper in selected
+            if str(paper.get("_matched_venue") or paper.get("matched_venue") or "").strip()
+        }
+    )
+
+    return selected, {
+        "strategy": "round_robin_by_keyword_and_venue",
+        "limit": limit,
+        "input_total": len(papers),
+        "output_total": len(selected),
+        "bucket_count": len(bucket_items),
+        "covered_keywords": kw_coverage,
+        "covered_venues": venue_coverage,
+    }
 
 
 def run_topic_search(
@@ -1430,19 +1630,27 @@ def run_topic_search(
         all_papers: list[dict] = []
         seen_keys: set[str] = set()
         hit_counts: dict[str, int] = {}
+        fallback_events: list[dict] = []
 
-        dblp_ok = True
         for kw in keyword_groups:
             kw_hits = 0
             for venue in search_venues:
                 label = venue or "全局"
                 print(f"[search] '{kw}'  venue={label} ...")
-                if dblp_ok:
-                    papers = dblp_search(kw, venue, top, year_from)
-                    if papers is None:
-                        dblp_ok = False
-                        print("[search] DBLP 不可用，切换到 OpenAlex 搜索引擎")
-                if not dblp_ok:
+                diagnostics: dict[str, object] = {}
+                papers = dblp_search(kw, venue, top, year_from, diagnostics)
+                if papers is None:
+                    print("[search] 本次 DBLP 请求失败，当前组合改用 OpenAlex 回退。")
+                    fallback_events.append(
+                        {
+                            "keyword": kw,
+                            "venue": venue or "",
+                            "fallback_engine": "openalex",
+                            "source_engine": "dblp",
+                            "error_type": str(diagnostics.get("error_type") or ""),
+                            "error": str(diagnostics.get("error") or ""),
+                        }
+                    )
                     papers = openalex_search(kw, venue, top, year_from)
                 new = 0
                 for p in papers:
@@ -1469,11 +1677,35 @@ def run_topic_search(
             hit_counts[kw] = kw_hits
 
         all_papers.sort(key=lambda p: -(p.get("year") or 0))
+        uncapped_total = len(all_papers)
+        cap_summary = {
+            "strategy": "full",
+            "limit": MAX_TOTAL_SEARCH_RESULTS,
+            "input_total": uncapped_total,
+            "output_total": uncapped_total,
+            "bucket_count": 0,
+            "covered_keywords": sorted(hit_counts.keys()),
+            "covered_venues": sorted(v for v in search_venues if v),
+        }
+        if uncapped_total > MAX_TOTAL_SEARCH_RESULTS:
+            all_papers, cap_summary = cap_papers_with_bucket_coverage(all_papers, MAX_TOTAL_SEARCH_RESULTS)
+            print(
+                f"\n[search] 合并去重后共 {uncapped_total} 篇，"
+                f"按覆盖优先策略保留 {len(all_papers)} 篇"
+            )
         total = len(all_papers)
-        print(f"\n[search] 合并去重后共 {total} 篇")
+        if uncapped_total <= MAX_TOTAL_SEARCH_RESULTS:
+            print(f"\n[search] 合并去重后共 {total} 篇")
         for kw, n in hit_counts.items():
             print(f"  '{kw}': {n} 篇")
-        report("search_completed", f"搜索完成，合并去重后共 {total} 篇。", total_papers=total, hit_counts=hit_counts, slot_index=slot_index)
+        report(
+            "search_completed",
+            f"搜索完成，合并去重后共 {uncapped_total} 篇，最终保留 {total} 篇。",
+            total_papers=total,
+            uncapped_total_papers=uncapped_total,
+            hit_counts=hit_counts,
+            slot_index=slot_index,
+        )
 
         if fetch_abstract:
             has_abstract = sum(1 for p in all_papers if p.get("abstract"))
@@ -1513,11 +1745,15 @@ def run_topic_search(
             "keywords": keyword_groups,
             "venues": [v for v in search_venues if v],
             "top_per_group": top,
+            "max_total_results": MAX_TOTAL_SEARCH_RESULTS,
+            "cap_summary": cap_summary,
             "year_from": year_from,
             "fetch_abstract": fetch_abstract,
             "date": date.today().isoformat(),
             "output_slug": dated_slug,
             "total_papers": total,
+            "uncapped_total_papers": uncapped_total,
+            "fallback_events": fallback_events,
         }
 
         write_csv(all_papers, csv_path)

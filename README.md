@@ -1,6 +1,6 @@
 # exScholar
 
-`exScholar` 是一套面向本地部署的论文搜索、PDF intake、深度阅读与阅读库管理工具。项目当前统一运行在 `openclaw-analytics` conda 环境中，并通过 OpenClaw 处理 PDF 元数据抽取、结构化分析和问答链路。
+`exScholar` 是一套面向云端长期运行的论文搜索、PDF intake、深度阅读与阅读库管理工具。当前这份仓库默认对应一台云服务器部署：`exscholar-site.service` 提供网站服务，`openclaw-gateway.service` 提供 OpenClaw 对话网关，项目统一运行在 `openclaw-analytics` conda 环境中，并通过 OpenClaw 处理 PDF 元数据抽取、结构化分析和问答链路。
 
 为避免文档和本机路径强耦合，下面统一使用两个占位写法：
 
@@ -11,6 +11,8 @@
 
 - 按关键词搜索 DBLP 论文并导出网页、CSV、JSON
 - 在网页中发起自然语言 research 搜索，自动生成更贴合学术表达的检索词建议，并在结果阶段做相关性复核与自动标签
+- 对“影响因素 / 决定因素 / 预测因素 / 作用机制”这类需求，搜索规划会优先改写成更像论文标题的英文名词短语，而不是解释型短语
+- 自然语言 research 结果默认不超过 200 篇；如果第一次召回过少，系统会自动补充建议检索词再重试一轮
 - 上传一个或多个 PDF，自动去重、建库、生成阅读工作区
 - 从搜索结果页加入深度阅读时，先打开原文链接手动下载 PDF，再上传 PDF
 - 在 OpenClaw 对话侧通过 `picsearch` 标准动作提交论文截图图片；除单篇论文截图外，也支持 Google Scholar 页面截图，并会把识别出的多篇论文统一加入当天 `Picsearch` timeline，同时尽量补抓摘要
@@ -98,8 +100,12 @@ systemctl --user restart exscholar-site.service
 
 - 先生成学术化检索词建议
 - 再生成正式搜索方案
+- 如果第一次召回结果过少，会自动补充一轮建议检索词并重试
+- DBLP 请求会按更稳的 direct/proxy 路径重试；单次 DBLP 失败只会让当前 `关键词 × venue` 组合回退到 OpenAlex，不会拖累整轮搜索
 - 搜索完成后结合标题和摘要做相关性复核
 - 为结果补充 `relevance_label`、`relevance_score`、`autotags`
+- 搜索阶段会实时显示当前关键词 / venue，以及已累计找到的论文数
+- `search.json` 会记录本次是否发生过 DBLP -> OpenAlex fallback，便于排查“结果变少”到底是检索词问题还是数据源波动
 
 本地导入 PDF：
 

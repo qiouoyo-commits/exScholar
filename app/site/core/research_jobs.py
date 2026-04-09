@@ -185,13 +185,37 @@ def _parse_search_cli_line(job_id: str, line: str):
         logs = payload.setdefault("logs", [])
         logs.append({"at": utc_now(), "step": payload.get("current_step") or "running", "message": text})
         payload["logs"] = logs[-60:]
+        progress = payload.setdefault("progress", {})
 
         if "开始搜索" in text:
             payload["current_step"] = "searching"
             payload["step_message"] = text
+        elif text.startswith("[search] '") and "venue=" in text:
+            payload["current_step"] = "searching"
+            matched_scope = re.search(r"^\[search\]\s*'(.+?)'\s+venue=(.+?)\s*\.\.\.$", text)
+            if matched_scope:
+                progress["current_keyword"] = matched_scope.group(1).strip()
+                venue_label = matched_scope.group(2).strip()
+                progress["current_venue"] = "" if venue_label == "全局" else venue_label
+            payload["step_message"] = text
+        elif text.startswith("[search] 命中") or "新增" in text:
+            payload["current_step"] = "searching"
+            matched = re.search(r"命中\s*(\d+)\s*篇.*新增\s*(\d+)\s*篇", text)
+            if matched:
+                hit_count = int(matched.group(1) or 0)
+                added_count = int(matched.group(2) or 0)
+                progress["current_hit_count"] = hit_count
+                progress["current_added_count"] = added_count
+                progress["discovered_papers"] = int(progress.get("discovered_papers") or 0) + added_count
+                payload["step_message"] = f"{text}（当前累计 {progress['discovered_papers']} 篇）"
+            else:
+                payload["step_message"] = text
         elif "合并去重后共" in text:
             payload["current_step"] = "search_completed"
             payload["step_message"] = text
+            matched_total = re.search(r"合并去重后共\s*(\d+)\s*篇", text)
+            if matched_total:
+                progress["discovered_papers"] = int(matched_total.group(1) or 0)
         elif "开始爬取摘要" in text:
             payload["current_step"] = "fetching_abstracts"
             payload["step_message"] = text
@@ -337,6 +361,50 @@ def _run_search_in_openclaw_analytics(job_id: str, plan: dict) -> dict:
     }
 
 
+def _expand_research_plan_for_low_results(plan: dict, result: dict) -> dict | None:
+    if not isinstance(plan, dict):
+        return None
+    total_papers = int(result.get("total_papers") or 0)
+    if total_papers >= 80:
+        return None
+
+    existing_keywords = []
+    seen = set()
+    for item in plan.get("keywords") or []:
+        value = " ".join(str(item or "").strip().split())
+        lowered = value.lower()
+        if not value or lowered in seen:
+            continue
+        seen.add(lowered)
+        existing_keywords.append(value)
+
+    suggestion = plan.get("query_suggestion") if isinstance(plan.get("query_suggestion"), dict) else {}
+    candidate_pool = list(suggestion.get("candidate_keywords") or []) + list(suggestion.get("core_concepts") or [])
+    extra_keywords = []
+    for item in candidate_pool:
+        value = " ".join(str(item or "").strip().split())
+        lowered = value.lower()
+        if not value or lowered in seen:
+            continue
+        seen.add(lowered)
+        extra_keywords.append(value)
+        if len(extra_keywords) >= 4:
+            break
+
+    if not extra_keywords:
+        return None
+
+    expanded = dict(plan)
+    expanded["keywords"] = (existing_keywords + extra_keywords)[:8]
+    expanded["notes"] = " ".join(
+        part for part in [
+            str(plan.get("notes") or "").strip(),
+            f"Low-result auto expansion applied after initial recall of {total_papers} papers.",
+        ] if part
+    )
+    return expanded
+
+
 def _apply_research_result_review(job_id: str, prompt: str, plan: dict, result: dict) -> dict:
     json_path = Path(result.get("json_path") or "")
     csv_path = Path(result.get("csv_path") or "")
@@ -478,6 +546,22 @@ def _run_research_job_inner(job_id: str):
             set_step("planned", "已生成搜索方案，开始执行搜索。")
 
         result = _run_search_in_openclaw_analytics(job_id, plan)
+        expanded_plan = _expand_research_plan_for_low_results(plan, result)
+        if expanded_plan:
+            update_research_job(
+                job_id,
+                lambda payload: payload.update(
+                    {
+                        "step_message": (
+                            f"首次搜索仅得到 {int(result.get('total_papers') or 0)} 篇，"
+                            "正在补充智能建议检索词后重试。"
+                        ),
+                        "plan": expanded_plan,
+                    }
+                ),
+            )
+            plan = expanded_plan
+            result = _run_search_in_openclaw_analytics(job_id, plan)
         set_step("reviewing_results", "正在根据标题和摘要复核相关性，并自动打标签。")
         result = _apply_research_result_review(job_id, prompt, plan, result)
 

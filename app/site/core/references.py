@@ -1,6 +1,103 @@
 """Reference expansion, external APIs, and search listing helpers for exScholar."""
 
+from app.common import get_no_proxy_session
+
 from .shared import *
+
+REFERENCE_JOB_LOCK = threading.Lock()
+REFERENCE_STALE_JOB_TIMEOUT_SECONDS = 20 * 60
+REFERENCE_STALE_JOB_MESSAGE = "扩展引用任务因服务重启或超时被中断，请重新发起。"
+
+
+def ensure_reference_jobs_dir():
+    REFERENCE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def build_relative_site_url(path: Path) -> str:
+    return f"/{path.relative_to(DATA_DIR).as_posix()}/"
+
+
+def build_reference_job_id() -> str:
+    return f"xjob_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
+
+
+def reference_job_path(job_id: str) -> Path:
+    ensure_reference_jobs_dir()
+    return REFERENCE_JOBS_DIR / f"{job_id}.json"
+
+
+def parse_reference_job_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def summarize_reference_job(job: dict) -> dict:
+    job["updated_at"] = utc_now()
+    return job
+
+
+def reconcile_reference_job_if_stale(job: dict, path: Path | None = None) -> dict:
+    status = str(job.get("status") or "").strip().lower()
+    if status in {"completed", "failed"}:
+        return job
+    updated_at = parse_reference_job_timestamp(job.get("updated_at") or job.get("created_at") or "")
+    if not updated_at:
+        return job
+    age_seconds = (datetime.utcnow() - updated_at).total_seconds()
+    if age_seconds < REFERENCE_STALE_JOB_TIMEOUT_SECONDS:
+        return job
+    job["status"] = "failed"
+    job["current_step"] = "failed"
+    job["step_message"] = REFERENCE_STALE_JOB_MESSAGE
+    job["error"] = REFERENCE_STALE_JOB_MESSAGE
+    if path is not None:
+        with REFERENCE_JOB_LOCK:
+            write_json_file_atomic(path, summarize_reference_job(job))
+    return job
+
+
+def save_reference_job(job: dict):
+    with REFERENCE_JOB_LOCK:
+        write_json_file_atomic(reference_job_path(job["id"]), summarize_reference_job(job))
+
+
+def load_reference_job(job_id: str) -> dict | None:
+    path = reference_job_path(job_id)
+    if not path.exists():
+        return None
+    job = read_json_file(path, None)
+    if not job:
+        return None
+    return reconcile_reference_job_if_stale(job, path)
+
+
+def list_reference_jobs(limit: int = 20) -> list[dict]:
+    ensure_reference_jobs_dir()
+    jobs = []
+    for path in sorted(REFERENCE_JOBS_DIR.glob("*.json"), reverse=True):
+        payload = read_json_file(path, None)
+        if not payload:
+            continue
+        jobs.append(reconcile_reference_job_if_stale(payload, path))
+        if len(jobs) >= limit:
+            break
+    return jobs
+
+
+def update_reference_job(job_id: str, mutate):
+    with REFERENCE_JOB_LOCK:
+        path = reference_job_path(job_id)
+        job = read_json_file(path, None)
+        if not job:
+            raise ValueError("扩展引用任务不存在")
+        mutate(job)
+        write_json_file_atomic(path, summarize_reference_job(job))
+        return job
 
 
 def reconstruct_abstract(inverted_index: dict | None) -> str:
@@ -41,7 +138,7 @@ def fetch_ai4scholar_citation_records(paper: dict, limit: int) -> list[dict]:
     identifier = build_ai4scholar_identifier(paper)
     url = f"https://ai4scholar.net/graph/v1/paper/{quote(identifier, safe=':')}/citations"
     try:
-        resp = requests.get(
+        resp = get_no_proxy_session().get(
             url,
             params={
                 "fields": "paperId,title,year,externalIds,authors,venue,abstract,openAccessPdf",
@@ -102,10 +199,12 @@ def slugify(text: str, fallback: str = "ref-search") -> str:
     return result[:50] or fallback
 
 
-def fetch_reference_records(doi: str, limit: int) -> list[dict]:
+def fetch_reference_records(doi: str, limit: int, progress_callback=None) -> list[dict]:
+    if progress_callback:
+        progress_callback("crossref_lookup", "正在查询 Crossref 引用信息。")
     crossref_url = f"https://api.crossref.org/works/{doi}"
     try:
-        resp = requests.get(crossref_url, timeout=20, headers={"User-Agent": "ccf-crawler-site/1.0"})
+        resp = get_no_proxy_session().get(crossref_url, timeout=20, headers={"User-Agent": "ccf-crawler-site/1.0"})
         resp.raise_for_status()
         message = resp.json().get("message", {})
     except Exception:
@@ -113,7 +212,8 @@ def fetch_reference_records(doi: str, limit: int) -> list[dict]:
 
     refs = message.get("reference", []) or []
     records = []
-    for ref in refs[:limit]:
+    sliced_refs = refs[:limit]
+    for idx, ref in enumerate(sliced_refs, start=1):
         ref_doi = (ref.get("DOI") or "").upper()
         title = (
             ref.get("article-title")
@@ -137,8 +237,10 @@ def fetch_reference_records(doi: str, limit: int) -> list[dict]:
         }
 
         if ref_doi:
+            if progress_callback:
+                progress_callback("openalex_enrich", f"正在补全引用元数据 {idx}/{len(sliced_refs)}。")
             try:
-                openalex = requests.get(
+                openalex = get_no_proxy_session().get(
                     "https://api.openalex.org/works",
                     params={
                         "filter": f"doi:https://doi.org/{ref_doi.lower()}",
@@ -207,7 +309,7 @@ def list_expansion_sites() -> dict[str, dict]:
             continue
         expansions[doi] = {
             "doi": doi,
-            "site_url": build_site_url(str(out_dir), str(site_path)),
+            "site_url": build_relative_site_url(site_path.parent),
             "slug": meta.get("slug", out_dir.name),
             "title": source_paper.get("title") or "",
             "source_slug": source_paper.get("source_slug") or "",
@@ -219,6 +321,10 @@ def list_expansion_sites() -> dict[str, dict]:
 
 
 def create_reference_search(source_slug: str, paper: dict) -> str:
+    return create_reference_search_with_progress(source_slug, paper)
+
+
+def create_reference_search_with_progress(source_slug: str, paper: dict, progress_callback=None) -> str:
     title = (paper.get("title") or "").strip()
     doi = (paper.get("doi") or "").strip()
     source_kw = (paper.get("matched_kw") or "").strip()
@@ -226,12 +332,16 @@ def create_reference_search(source_slug: str, paper: dict) -> str:
     if normalized_doi:
         existing = list_expansion_sites().get(normalized_doi)
         if existing:
+            if progress_callback:
+                progress_callback("completed", "已找到现有相关论文页。")
             return existing["site_url"]
+    if progress_callback:
+        progress_callback("ai4scholar_lookup", "正在查询 AI4Scholar 引用网络。")
     ref_records = fetch_ai4scholar_citation_records(paper, REFERENCE_LIMIT)
     keywords = [f"citations of {title}"]
     source_kind = "ai4scholar-citations"
     if not ref_records and doi:
-        ref_records = fetch_reference_records(doi, REFERENCE_LIMIT)
+        ref_records = fetch_reference_records(doi, REFERENCE_LIMIT, progress_callback=progress_callback)
         keywords = [f"references of {title}"]
         source_kind = "crossref-references"
     if not ref_records:
@@ -247,6 +357,8 @@ def create_reference_search(source_slug: str, paper: dict) -> str:
     search_json_path = out_dir / "search.json"
     site_path = out_dir / "site" / "index.html"
 
+    if progress_callback:
+        progress_callback("writing_outputs", "正在整理扩展搜索结果。")
     write_csv(ref_records, str(csv_path))
     json_records = build_json_records(ref_records)
     meta = {
@@ -271,7 +383,113 @@ def create_reference_search(source_slug: str, paper: dict) -> str:
     write_json(json_records, str(json_path), meta)
     write_site(json_records, str(site_path), meta)
     search_json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    return build_site_url(str(out_dir), str(site_path))
+    return f"/{out_dir.relative_to(DATA_DIR).as_posix()}/site/"
+
+
+def start_reference_expansion_job(search_slug: str, paper: dict) -> dict:
+    title = " ".join(str((paper or {}).get("title") or "").split())
+    doi = normalize_doi((paper or {}).get("doi") or "")
+    normalized_slug = " ".join(str(search_slug or "").split()).strip("/")
+
+    if doi:
+        existing = list_expansion_sites().get(doi)
+        if existing:
+            job = {
+                "id": build_reference_job_id(),
+                "kind": "reference_expansion",
+                "status": "completed",
+                "current_step": "completed",
+                "step_message": "已找到现有相关论文页。",
+                "message": "扩展搜索结果已就绪。",
+                "search_slug": normalized_slug,
+                "paper_title": title,
+                "paper_doi": doi,
+                "site_url": existing.get("site_url") or "",
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+                "finished_at": utc_now(),
+                "logs": [{"at": utc_now(), "step": "completed", "message": "已找到现有相关论文页。"}],
+            }
+            save_reference_job(job)
+            return job
+
+    job = {
+        "id": build_reference_job_id(),
+        "kind": "reference_expansion",
+        "status": "queued",
+        "current_step": "queued",
+        "step_message": "已收到扩展搜索请求，正在准备任务。",
+        "message": "扩展搜索任务等待执行。",
+        "search_slug": normalized_slug,
+        "paper_title": title,
+        "paper_doi": doi,
+        "paper": dict(paper or {}),
+        "site_url": "",
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "logs": [{"at": utc_now(), "step": "queued", "message": "已收到扩展搜索请求，正在准备任务。"}],
+    }
+    save_reference_job(job)
+    username = current_username()
+    threading.Thread(
+        target=run_reference_expansion_job,
+        args=(job["id"], username),
+        daemon=True,
+    ).start()
+    return job
+
+
+def run_reference_expansion_job(job_id: str, username: str = ""):
+    with user_context(username):
+        _run_reference_expansion_job_inner(job_id)
+
+
+def _run_reference_expansion_job_inner(job_id: str):
+    def mark(step: str, message: str):
+        def mutate(job):
+            job["status"] = "running" if step != "completed" else "completed"
+            job["current_step"] = step
+            job["step_message"] = message
+            job["message"] = message
+            logs = job.setdefault("logs", [])
+            logs.append({"at": utc_now(), "step": step, "message": message})
+            job["logs"] = logs[-40:]
+            if step == "completed":
+                job["finished_at"] = utc_now()
+        update_reference_job(job_id, mutate)
+
+    job = load_reference_job(job_id)
+    if not job:
+        return
+    search_slug = " ".join(str(job.get("search_slug") or "").split()).strip("/")
+    paper = job.get("paper") or {}
+
+    try:
+        mark("running", "扩展搜索任务进行中。")
+        site_url = create_reference_search_with_progress(search_slug, paper, progress_callback=mark)
+
+        def finalize(payload):
+            payload["status"] = "completed"
+            payload["current_step"] = "completed"
+            payload["step_message"] = "扩展搜索结果已生成。"
+            payload["message"] = "扩展搜索结果已生成。"
+            payload["site_url"] = site_url
+            payload["finished_at"] = utc_now()
+            logs = payload.setdefault("logs", [])
+            logs.append({"at": utc_now(), "step": "completed", "message": "扩展搜索结果已生成。"})
+            payload["logs"] = logs[-40:]
+        update_reference_job(job_id, finalize)
+    except Exception as exc:
+        def fail(payload):
+            payload["status"] = "failed"
+            payload["current_step"] = "failed"
+            payload["step_message"] = str(exc)
+            payload["error"] = str(exc)
+            payload["finished_at"] = utc_now()
+            logs = payload.setdefault("logs", [])
+            logs.append({"at": utc_now(), "step": "failed", "message": str(exc)})
+            payload["logs"] = logs[-40:]
+        update_reference_job(job_id, fail)
 
 
 def list_search_entries():

@@ -28,12 +28,18 @@ def build_timeline_html():
             detail_parts.append(f"命中词：{source_kw}")
         else:
             detail_parts.append(f"范围：{venues}")
-        primary_href = entry["site_url"] or entry["csv_url"] or entry["json_url"] or entry["search_url"]
+        primary_href = entry["site_url"] or entry["search_url"] or "#"
         links = [
+            f'<a href="{entry["site_url"]}">结果网页</a>' if entry["site_url"] else "",
             f'<a href="{entry["csv_url"]}">CSV</a>' if entry["csv_url"] else "",
         ]
         delete_button = f'<button class="delete-search-entry" type="button" data-relative-dir="{entry["relative_dir"]}">删除这次搜索</button>'
         subtitle = f'<div class="meta">{keywords}</div>' if is_expansion and keywords else ""
+        title_html = (
+            f'<a class="title-link" href="{primary_href}">{title}</a>'
+            if primary_href != "#"
+            else f'<span class="title-link">{title}</span>'
+        )
         return f"""
         <article class="entry" data-matched-kw="{entry.get("source_matched_kw", "").lower()}">
           <div class="dot"></div>
@@ -43,7 +49,7 @@ def build_timeline_html():
               <div class="slug">{entry["slug"]}</div>
             </div>
             <div class="meta">{' · '.join(detail_parts)}</div>
-            <h2><a class="title-link" href="{primary_href}">{title}</a></h2>
+            <h2>{title_html}</h2>
             {subtitle}
             <div class="links">{' '.join(link for link in links if link)} {delete_button}</div>
           </div>
@@ -354,6 +360,7 @@ def build_timeline_html():
     let activeResearchJobId = '';
     let previewResearchPlan = null;
     let previewResearchPrompt = '';
+    let previewResearchPlanDirty = false;
 
     function syncResearchSubmitState() {{
       if (!researchSubmit) return;
@@ -366,6 +373,11 @@ def build_timeline_html():
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;');
+    }}
+
+    function text(value) {{
+      if (value === null || value === undefined) return '';
+      return String(value);
     }}
 
     async function parseApiJson(resp, fallbackError) {{
@@ -393,6 +405,7 @@ def build_timeline_html():
       const status = (job && job.status || '').toString();
       const step = (job && job.current_step || '').toString();
       const stepMessage = (job && job.step_message || '').toString();
+      const progressPayload = (job && job.progress) || {{}};
       const reviewSummary = (job && job.review_summary) || {{}};
       if (status === 'completed') {{
         return {{
@@ -435,6 +448,19 @@ def build_timeline_html():
           }}
         }}
       }}
+      if (step === 'searching') {{
+        const discovered = Number(progressPayload.discovered_papers || 0);
+        const currentHit = Number(progressPayload.current_hit_count || 0);
+        const currentAdded = Number(progressPayload.current_added_count || 0);
+        const currentKeyword = text(progressPayload.current_keyword).trim();
+        const currentVenue = text(progressPayload.current_venue).trim();
+        const scope = [currentKeyword, currentVenue].filter(Boolean).join(' / ');
+        const detailBase = discovered > 0
+          ? `当前已找到 ${{discovered}} 篇（最近一轮命中 ${{currentHit}} 篇，新增 ${{currentAdded}} 篇）`
+          : '正在召回与去重';
+        const detail = scope ? `${{detailBase}} · 当前检索：${{scope}}` : detailBase;
+        return {{ percent: 45, label: '搜索中', detail }};
+      }}
       const matched = mapping[step] || mapping[status] || [12, '处理中', '任务正在运行'];
       return {{ percent: matched[0], label: matched[1], detail: matched[2] }};
     }}
@@ -448,6 +474,7 @@ def build_timeline_html():
       }}
       const plan = job.plan || {{}};
       const suggestion = plan.query_suggestion || {{}};
+      const diagnostics = job.diagnostics || plan.diagnostics || {{}};
       const progress = researchProgressState(job);
       const hasKeywords = Array.isArray(plan.keywords) && plan.keywords.length > 0;
       const hasSlug = Boolean((plan.slug || '').toString().trim());
@@ -473,6 +500,7 @@ def build_timeline_html():
         </div>
         ${{suggestion.candidate_keywords && suggestion.candidate_keywords.length ? `<div style="margin-top:6px;"><strong>智能建议检索词：</strong>${{esc((suggestion.candidate_keywords || []).join(' ; '))}}</div>` : ''}}
         ${{suggestion.avoid_keywords && suggestion.avoid_keywords.length ? `<div style="margin-top:6px;"><strong>建议避免：</strong>${{esc((suggestion.avoid_keywords || []).join(' ; '))}}</div>` : ''}}
+        ${{diagnostics.plan_generation_mode ? `<div style="margin-top:6px;"><strong>规划诊断：</strong>plan=${{esc(diagnostics.plan_generation_mode)}}${{diagnostics.query_suggestion_mode ? ` · suggestion=${{esc(diagnostics.query_suggestion_mode)}}` : ''}}${{diagnostics.fallback_reason ? ` · reason=${{esc(diagnostics.fallback_reason)}}` : ''}}</div>` : ''}}
         ${{hasPlan ? `<div style="margin-top:6px;"><strong>方案：</strong>${{esc((plan.keywords || []).join(' ; '))}}${{plan.venues && plan.venues.length ? ` | venues: ${{esc(plan.venues.join(', '))}}` : ''}}</div>` : ''}}
         ${{hasPlan ? `<div style="margin-top:6px;"><strong>slug：</strong>${{esc(plan.slug || '')}}${{plan.year_from ? ` | year_from: ${{esc(plan.year_from)}}` : ''}}</div>` : ''}}
         ${{links.length ? `<div class="research-job-links">${{links.join('')}}</div>` : ''}}
@@ -482,6 +510,7 @@ def build_timeline_html():
     function renderResearchPreview(plan, prompt, message) {{
       previewResearchPlan = plan || null;
       previewResearchPrompt = prompt || '';
+      previewResearchPlanDirty = false;
       if (researchEditor) researchEditor.style.display = previewResearchPlan ? 'block' : 'none';
       syncResearchSubmitState();
       if (previewResearchPlan) {{
@@ -504,6 +533,7 @@ def build_timeline_html():
     function clearResearchPreview() {{
       previewResearchPlan = null;
       previewResearchPrompt = '';
+      previewResearchPlanDirty = false;
       if (researchEditor) researchEditor.style.display = 'none';
       syncResearchSubmitState();
       if (researchEditSlug) researchEditSlug.value = '';
@@ -526,6 +556,11 @@ def build_timeline_html():
         fetch_abstract: researchEditFetchAbstract ? Boolean(researchEditFetchAbstract.checked) : true,
         summary: previewResearchPlan && previewResearchPlan.summary ? previewResearchPlan.summary : '',
       }};
+    }}
+
+    function markResearchPlanDirty() {{
+      if (!previewResearchPlan) return;
+      previewResearchPlanDirty = true;
     }}
 
     function renderResearchJobs(items) {{
@@ -596,6 +631,10 @@ def build_timeline_html():
       renderResearchJobs(jobs);
       if (!activeResearchJobId) {{
         renderResearchStatus(pickPrimaryResearchJob(jobs));
+        const runningJob = jobs.find((item) => item && !['completed', 'failed'].includes((item.status || '').toString()));
+        if (runningJob && runningJob.id) {{
+          pollResearchJob(runningJob.id);
+        }}
       }}
       return jobs;
     }}
@@ -670,12 +709,14 @@ def build_timeline_html():
         setActionButtonState(researchSubmit, 'busy');
         renderResearchStatus({{
           status: 'queued',
-          step_message: previewResearchPlan ? '正在检查当前方案，并把搜索任务提交到后台队列。' : '还没有现成方案，正在自动生成并提交搜索任务。',
+          step_message: previewResearchPlan
+            ? (previewResearchPlanDirty ? '正在检查你手工修改后的方案，并把搜索任务提交到后台队列。' : '正在直接提交刚生成的方案到后台队列。')
+            : '还没有现成方案，正在自动生成并提交搜索任务。',
           plan: previewResearchPlan || {{}}
         }});
         try {{
           let validatedPlan = previewResearchPlan;
-          if (previewResearchPlan) {{
+          if (previewResearchPlan && previewResearchPlanDirty) {{
             const manualPlan = collectManualResearchPlan();
             const validateResp = await fetch('/api/research/plan/validate', {{
               method: 'POST',
@@ -689,6 +730,8 @@ def build_timeline_html():
             const validateData = await parseApiJson(validateResp, '方案验证失败');
             validatedPlan = validateData.plan || manualPlan;
             renderResearchPreview(validatedPlan, effectivePrompt, '当前手工编辑方案已通过模型复核，开始执行 Research。');
+          }} else if (previewResearchPlan) {{
+            validatedPlan = collectManualResearchPlan();
           }}
           const resp = await fetch('/api/research/jobs', {{
             method: 'POST',
@@ -716,6 +759,20 @@ def build_timeline_html():
       syncResearchSubmitState();
       fetchResearchJobs().catch(() => {{}});
     }}
+
+    [
+      researchEditSlug,
+      researchEditYearFrom,
+      researchEditTop,
+      researchEditVenues,
+      researchEditKeywords,
+      researchEditNotes,
+      researchEditFetchAbstract,
+    ].filter(Boolean).forEach((element) => {{
+      element.addEventListener('input', markResearchPlanDirty);
+      element.addEventListener('change', markResearchPlanDirty);
+    }});
+
     expansionFilterButtons.forEach((button) => {{
       button.addEventListener('click', () => {{
         const filter = button.dataset.expansionFilter || 'all';
@@ -1128,6 +1185,84 @@ def build_keyword_detail_html(keyword: str):
       return data;
     }}
 
+    async function apiGet(path) {{
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let resp;
+      try {{
+        resp = await fetch(path, {{
+          credentials: 'same-origin',
+          signal: controller.signal,
+        }});
+      }} catch (error) {{
+        if (error && error.name === 'AbortError') {{
+          throw new Error('扩展搜索请求超时，请稍后重试');
+        }}
+        throw error;
+      }} finally {{
+        clearTimeout(timer);
+      }}
+      const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
+      if (!resp.ok || data.ok === false) {{
+        throw new Error(data.error || '请求失败');
+      }}
+      return data;
+    }}
+
+    function sleep(ms) {{
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }}
+
+    const keywordExpansionStatus = (() => {{
+      const el = document.createElement('div');
+      el.style.position = 'fixed';
+      el.style.right = '20px';
+      el.style.bottom = '20px';
+      el.style.maxWidth = '360px';
+      el.style.padding = '10px 14px';
+      el.style.borderRadius = '12px';
+      el.style.background = 'rgba(61, 50, 39, 0.92)';
+      el.style.color = '#fffaf2';
+      el.style.fontSize = '14px';
+      el.style.lineHeight = '1.5';
+      el.style.boxShadow = '0 10px 30px rgba(43, 35, 25, 0.18)';
+      el.style.zIndex = '9999';
+      el.style.display = 'none';
+      document.body.appendChild(el);
+      return el;
+    }})();
+
+    function showKeywordExpansionStatus(message) {{
+      const textValue = text(message).trim();
+      if (!textValue) return;
+      keywordExpansionStatus.textContent = textValue;
+      keywordExpansionStatus.style.display = 'block';
+    }}
+
+    function hideKeywordExpansionStatus() {{
+      keywordExpansionStatus.style.display = 'none';
+      keywordExpansionStatus.textContent = '';
+    }}
+
+    async function waitReferenceExpansionJob(jobId) {{
+      const deadline = Date.now() + 20 * 60 * 1000;
+      while (Date.now() < deadline) {{
+        const data = await apiGet(`/api/papers/expand-references/jobs/${{encodeURIComponent(jobId)}}`);
+        const job = data.job || {{}};
+        const status = text(job.status).trim().toLowerCase();
+        const message = text(job.step_message).trim();
+        if (message) {{
+          showKeywordExpansionStatus(message);
+        }}
+        if (status === 'completed') return job;
+        if (status === 'failed') {{
+          throw new Error(job.error || job.step_message || '扩展搜索失败');
+        }}
+        await sleep(1200);
+      }}
+      throw new Error('扩展搜索等待超时，请稍后到时间线中查看结果');
+    }}
+
     async function addKeywordCitation(index) {{
       const paper = keywordPapers[index - 1];
       if (!paper) return;
@@ -1151,12 +1286,23 @@ def build_keyword_detail_html(keyword: str):
       const paper = keywordPapers[index - 1];
       if (!paper) return;
       try {{
-        const data = await apiPost('/api/papers/expand-references', {{
+        showKeywordExpansionStatus('已进入扩展搜索队列，正在准备结果...');
+        const started = await apiPost('/api/papers/expand-references', {{
           search_slug: paper.source_slug || '',
           paper
         }});
-        window.open(data.site_url, '_blank', 'noopener');
+        const job = started.job || {{}};
+        if (!job.id) {{
+          throw new Error('扩展搜索任务创建失败');
+        }}
+        const finished = job.status === 'completed' ? job : await waitReferenceExpansionJob(job.id);
+        if (!finished.site_url) {{
+          throw new Error('扩展搜索结果未生成链接');
+        }}
+        hideKeywordExpansionStatus();
+        window.open(finished.site_url, '_blank', 'noopener');
       }} catch (error) {{
+        hideKeywordExpansionStatus();
         alert(error.message);
       }}
     }}

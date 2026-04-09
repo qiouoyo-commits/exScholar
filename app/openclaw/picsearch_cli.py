@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+from app.openclaw import model_http_transport_mode
 from app.openclaw._cli_utils import wait_for_job
 from app.site.core import ensure_db, openclaw_default_username, start_openclaw_picsearch_job, user_context
 
@@ -66,6 +67,7 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"username={username}")
+        print(f"model_http={model_http_transport_mode()}")
         print(f"job_id={job['id']}")
         print(f"status={job.get('status')}")
         print(f"running={job.get('running')}")

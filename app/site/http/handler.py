@@ -61,6 +61,9 @@ class UploadedFormFile:
 
 
 class SearchSiteHandler(SimpleHTTPRequestHandler):
+    _ALLOWED_STATIC_SEARCH_EXTS = {".html", ".csv", ".json"}
+    _ALLOWED_STATIC_BINARY_EXTS = {".pdf"}
+
     # Request parsing and response helpers
     def is_openclaw_public_api(self) -> bool:
         path = self.path.split("?", 1)[0].split("#", 1)[0]
@@ -73,9 +76,64 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             or path.startswith("/api/openclaw-image-intake/jobs/")
         )
 
+    def _resolve_data_request_path(self, path: str) -> Path | None:
+        normalized = unquote(path.split("?", 1)[0].split("#", 1)[0]).strip()
+        cleaned = normalized.lstrip("/")
+        candidate = (DATA_DIR / cleaned).resolve()
+        try:
+            candidate.relative_to(DATA_DIR.resolve())
+        except Exception:
+            return None
+        return candidate
+
+    def _is_allowed_static_data_path(self, path: Path) -> bool:
+        try:
+            relative = path.relative_to(DATA_DIR.resolve())
+        except Exception:
+            return False
+        parts = relative.parts
+        if not parts:
+            return False
+        suffix = path.suffix.lower()
+        if path.name.endswith(".sqlite3"):
+            return False
+
+        searches_root = Path(current_searches_dir()).resolve()
+        expansions_root = Path(current_expansions_dir()).resolve()
+        library_root = Path(current_library_dir()).resolve()
+        reading_root = Path(current_reading_dir()).resolve()
+
+        try:
+            rel = path.relative_to(searches_root)
+            if path.is_dir():
+                return "site" in rel.parts
+            return suffix in self._ALLOWED_STATIC_SEARCH_EXTS
+        except Exception:
+            pass
+        try:
+            rel = path.relative_to(expansions_root)
+            if path.is_dir():
+                return "site" in rel.parts
+            return suffix in self._ALLOWED_STATIC_SEARCH_EXTS
+        except Exception:
+            pass
+        try:
+            path.relative_to(library_root)
+            return suffix in self._ALLOWED_STATIC_BINARY_EXTS
+        except Exception:
+            pass
+        try:
+            rel = path.relative_to(reading_root)
+            return suffix in self._ALLOWED_STATIC_BINARY_EXTS and "source" in rel.parts
+        except Exception:
+            pass
+        return False
+
     def translate_path(self, path):
-        path = unquote(path.split("?", 1)[0].split("#", 1)[0]).lstrip("/")
-        return str(DATA_DIR / path)
+        resolved = self._resolve_data_request_path(path)
+        if not resolved:
+            return str((DATA_DIR / "__forbidden__").resolve())
+        return str(resolved)
 
     @staticmethod
     def _append_form_value(data: dict, name: str, value):
@@ -627,14 +685,14 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         search_slug = (data.get("search_slug") or "").strip()
         paper = data.get("paper") or {}
         try:
-            site_url = create_reference_search(search_slug, paper)
+            job = start_reference_expansion_job(search_slug, paper)
         except ValueError as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return True
         except Exception as exc:
             self.send_json({"ok": False, "error": f"扩展引用失败: {exc}"}, status=500)
             return True
-        self.send_json({"ok": True, "site_url": site_url})
+        self.send_json({"ok": True, "job": job})
         return True
 
     def _handle_research_post(self) -> bool:
@@ -985,6 +1043,28 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/expansions":
             self.send_json({"ok": True, "items": list_expansion_sites()})
             return
+
+        if self.path == "/api/papers/expand-references/jobs":
+            self.send_json({"ok": True, "items": list_reference_jobs()})
+            return
+
+        if self.path.startswith("/api/papers/expand-references/jobs/"):
+            job_id = unquote(self.path[len("/api/papers/expand-references/jobs/"):]).strip().strip("/")
+            if not job_id:
+                self.send_json({"ok": False, "error": "job id 不合法"}, status=400)
+                return
+            job = load_reference_job(job_id)
+            if not job:
+                self.send_json({"ok": False, "error": "任务不存在"}, status=404)
+                return
+            self.send_json({"ok": True, "job": job})
+            return
+
+        static_target = self._resolve_data_request_path(self.path)
+        if static_target and static_target.exists():
+            if not self._is_allowed_static_data_path(static_target):
+                self.send_error(404, "File not found")
+                return
 
         super().do_GET()
 

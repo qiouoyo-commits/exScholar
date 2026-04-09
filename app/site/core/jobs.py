@@ -4,6 +4,7 @@ from app.openclaw import (
     DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL,
     DEFAULT_OPENCLAW_IMAGE_MODEL,
     generate_keywords_from_metadata,
+    model_http_transport_mode,
     resolve_paper_lookup_from_image,
     resolve_paper_lookups_from_image,
     resolve_paper_lookup_from_title,
@@ -285,7 +286,7 @@ def process_openclaw_intake_item(job_id: str, index: int):
     metadata = {}
     target_citation_id = citation_id
     if run_metadata:
-        update_step("extracting_metadata", "正在调用主模型提取元数据，并由检查模型复核。")
+        update_step("extracting_metadata", f"正在调用主模型提取元数据，并由检查模型复核。（model_http={model_http_transport_mode()}）")
         metadata = extract_metadata_from_text(
             extracted.get("text") or "",
             filename=pdf_abs.name,
@@ -327,13 +328,13 @@ def process_openclaw_intake_item(job_id: str, index: int):
 
     paper_payload = read_json_file(Path(reading["paper_json_path"]), {})
     if run_analysis:
-        update_step("generating_analysis", "正在生成论文结构化分析，并由检查模型复核。")
+        update_step("generating_analysis", f"正在生成论文结构化分析，并由检查模型复核。（model_http={model_http_transport_mode()}）")
         update_paper_analysis_progress(
             Path(reading["paper_json_path"]),
             state="in_progress",
             progress=50,
             stage="analyzing",
-            message=f"正在调用 {OPENCLAW_INGEST_MODEL} 生成结构化分析。",
+            message=f"正在调用 {OPENCLAW_INGEST_MODEL} 生成结构化分析。（model_http={model_http_transport_mode()}）",
         )
         analysis = generate_analysis_from_text(
             {
@@ -821,6 +822,7 @@ def process_openclaw_textsearch_item(job_id: str, index: int):
         "paper": enriched,
         "candidate": result.get("candidate") or {},
         "source": result.get("source") or "",
+        "failure_reason": result.get("failure_reason") or "",
         "timeline": timeline,
     }
 
@@ -863,6 +865,7 @@ def _run_openclaw_textsearch_job_inner(job_id: str):
                 item["paper"] = paper
                 item["candidate"] = result.get("candidate") or {}
                 item["source"] = result.get("source") or ""
+                item["failure_reason"] = result.get("failure_reason") or ""
                 item["timeline"] = result.get("timeline") or {}
                 item["current_step"] = "completed"
                 item["step_message"] = "该标题已处理完成。"
@@ -875,6 +878,11 @@ def _run_openclaw_textsearch_job_inner(job_id: str):
                 item = payload["items"][index]
                 item["status"] = "failed"
                 item["error"] = str(exc)
+                item["failure_reason"] = (
+                    str(exc).split("failure_reason=", 1)[1].strip()
+                    if "failure_reason=" in str(exc)
+                    else ""
+                )
                 item["current_step"] = "failed"
                 item["step_message"] = str(exc)
 
@@ -910,6 +918,7 @@ def _build_textsearch_job(title_items: list[str], *, kind: str, message_prefix: 
                 "step_message": "等待进入标题匹配队列。",
                 "title": "",
                 "source": "",
+                "failure_reason": "",
                 "paper": {},
                 "candidate": {},
                 "timeline": {},

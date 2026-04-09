@@ -1,10 +1,10 @@
 # exScholar 架构说明
 
-这份文档面向需要快速建立全局理解的开发者，重点说明 exScholar 当前的模块划分、运行方式、用户上下文和核心数据流。
+这份文档面向需要快速建立全局理解的开发者，重点说明 exScholar 当前的模块划分、运行方式、用户上下文和核心数据流。当前仓库默认对应一套云服务器常驻部署：`exscholar-site.service` 和 `openclaw-gateway.service` 一起运行，对外提供网页与 OpenClaw 能力。
 
 ## 1. 系统目标
 
-exScholar 当前是一套本地部署的论文工作台，核心职责包括：
+exScholar 当前是一套以云服务器常驻运行为主的论文工作台，核心职责包括：
 
 - 搜索论文并导出结构化结果
 - 上传和处理 PDF
@@ -46,7 +46,7 @@ exscholar-site.service
 启动命令：
 
 ```text
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -u -m app.site.http.handler
+<openclaw-python> -u -m app.site.http.handler
 ```
 
 这意味着：
@@ -60,7 +60,7 @@ exscholar-site.service
 项目当前统一使用：
 
 ```text
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+<openclaw-python>
 ```
 
 主要覆盖：
@@ -91,6 +91,7 @@ data/users/<username>/
 ├── reading/
 ├── openclaw_jobs/
 ├── research_jobs/
+├── reference_jobs/
 └── citation_library.sqlite3
 ```
 
@@ -123,6 +124,7 @@ data/users/<username>/
 - 使用用户名 + 密码登录
 - 用户注册信息保存在 `data/users/users.json`
 - HTTP 会话通过 cookie 维持
+- 会话带 TTL，超时后会被 `prune_expired_sessions(...)` 清理
 - 登录后，页面和 API 仅访问当前用户自己的搜索时间线和阅读库
 
 ## 6. 搜索链路
@@ -151,12 +153,21 @@ data/users/<username>/
 
 1. 前端提交 research prompt
 2. 后端先生成一版更贴合学术表达的检索词建议
+   - 对“影响因素 / 决定因素 / 预测因素 / 作用机制”这类需求，会额外收敛成更像标题检索的名词短语
 3. 基于建议词生成或校验搜索方案
 4. 在后台线程中创建 job
 5. 使用 `OPENCLAW_ANALYTICS_PYTHON` 启动 `app.pipeline.search`
-6. 搜索完成后结合标题和摘要做相关性复核与自动标签
-7. 解析 stdout，实时回写 job 状态
-8. 将结果路径映射为站点可访问 URL
+6. 如果第一次召回过少，自动补充一轮建议检索词后重试
+7. 搜索完成后结合标题和摘要做相关性复核与自动标签
+8. 解析 stdout，实时回写 job 状态，包括当前关键词 / venue 和累计找到的论文数
+9. 将结果路径映射为站点可访问 URL
+
+底层检索阶段当前采用：
+
+- DBLP 优先
+- 单次 DBLP 请求失败时，仅当前 `关键词 × venue` 组合回退到 OpenAlex
+- DBLP 请求本身带 direct/proxy 重试
+- 回退记录写入 `search.json.fallback_events`
 
 ### 6.3 并发控制
 
@@ -167,6 +178,37 @@ data/users/<username>/
 - 直接搜索入口
 
 限流逻辑在 [search.py](/home/ubuntu/tools/exScholar/app/pipeline/search.py) 中完成。
+
+后台模型调用的节流逻辑位于：
+
+- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
+
+当前做法包括：
+
+- 全局模型调用并发闸门
+- provider 级最小请求间隔
+- research 结果复核按较大 chunk 分批执行，并在批间轻量节流
+
+### 6.4 引用扩展后台任务
+
+引用扩展当前已经不再同步阻塞 HTTP 请求线程，而是改成后台 job：
+
+1. 前端点击“扩展搜索”
+2. 后端创建 `reference expansion job`
+3. 前端轮询 `GET /api/papers/expand-references/jobs/<id>`
+4. 后端串行执行：
+   - AI4Scholar / Crossref 引文获取
+   - OpenAlex enrich
+   - 结果目录和 `site/index.html` 生成
+5. 完成后前端打开相应的扩展结果页
+
+当前这条链和 research job 一样，具备：
+
+- 后台状态持久化
+- 前端步骤提示
+- 单次请求超时保护
+- 整体等待超时保护
+- 结果页相对 URL 输出，避免不同访问入口下的绝对 URL 失效
 
 ## 7. OpenClaw PDF 链路
 
@@ -228,7 +270,8 @@ data/users/qioyo/
 - citation 库保存在每个用户自己的 SQLite 中
 - 每篇进入深度阅读的文章会有独立 `paper_id`
 - 对应阅读工作区保存在 `reading/<paper_id>/`
-- 工作区中通常包含 `paper.json`、`analysis.json`、`notes.json`、`qa_history.json` 和 `source/`
+- 工作区中通常包含 `paper.json`、`notes.json`、`qa_history.json` 和 `source/`
+- `paper.json` 当前是主要状态文件，里面会汇总元数据、分析状态、进度和页面展示所需字段
 
 ## 10. HTTP 层与页面层
 

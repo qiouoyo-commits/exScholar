@@ -56,17 +56,22 @@ metadata:
 
 1. 用户输入自然语言研究需求
 2. 智能体先生成一版更贴合学术表达的检索词建议
-3. 基于建议词生成正式搜索方案
+   - 对“影响因素 / 决定因素 / 预测因素 / 作用机制”这类中文需求，要优先改写成更像论文标题的英文名词短语，而不是 `impact analysis`、`effects assessment` 这类解释型短语
+3. 基于建议词生成正式搜索方案，并把建议词合并进最终可执行关键词
 4. 用户确认后执行搜索
-5. 搜索结果出来后，再由智能体结合标题和摘要复核相关性
-6. 为每篇论文补充 `relevance_label`、`relevance_score`、`autotags`、`review_reason`
-7. 最终导出网页、CSV、JSON
+5. 如果第一次召回结果过少，系统会自动补充一轮建议检索词后重试
+6. 搜索结果出来后，再由智能体结合标题和摘要复核相关性
+7. 为每篇论文补充 `relevance_label`、`relevance_score`、`autotags`、`review_reason`
+8. 最终导出网页、CSV、JSON
 
 这意味着：
 
 - 前置阶段不会直接拿口语化描述去搜
+- 前置阶段会主动规避 `impact analysis`、`factors influence`、`interaction evaluation` 这类不利于标题检索的短语
 - 结果阶段不会只按原始召回顺序展示
 - 高相关结果会优先排在前面，并带自动标签
+- 单次最终结果默认不超过 200 篇，但会尽量覆盖每个关键词和 venue 的命中
+- DBLP 请求现在按单次组合回退到 OpenAlex；某一组临时失败不会让整轮搜索都放弃 DBLP
 
 ---
 
@@ -241,8 +246,10 @@ AI / NLP:          aaai, nips, acl, cvpr, iccv, icml, ijcai, iclr, emnlp, naacl,
 
 - DBLP 搜索只匹配**标题**，不匹配摘要。关键词选名词短语，避免动词。
 - 当前链路会先生成一版“学术化检索建议”，再产出正式 plan；如果建议词不贴切，应优先调整建议词。
+- 如果用户需求属于“因素 / 机制 / 预测”类问题，优先使用 `user experience factors`、`usability predictors`、`interaction outcomes`、`human factors in HCI` 这类名词短语。
 - 搜索结束后会基于标题和摘要做二次复核，所以页面中的排序和标签可能与原始召回顺序不同。
 - 某关键词组命中 0 篇时，提示用户换同义词或放宽措辞。
 - `papers.csv` 的 `matched_kw` 列记录每篇由哪组关键词命中，网页中也可据此展示。
 - 无摘要的论文（`abstract` 为空）在网页中标注"暂无内容"，不影响标题级别的浏览。
 - CSV、JSON 和静态网页会一并保存，下次可直接打开网页查看，无需重新爬取。
+- `search.json` 中的 `fallback_events` 可以用来判断某次结果变少到底是检索词问题还是 DBLP 临时波动。

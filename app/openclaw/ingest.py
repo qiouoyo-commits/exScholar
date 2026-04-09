@@ -2,7 +2,11 @@
 import base64
 import io
 import json
+import os
+import random
 import re
+import threading
+import time
 from pathlib import Path
 
 import requests
@@ -17,6 +21,11 @@ DEFAULT_OPENCLAW_FALLBACK_MODEL = "joybuilder-plan/Kimi-K2.5"
 DEFAULT_OPENCLAW_IMAGE_MODEL = "joybuilder-plan/Kimi-K2.5"
 DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL = "joybuilder-plan/DeepSeek-V3.2"
 DEFAULT_RESEARCH_TOP = 100
+DEFAULT_OPENCLAW_MODEL_CONCURRENCY = 1
+DEFAULT_REVIEW_CHUNK_SIZE = 12
+DEFAULT_REVIEW_BATCH_THROTTLE_SECONDS = 0.8
+DEFAULT_JOYBUILDER_MIN_INTERVAL_SECONDS = 0.8
+DEFAULT_KIMI_MIN_INTERVAL_SECONDS = 1.2
 ALLOWED_RESEARCH_VENUES = [
     "chi", "uist", "cscw", "ubicomp",
     "dis", "nime", "iui", "tei", "mobilehci", "assets", "imwut", "its", "hri", "gi", "muc",
@@ -43,9 +52,122 @@ ACM_HCI_VENUES = [
     "assets",
 ]
 
+_GENERIC_RESEARCH_KEYWORD_TOKENS = {
+    "analysis", "assessment", "effect", "effects", "evaluation", "factor", "factors",
+    "hci", "human", "impact", "influence", "interaction", "interactions", "computer",
+    "user", "users",
+}
+
+_HCI_FACTOR_GUIDED_CORE_CONCEPTS = [
+    "user experience",
+    "usability",
+    "interaction outcomes",
+    "human factors",
+    "behavioral predictors",
+]
+
+_HCI_FACTOR_GUIDED_KEYWORDS = [
+    "user experience factors",
+    "usability predictors",
+    "interaction outcomes",
+    "human factors in HCI",
+    "empirical HCI study",
+    "interaction effects",
+    "behavioral predictors",
+    "predictors of user engagement",
+    "mechanisms of user behavior",
+]
+
+_HCI_FACTOR_GUIDED_AVOID = [
+    "analysis",
+    "factors",
+    "impact",
+    "evaluation",
+    "mechanism analysis",
+    "influencing factors",
+]
+
+_RESEARCH_TAG_STOPWORDS = {
+    "a", "an", "and", "as", "at", "based", "by", "for", "from", "in", "into", "of",
+    "on", "or", "the", "to", "using", "with", "via", "toward", "towards", "study",
+    "research", "paper", "analysis", "approach", "method", "methods", "evaluation",
+}
+
+OPENCLAW_MODEL_CONCURRENCY = max(
+    1,
+    int((os.getenv("OPENCLAW_MODEL_CONCURRENCY") or str(DEFAULT_OPENCLAW_MODEL_CONCURRENCY)).strip() or str(DEFAULT_OPENCLAW_MODEL_CONCURRENCY)),
+)
+REVIEW_RESEARCH_RESULTS_CHUNK_SIZE = max(
+    1,
+    int((os.getenv("REVIEW_RESEARCH_RESULTS_CHUNK_SIZE") or str(DEFAULT_REVIEW_CHUNK_SIZE)).strip() or str(DEFAULT_REVIEW_CHUNK_SIZE)),
+)
+REVIEW_BATCH_THROTTLE_SECONDS = max(
+    0.0,
+    float((os.getenv("REVIEW_BATCH_THROTTLE_SECONDS") or str(DEFAULT_REVIEW_BATCH_THROTTLE_SECONDS)).strip() or str(DEFAULT_REVIEW_BATCH_THROTTLE_SECONDS)),
+)
+JOYBUILDER_REQUEST_MIN_INTERVAL_SECONDS = max(
+    0.0,
+    float((os.getenv("JOYBUILDER_REQUEST_MIN_INTERVAL_SECONDS") or str(DEFAULT_JOYBUILDER_MIN_INTERVAL_SECONDS)).strip() or str(DEFAULT_JOYBUILDER_MIN_INTERVAL_SECONDS)),
+)
+KIMI_REQUEST_MIN_INTERVAL_SECONDS = max(
+    0.0,
+    float((os.getenv("KIMI_REQUEST_MIN_INTERVAL_SECONDS") or str(DEFAULT_KIMI_MIN_INTERVAL_SECONDS)).strip() or str(DEFAULT_KIMI_MIN_INTERVAL_SECONDS)),
+)
+
+MODEL_REQUEST_SEMAPHORE = threading.Semaphore(OPENCLAW_MODEL_CONCURRENCY)
+MODEL_REQUEST_SCHEDULE_LOCK = threading.Lock()
+MODEL_PROVIDER_NEXT_REQUEST_AT: dict[str, float] = {}
+MODEL_HTTP_SESSION = None
+MODEL_HTTP_SESSION_LOCK = threading.Lock()
+
 
 class OpenClawIngestError(RuntimeError):
     pass
+
+
+def model_http_transport_mode() -> str:
+    return "no_proxy"
+
+
+def _get_model_http_session() -> requests.Session:
+    global MODEL_HTTP_SESSION
+    with MODEL_HTTP_SESSION_LOCK:
+        if MODEL_HTTP_SESSION is None:
+            session = requests.Session()
+            session.trust_env = False
+            MODEL_HTTP_SESSION = session
+    return MODEL_HTTP_SESSION
+
+
+def _provider_min_interval_seconds(model_id: str) -> float:
+    provider_name = str(model_id or "").partition("/")[0].strip().lower()
+    if provider_name == "kimi":
+        return KIMI_REQUEST_MIN_INTERVAL_SECONDS
+    return JOYBUILDER_REQUEST_MIN_INTERVAL_SECONDS
+
+
+def _acquire_model_request_slot(model_id: str):
+    provider_name = str(model_id or "").partition("/")[0].strip().lower() or "default"
+    min_interval = _provider_min_interval_seconds(model_id)
+    MODEL_REQUEST_SEMAPHORE.acquire()
+    try:
+        if min_interval > 0:
+            with MODEL_REQUEST_SCHEDULE_LOCK:
+                now = time.time()
+                next_allowed = MODEL_PROVIDER_NEXT_REQUEST_AT.get(provider_name, 0.0)
+                sleep_seconds = max(0.0, next_allowed - now)
+                reserve_base = max(now, next_allowed)
+                jitter = random.uniform(0.0, min(0.25, min_interval * 0.25))
+                MODEL_PROVIDER_NEXT_REQUEST_AT[provider_name] = reserve_base + min_interval + jitter
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+    except Exception:
+        MODEL_REQUEST_SEMAPHORE.release()
+        raise
+
+
+def _release_model_request_slot():
+    MODEL_REQUEST_SEMAPHORE.release()
 
 
 def _read_json(path: Path) -> dict:
@@ -157,6 +279,67 @@ def _normalize_keyword_list(raw) -> list[str]:
     return cleaned
 
 
+def _keyword_phrase_candidates(text: str, *, max_terms: int = 5) -> list[str]:
+    source = " ".join(str(text or "").split())
+    if not source:
+        return []
+    pieces: list[str] = []
+    for chunk in re.split(r"[:;|,()\\[\\]{}]+", source):
+        value = " ".join(chunk.strip().split())
+        if not value:
+            continue
+        lowered = value.lower()
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", lowered) if w]
+        if not words:
+            continue
+        if all(word in _RESEARCH_TAG_STOPWORDS for word in words):
+            continue
+        if 1 <= len(words) <= 5:
+            pieces.append(value)
+    normalized = _normalize_keyword_list(pieces)
+    return normalized[:max_terms]
+
+
+def _heuristic_research_plan_from_suggestion(requirement_text: str, suggestion: dict) -> dict:
+    normalized_suggestion = _apply_research_query_suggestion_heuristics(requirement_text, suggestion or {})
+    normalized_suggestion["generation_mode"] = normalized_suggestion.get("generation_mode") or "heuristic"
+    summary = _short_research_summary(
+        normalized_suggestion.get("summary") or "",
+        " ".join(normalized_suggestion.get("candidate_keywords") or []),
+        requirement_text,
+    )
+    plan = {
+        "summary": summary,
+        "slug": _safe_slug(f"{summary} {requirement_text}"),
+        "keywords": _merge_keyword_candidates(
+            normalized_suggestion.get("candidate_keywords") or [],
+            normalized_suggestion.get("core_concepts") or [],
+            limit=6,
+        ),
+        "venues": [],
+        "year_from": 0,
+        "top": DEFAULT_RESEARCH_TOP,
+        "fetch_abstract": True,
+        "notes": normalized_suggestion.get("notes") or "",
+        "query_suggestion": normalized_suggestion,
+        "diagnostics": {
+            "plan_generation_mode": "heuristic",
+            "query_suggestion_mode": normalized_suggestion.get("generation_mode") or "heuristic",
+            "model_http": model_http_transport_mode(),
+        },
+    }
+    requirement_lower = " ".join(str(requirement_text or "").lower().split())
+    year_matches = re.findall(r"\b(19\d{2}|20\d{2}|21\d{2})\b", requirement_lower)
+    if year_matches:
+        try:
+            plan["year_from"] = max(0, min(int(year_matches[0]), 2100))
+        except Exception:
+            plan["year_from"] = 0
+    plan = _prefer_acm_hci_venues_for_create(requirement_text, plan)
+    plan = _apply_research_plan_heuristics(plan)
+    return _normalize_research_plan_payload(plan)
+
+
 def _normalize_research_query_suggestion(payload: dict) -> dict:
     if not isinstance(payload, dict):
         payload = {}
@@ -166,7 +349,104 @@ def _normalize_research_query_suggestion(payload: dict) -> dict:
         "candidate_keywords": _normalize_keyword_list(payload.get("candidate_keywords") or []),
         "avoid_keywords": _normalize_keyword_list(payload.get("avoid_keywords") or []),
         "notes": " ".join(str(payload.get("notes") or "").split()),
+        "generation_mode": " ".join(str(payload.get("generation_mode") or "").split()),
     }
+
+
+def _is_hci_factor_analysis_request(text: str) -> bool:
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return False
+    hci_markers = (
+        " hci ",
+        "human-computer interaction",
+        "human computer interaction",
+        "人机交互",
+    )
+    padded = f" {lowered} "
+    if not any(marker in padded for marker in hci_markers):
+        return False
+    factor_markers = (
+        "factor",
+        "factors",
+        "impact",
+        "influence",
+        "effect",
+        "effects",
+        "evaluation",
+        "assessment",
+        "predictor",
+        "predictors",
+        "determinant",
+        "determinants",
+        "mechanism",
+        "mechanisms",
+        "作用机制",
+        "影响因素",
+        "决定因素",
+        "预测因素",
+        "机制",
+    )
+    return any(marker in lowered for marker in factor_markers)
+
+
+def _keyword_looks_overly_generic_for_title_search(keyword: str) -> bool:
+    tokens = re.findall(r"[a-z0-9]+", str(keyword or "").lower())
+    if len(tokens) < 3:
+        return False
+    return all(token in _GENERIC_RESEARCH_KEYWORD_TOKENS for token in tokens)
+
+
+def _merge_keyword_candidates(*groups, limit: int = 6) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group or []:
+            value = " ".join(str(item or "").strip().split())
+            lowered = value.lower()
+            if not value or lowered in seen:
+                continue
+            seen.add(lowered)
+            merged.append(value)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _apply_research_query_suggestion_heuristics(requirement_text: str, suggestion: dict) -> dict:
+    normalized = _normalize_research_query_suggestion(suggestion)
+    if not _is_hci_factor_analysis_request(requirement_text):
+        return normalized
+
+    filtered_candidates = [
+        item for item in (normalized.get("candidate_keywords") or [])
+        if not _keyword_looks_overly_generic_for_title_search(item)
+    ]
+    filtered_core = [
+        item for item in (normalized.get("core_concepts") or [])
+        if not _keyword_looks_overly_generic_for_title_search(item)
+    ]
+    normalized["core_concepts"] = _merge_keyword_candidates(
+        filtered_core,
+        _HCI_FACTOR_GUIDED_CORE_CONCEPTS,
+        limit=5,
+    )
+    normalized["candidate_keywords"] = _merge_keyword_candidates(
+        filtered_candidates,
+        _HCI_FACTOR_GUIDED_KEYWORDS,
+        normalized["core_concepts"],
+        limit=6,
+    )
+    normalized["avoid_keywords"] = _merge_keyword_candidates(
+        normalized.get("avoid_keywords") or [],
+        _HCI_FACTOR_GUIDED_AVOID,
+        limit=5,
+    )
+    if not normalized.get("summary"):
+        normalized["summary"] = _short_research_summary(*normalized["candidate_keywords"], requirement_text)
+    if not normalized.get("notes"):
+        normalized["notes"] = "优先使用更像论文标题和摘要的 HCI 实证研究短语，避免解释型检索表达。"
+    return normalized
 
 
 _SUMMARY_STOPWORDS = {
@@ -242,6 +522,9 @@ def _research_query_suggestion_prompt(requirement_text: str) -> str:
 - `avoid_keywords` 是 0 到 5 个应尽量避免的过泛词、歧义词或容易引入噪声的词。
 - 关键词要尽量贴近学术论文标题和摘要中常出现的表达。
 - 如果用户给的是口语表达，请转成更学术的写法。
+- 不要优先输出解释型、方法型短语，例如 `impact analysis`、`factors influence`、`effects assessment`、`interaction evaluation`。
+- 如果用户在中文里提到“影响因素 / 决定因素 / 预测因素 / 作用机制 / 影响分析”这类意图，优先改写成更适合标题检索的英文名词短语。
+- 优先输出更像论文标题的名词短语，例如 `user experience factors`、`usability predictors`、`interaction outcomes`、`human factors in HCI`、`empirical HCI study`、`behavioral predictors`。
 - 不要输出 venue 名、作者名、年份。
 
 schema:
@@ -290,7 +573,9 @@ def suggest_research_queries(
             attempts=2,
             max_tokens=300,
         )
-        return _normalize_research_query_suggestion(payload)
+        normalized = _apply_research_query_suggestion_heuristics(text, payload)
+        normalized["generation_mode"] = target_model_id
+        return normalized
 
     try:
         suggestion = _run(model_id)
@@ -311,14 +596,16 @@ def suggest_research_queries(
         value = " ".join(phrase.strip().split())
         if value:
             heuristic_keywords.append(value)
-    return _normalize_research_query_suggestion(
+    return _apply_research_query_suggestion_heuristics(
+        text,
         {
             "summary": text,
             "core_concepts": heuristic_keywords[:4],
             "candidate_keywords": heuristic_keywords[:6],
             "avoid_keywords": [],
             "notes": "",
-        }
+            "generation_mode": "heuristic",
+        },
     )
 
 
@@ -525,6 +812,12 @@ def _safe_slug(value: str, fallback: str = "research-topic") -> str:
 def _apply_research_plan_heuristics(payload: dict) -> dict:
     normalized = dict(payload or {})
     keywords = [item for item in (normalized.get("keywords") or []) if str(item).strip()]
+    suggestion = normalized.get("query_suggestion") if isinstance(normalized.get("query_suggestion"), dict) else {}
+    suggestion_keywords = []
+    for item in (suggestion.get("candidate_keywords") or []) + (suggestion.get("core_concepts") or []):
+        value = " ".join(str(item or "").strip().split())
+        if value:
+            suggestion_keywords.append(value)
     venues = [item for item in (normalized.get("venues") or []) if str(item).strip()]
     theme_text = " ".join(
         [
@@ -533,6 +826,14 @@ def _apply_research_plan_heuristics(payload: dict) -> dict:
             " ".join(str(item) for item in keywords),
         ]
     ).lower()
+
+    filtered_keywords = [item for item in keywords if not _keyword_looks_overly_generic_for_title_search(item)]
+    filtered_suggestion_keywords = [
+        item for item in suggestion_keywords
+        if not _keyword_looks_overly_generic_for_title_search(item)
+    ]
+    keywords = _merge_keyword_candidates(filtered_keywords, filtered_suggestion_keywords, limit=6)
+    normalized["keywords"] = keywords
 
     audio_theme_markers = ("timbre", "sound", "audio", "music", "synth", "voice interaction")
     if any(marker in theme_text for marker in audio_theme_markers):
@@ -565,6 +866,18 @@ def _apply_research_plan_heuristics(payload: dict) -> dict:
             seen_keywords.add(lowered)
             expanded_keywords.append(" ".join(str(keyword).split()))
         normalized["keywords"] = expanded_keywords[:6]
+
+    if _is_hci_factor_analysis_request(theme_text):
+        normalized["keywords"] = _merge_keyword_candidates(
+            suggestion.get("candidate_keywords") or [],
+            suggestion.get("core_concepts") or [],
+            _HCI_FACTOR_GUIDED_KEYWORDS,
+            _HCI_FACTOR_GUIDED_CORE_CONCEPTS,
+            normalized.get("keywords") or [],
+            limit=6,
+        )
+        preferred_hci_venues = ["chi", "uist", "cscw", "dis", "iui", "mobilehci", "imwut", "ubicomp"]
+        normalized["venues"] = _merge_keyword_candidates(preferred_hci_venues, normalized.get("venues") or [], limit=8)
 
     return normalized
 
@@ -817,7 +1130,7 @@ def _request_chat_completion(
     }
     if max_tokens is not None:
         payload["max_tokens"] = max(1, int(max_tokens))
-    response = requests.post(
+    response = _get_model_http_session().post(
         url,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -858,14 +1171,18 @@ def _request_json_payload(
     current_messages = list(messages)
     for attempt in range(1, max(attempts, 1) + 1):
         try:
-            content = _request_chat_completion(
-                model_id=model_id,
-                config_path=config_path,
-                temperature=0,
-                messages=current_messages,
-                timeout=timeout,
-                max_tokens=max_tokens,
-            )
+            _acquire_model_request_slot(model_id)
+            try:
+                content = _request_chat_completion(
+                    model_id=model_id,
+                    config_path=config_path,
+                    temperature=0,
+                    messages=current_messages,
+                    timeout=timeout,
+                    max_tokens=max_tokens,
+                )
+            finally:
+                _release_model_request_slot()
             return _extract_json_object(content)
         except Exception as exc:
             last_error = exc
@@ -1189,6 +1506,8 @@ def _heuristic_review_tags(requirement_text: str, plan: dict, paper: dict) -> di
     title = " ".join(str(paper.get("title") or "").lower().split())
     abstract = " ".join(str(paper.get("content") or paper.get("abstract") or "").lower().split())
     haystack = f"{title} {abstract}".strip()
+    title_text = " ".join(str(paper.get("title") or "").split())
+    abstract_text = " ".join(str(paper.get("content") or paper.get("abstract") or "").split())
     tags = []
     for keyword in (plan.get("keywords") or []):
         value = " ".join(str(keyword or "").strip().split())
@@ -1198,12 +1517,17 @@ def _heuristic_review_tags(requirement_text: str, plan: dict, paper: dict) -> di
     for token in ("timbre", "sonification", "auditory", "sound design", "musical interface", "voice interaction"):
         if token in haystack:
             tags.append(token.title() if " " in token else token)
+    tags.extend(_keyword_phrase_candidates(title_text, max_terms=3))
+    if abstract_text:
+        tags.extend(_keyword_phrase_candidates(abstract_text[:320], max_terms=3))
     tags = _normalize_keyword_list(tags)
     score = 0.18
     if any(low in haystack for low in [str(k).lower() for k in (plan.get("keywords") or []) if str(k).strip()]):
         score = 0.58
     if "timbre" in haystack or "sonification" in haystack:
         score = max(score, 0.78)
+    if "human-robot interaction" in haystack or "social robot" in haystack or "companion robot" in haystack:
+        score = max(score, 0.62)
     if score >= 0.75:
         label = "high"
     elif score >= 0.4:
@@ -1226,7 +1550,7 @@ def review_research_results(
     model_id: str = DEFAULT_OPENCLAW_MODEL,
     fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
     config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
-    chunk_size: int = 6,
+    chunk_size: int = REVIEW_RESEARCH_RESULTS_CHUNK_SIZE,
     progress_callback=None,
 ) -> list[dict]:
     text = " ".join(str(requirement_text or "").split())
@@ -1320,6 +1644,8 @@ def review_research_results(
                     "papers": reviewed_records,
                 }
             )
+        if completed_chunks < total_chunks and REVIEW_BATCH_THROTTLE_SECONDS > 0:
+            time.sleep(REVIEW_BATCH_THROTTLE_SECONDS + random.uniform(0.0, min(0.4, REVIEW_BATCH_THROTTLE_SECONDS * 0.5)))
 
     return reviewed_records
 
@@ -1457,6 +1783,11 @@ def plan_research_request(
         normalized = _normalize_research_plan_payload(payload)
         normalized = _prefer_acm_hci_venues_for_create(text, normalized)
         normalized["query_suggestion"] = query_suggestion
+        normalized["diagnostics"] = {
+            "plan_generation_mode": target_model_id,
+            "query_suggestion_mode": query_suggestion.get("generation_mode") or "",
+            "model_http": model_http_transport_mode(),
+        }
         return normalized
 
     primary_error = None
@@ -1478,6 +1809,12 @@ def plan_research_request(
                 if isinstance(corrected, dict):
                     normalized = _normalize_research_plan_payload(corrected)
                     if _research_plan_is_usable(normalized):
+                        normalized["query_suggestion"] = query_suggestion
+                        normalized["diagnostics"] = {
+                            "plan_generation_mode": "reviewer_corrected",
+                            "query_suggestion_mode": query_suggestion.get("generation_mode") or "",
+                            "model_http": model_http_transport_mode(),
+                        }
                         return normalized
                 return primary
         else:
@@ -1489,13 +1826,34 @@ def plan_research_request(
     if not fallback_model_id:
         detail = "; ".join(str(item) for item in review.get("issues") or [] if str(item).strip())
         if primary_error:
+            heuristic_plan = _heuristic_research_plan_from_suggestion(text, query_suggestion)
+            if _research_plan_is_usable(heuristic_plan):
+                heuristic_plan["diagnostics"] = {
+                    "plan_generation_mode": "heuristic",
+                    "query_suggestion_mode": query_suggestion.get("generation_mode") or "",
+                    "fallback_reason": detail or str(primary_error),
+                    "model_http": model_http_transport_mode(),
+                }
+                return heuristic_plan
             raise OpenClawIngestError(f"research 方案生成失败: {detail or str(primary_error)}")
         raise OpenClawIngestError(f"research 方案未通过检查: {detail or '结果不符合要求'}")
 
-    fallback = _run_generation(fallback_model_id)
-    if not _research_plan_is_usable(fallback):
-        raise OpenClawIngestError("Kimi 回退后仍未得到可执行的 research 方案。")
-    return fallback
+    try:
+        fallback = _run_generation(fallback_model_id)
+        if _research_plan_is_usable(fallback):
+            return fallback
+    except Exception:
+        pass
+    heuristic_plan = _heuristic_research_plan_from_suggestion(text, query_suggestion)
+    if _research_plan_is_usable(heuristic_plan):
+        heuristic_plan["diagnostics"] = {
+            "plan_generation_mode": "heuristic",
+            "query_suggestion_mode": query_suggestion.get("generation_mode") or "",
+            "fallback_reason": "primary_and_fallback_model_unavailable_or_invalid",
+            "model_http": model_http_transport_mode(),
+        }
+        return heuristic_plan
+    raise OpenClawIngestError("模型回退后仍未得到可执行的 research 方案。")
 
 
 def refine_research_plan(
@@ -1653,6 +2011,7 @@ def compose_research_plan(
             "prompt": latest,
             "message": "已根据你的需求生成一份搜索方案草案。" if fast_preview else "已根据新的 research 需求生成方案。",
             "plan": plan,
+            "diagnostics": plan.get("diagnostics") or {},
         }
 
     def _run_generation(target_model_id: str) -> dict:
@@ -1678,8 +2037,31 @@ def compose_research_plan(
         raw = _run_generation(model_id)
     except Exception:
         if not fallback_model_id:
-            raise
-        raw = _run_generation(fallback_model_id)
+            return {
+                "mode": "create",
+                "prompt": latest,
+                "message": "上游模型暂时不可用，已根据智能建议检索词生成本地方案草案。",
+                "plan": _heuristic_research_plan_from_suggestion(latest, suggest_research_queries(
+                    latest,
+                    model_id=model_id,
+                    fallback_model_id=fallback_model_id,
+                    config_path=config_path,
+                )),
+            }
+        try:
+            raw = _run_generation(fallback_model_id)
+        except Exception:
+            return {
+                "mode": "create",
+                "prompt": latest,
+                "message": "上游模型暂时不可用，已根据智能建议检索词生成本地方案草案。",
+                "plan": _heuristic_research_plan_from_suggestion(latest, suggest_research_queries(
+                    latest,
+                    model_id=model_id,
+                    fallback_model_id=fallback_model_id,
+                    config_path=config_path,
+                )),
+            }
 
     mode = str(raw.get("mode") or "").strip().lower()
     if mode not in {"create", "revise"}:
@@ -1721,6 +2103,7 @@ def compose_research_plan(
             else "已基于当前方案更新。"
         ),
         "plan": validated_plan,
+        "diagnostics": validated_plan.get("diagnostics") or {},
     }
 
 

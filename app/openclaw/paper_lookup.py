@@ -1,13 +1,16 @@
 #!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
 """Paper lookup helpers for lightweight OpenClaw paper discovery workflows."""
 
+import os
 import re
+import threading
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+from dotenv import load_dotenv
 
-from app.common import normalize_title, title_similarity
+from app.common import get_no_proxy_session, normalize_title, title_similarity
 from app.pipeline.search import dblp_search
 
 from .ingest import (
@@ -42,12 +45,44 @@ LOW_TRUST_DOMAINS = {
     "scholar.google.com": -10.0,
     "semanticscholar.org": -3.0,
     "www.semanticscholar.org": -3.0,
+    "wikipedia.org": -12.0,
+    "en.wikipedia.org": -12.0,
+    "forbes.com": -12.0,
+    "www.forbes.com": -12.0,
+    "medium.com": -10.0,
+    "www.medium.com": -10.0,
+    "coursefoundry.org": -15.0,
+    "www.coursefoundry.org": -15.0,
 }
 
 GOOGLE_SCHOLAR_PROFILE_HOSTS = {
     "scholar.google.com",
     "scholar.googleusercontent.com",
 }
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env.local")
+
+DUCKDUCKGO_HTTP_PROXY = (os.getenv("DUCKDUCKGO_HTTP_PROXY") or "").strip()
+_DUCKDUCKGO_SESSION = None
+_DUCKDUCKGO_SESSION_LOCK = threading.Lock()
+
+
+def _get_duckduckgo_session() -> requests.Session:
+    global _DUCKDUCKGO_SESSION
+    with _DUCKDUCKGO_SESSION_LOCK:
+        if _DUCKDUCKGO_SESSION is None:
+            session = requests.Session()
+            session.trust_env = False
+            if DUCKDUCKGO_HTTP_PROXY:
+                session.proxies.update(
+                    {
+                        "http": DUCKDUCKGO_HTTP_PROXY,
+                        "https": DUCKDUCKGO_HTTP_PROXY,
+                    }
+                )
+            _DUCKDUCKGO_SESSION = session
+    return _DUCKDUCKGO_SESSION
 
 def normalize_doi(value: str) -> str:
     text = " ".join(str(value or "").strip().split()).lower()
@@ -89,7 +124,7 @@ def extract_titles_from_google_scholar_profile(url: str, *, limit: int = 100) ->
 
     for start in range(0, max(limit, 1), page_size):
         try:
-            resp = requests.get(
+            resp = get_no_proxy_session().get(
                 base_url,
                 params={
                     "user": user_id,
@@ -162,7 +197,7 @@ def search_paper_candidates_via_web(query: str, limit: int = 20) -> list[dict]:
     if not text:
         return []
     try:
-        resp = requests.get(
+        resp = _get_duckduckgo_session().get(
             "https://html.duckduckgo.com/html/",
             params={"q": text},
             timeout=20,
@@ -191,6 +226,76 @@ def search_paper_candidates_via_web(query: str, limit: int = 20) -> list[dict]:
         if len(results) >= limit:
             break
     return results
+
+
+def is_probably_academic_result(url: str, title: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.netloc or "").strip().lower()
+    path = (parsed.path or "").strip().lower()
+    title_text = " ".join(str(title or "").lower().split())
+    if not host:
+        return False
+    if host in LOW_TRUST_DOMAINS:
+        return False
+    if any(
+        token in host
+        for token in (
+            "wikipedia.org",
+            "forbes.com",
+            "medium.com",
+            "youtube.com",
+            "youtu.be",
+            "coursefoundry.org",
+            "coursera.org",
+            "udemy.com",
+        )
+    ):
+        return False
+    if any(
+        token in path
+        for token in (
+            "/course",
+            "/courses",
+            "/tutorial",
+            "/tutorials",
+            "/blog",
+            "/news",
+            "/videos",
+            "/wiki/",
+        )
+    ):
+        return False
+    if any(
+        token in title_text
+        for token in (
+            "wikipedia",
+            "forbes",
+            "course",
+            "skills",
+            "tutorial",
+            "blog",
+            "news",
+        )
+    ):
+        return False
+    return True
+
+
+def academic_result_path_score(url: str, title: str = "") -> float:
+    parsed = urlparse(url or "")
+    host = (parsed.netloc or "").strip().lower()
+    path = (parsed.path or "").strip().lower()
+    title_text = " ".join(str(title or "").lower().split())
+    score = 0.0
+    if path.endswith(".pdf"):
+        score += 8.0
+    if any(token in path for token in ("/doi/", "/article/", "/paper/", "/papers/", "/abs/", "/pdf/", "/publication/", "/proceeding/")):
+        score += 4.0
+    if any(token in title_text for token in ("proceedings", "technical report", "conference", "journal", "paper")):
+        score += 2.0
+    if host.endswith(".edu") or host.endswith(".ac.uk"):
+        score += 1.5
+    return score
 
 
 def web_result_domain_score(url: str) -> float:
@@ -224,15 +329,43 @@ def find_best_web_match(query_title: str, query: str, limit: int = 20) -> dict |
         return None
     title = (query_title or "").strip()
     scored_results = []
+    official_scored_results = []
     for item in results:
-        similarity = title_similarity(title, item.get("title") or "") if title else 0.0
-        domain_score = web_result_domain_score(item.get("url") or "")
-        total_score = similarity * 100.0 + domain_score
-        scored_results.append((total_score, similarity, domain_score, item))
-    scored_results.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
-    best_total, best_similarity, _, best_item = scored_results[0]
+        url = item.get("url") or ""
+        title_text = item.get("title") or ""
+        if not is_probably_academic_result(url, title_text):
+            continue
+        similarity = title_similarity(title, title_text) if title else 0.0
+        domain_score = web_result_domain_score(url)
+        path_score = academic_result_path_score(url, title_text)
+        total_score = similarity * 100.0 + domain_score + path_score
+        row = (total_score, similarity, domain_score, path_score, item)
+        scored_results.append(row)
+        host = (urlparse(url).netloc or "").strip().lower()
+        if host in OFFICIAL_PUBLISHER_DOMAINS or any(
+            host.endswith(suffix)
+            for suffix in (
+                ".acm.org",
+                ".ieee.org",
+                ".springer.com",
+                ".nature.com",
+                ".elsevier.com",
+                ".openreview.net",
+            )
+        ):
+            official_scored_results.append(row)
+    if not scored_results and not official_scored_results:
+        return None
+
+    candidate_rows = official_scored_results or scored_results
+    candidate_rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]), reverse=True)
+    best_total, best_similarity, _, _, best_item = candidate_rows[0]
     if title:
-        if best_similarity >= 0.45:
+        if official_scored_results:
+            if best_similarity >= 0.35:
+                return best_item
+            return None
+        if best_similarity >= 0.80:
             return best_item
         return None
     return best_item
@@ -276,7 +409,12 @@ def resolve_paper_lookup_from_candidate(candidate: dict, *, matched_kw: str = "p
     if dblp_record:
         dblp_record = dict(dblp_record)
         dblp_record["_matched_kw"] = matched_kw
-        return {"candidate": candidate, "record": dblp_record, "source": "dblp"}
+        return {
+            "candidate": candidate,
+            "record": dblp_record,
+            "source": "dblp",
+            "failure_reason": "",
+        }
 
     best_web = find_best_web_match(title or query, query)
     if best_web:
@@ -284,6 +422,7 @@ def resolve_paper_lookup_from_candidate(candidate: dict, *, matched_kw: str = "p
             "candidate": candidate,
             "record": build_lookup_record(candidate, best_web.get("url") or "", best_web.get("title") or "", matched_kw=matched_kw),
             "source": "websearch",
+            "failure_reason": "",
         }
 
     doi = normalize_doi(candidate.get("doi") or "")
@@ -293,9 +432,10 @@ def resolve_paper_lookup_from_candidate(candidate: dict, *, matched_kw: str = "p
             "candidate": candidate,
             "record": build_lookup_record(candidate, doi_url, title or query, matched_kw=matched_kw),
             "source": "doi_fallback",
+            "failure_reason": "",
         }
 
-    raise ValueError("没有找到可用的论文链接。")
+    raise ValueError("没有找到可用的论文链接。failure_reason=websearch_filtered_or_unavailable")
 
 
 def resolve_paper_lookup_from_title(
