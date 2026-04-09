@@ -17,6 +17,15 @@ metadata:
 
 ---
 
+## 0. 触发边界
+
+- 这条 skill 负责普通的“找论文 / 查论文 / 搜论文 / 读文献”
+- 不负责基于图片或截图识别论文
+- 如果用户明确要根据图片找论文，应改走 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
+- `picsearch` 当前会按“图片识别 -> DBLP -> 官方 web 候选筛选 -> DOI fallback”定位论文
+
+---
+
 ## 数据存储结构
 
 当前项目是多用户模式。网页登录触发的搜索会写入当前登录用户自己的目录；非网页登录触发的默认 OpenClaw 搜索会写入 `data/users/qioyo/`。

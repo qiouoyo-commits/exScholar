@@ -847,13 +847,24 @@ def build_keyword_detail_html(keyword: str):
               <option value="">暂不加入 Group</option>
             </select>
           </label>
+          <div id="citation-source-link-box" style="display:none; margin-bottom:14px; padding:12px; border:1px dashed #d5cbba; border-radius:14px; background:#fffaf4;">
+            <div style="margin-bottom:8px; color:#6f685c;">请先打开原文链接手动下载 PDF，再上传到深度阅读。</div>
+            <a id="citation-source-link" href="#" target="_blank" rel="noreferrer" style="display:none; border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; text-decoration:none;">打开原文链接</a>
+          </div>
           <label style="display:block; margin-bottom:14px;">
-            <div style="margin-bottom:6px; color:#6f685c;">上传 PDF（可选）</div>
+            <div style="margin-bottom:6px; color:#6f685c;">上传 PDF（必填）</div>
             <input id="citation-pdf-input" type="file" accept="application/pdf,.pdf" style="width:100%;">
           </label>
+          <div id="citation-progress-box" style="display:none; margin:-4px 0 14px;">
+            <div style="height:10px; border-radius:999px; background:#eadfce; overflow:hidden;">
+              <div id="citation-progress-bar" style="width:0%; height:100%; background:#9c4f2f; transition:width .2s ease;"></div>
+            </div>
+            <div id="citation-progress-text" style="margin-top:8px; color:#6f685c; font-size:14px;">等待开始...</div>
+          </div>
+          <div id="citation-status" style="display:none; margin:-4px 0 14px; padding:10px 12px; border-radius:12px; background:#f5ede4; color:#6b4b39; line-height:1.6;"></div>
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
-            <button id="citation-submit" type="submit" value="submit" style="border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">保存</button>
-            <button type="submit" value="cancel" style="border:none; background:#6f6455; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">取消</button>
+            <button id="citation-submit" type="submit" value="submit" style="border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">保存并解析</button>
+            <button id="citation-cancel" type="submit" value="cancel" style="border:none; background:#6f6455; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">取消</button>
           </div>
         </form>
       `;
@@ -872,39 +883,81 @@ def build_keyword_detail_html(keyword: str):
       document.getElementById('citation-dialog-title').textContent = paper.title || '';
       const select = document.getElementById('citation-group-select');
       const fileInput = document.getElementById('citation-pdf-input');
+      const progressBox = document.getElementById('citation-progress-box');
+      const progressBar = document.getElementById('citation-progress-bar');
+      const progressText = document.getElementById('citation-progress-text');
+      const statusBox = document.getElementById('citation-status');
+      const sourceLinkBox = document.getElementById('citation-source-link-box');
+      const sourceLink = document.getElementById('citation-source-link');
+      const submitButton = document.getElementById('citation-submit');
+      const cancelButton = document.getElementById('citation-cancel');
       select.innerHTML = '<option value="">暂不加入 Group</option>' + readingGroups.map(
         (group) => `<option value="${{group.id}}">${{escapeHtml(group.name)}}</option>`
       ).join('');
       fileInput.value = '';
+      progressBox.style.display = 'none';
+      progressBar.style.width = '0%';
+      progressText.textContent = '等待开始...';
+      statusBox.style.display = 'none';
+      statusBox.textContent = '';
+      const sourceUrl = (paper.url || '').toString().trim();
+      sourceLinkBox.style.display = 'block';
+      sourceLink.href = sourceUrl || '#';
+      sourceLink.style.display = sourceUrl ? 'inline-flex' : 'none';
+      submitButton.disabled = false;
+      cancelButton.disabled = false;
       const result = await new Promise((resolve) => {{
         const form = document.getElementById('citation-form');
+
+        const setBusy = (busy) => {{
+          submitButton.disabled = busy;
+          cancelButton.disabled = busy;
+        }};
+
+        const cleanup = () => {{
+          form.removeEventListener('submit', handler);
+        }};
+
         const handler = async (event) => {{
           event.preventDefault();
           const submitterValue = event.submitter && event.submitter.value;
-          form.removeEventListener('submit', handler);
           if (submitterValue !== 'submit') {{
+            cleanup();
             dialog.close();
             resolve(null);
             return;
           }}
+          if (!fileInput.files[0]) {{
+            statusBox.textContent = '请先从原文链接下载 PDF，然后上传 PDF 后再加入深度阅读。';
+            statusBox.style.display = 'block';
+            return;
+          }}
+          setBusy(true);
+          progressBox.style.display = 'block';
+          progressBar.style.width = '0%';
+          progressText.textContent = '准备上传 PDF...';
           const formData = new FormData();
           formData.append('search_slug', searchSlug || '');
           formData.append('paper', JSON.stringify(paper));
           if (select.value) formData.append('group_id', select.value);
-          if (fileInput.files[0]) formData.append('pdf', fileInput.files[0]);
-          const resp = await fetch('/api/citations', {{
-            method: 'POST',
-            credentials: 'same-origin',
-            body: formData
-          }});
-          const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
-          dialog.close();
-          if (!resp.ok || data.ok === false) {{
-            resolve({{ error: data.error || '请求失败' }});
-            return;
+          formData.append('pdf', fileInput.files[0]);
+          try {{
+            const data = await uploadWithProgress('/api/citations', formData, (percent, text) => {{
+              progressBar.style.width = percent + '%';
+              progressText.textContent = text;
+            }});
+            progressBar.style.width = '100%';
+            progressText.textContent = 'PDF 已上传，正在启动深度解析...';
+            cleanup();
+            dialog.close();
+            resolve(data);
+          }} catch (error) {{
+            cleanup();
+            dialog.close();
+            resolve({{ error: error.message || '请求失败' }});
           }}
-          resolve(data);
         }};
+
         form.addEventListener('submit', handler);
         dialog.showModal();
       }});
@@ -1077,11 +1130,12 @@ def build_reading_detail_html(paper_id: str):
   <style>
     body {{ margin:0; font-family: Georgia, "Noto Serif SC", serif; background:#f3efe7; color:#1f1c18; }}
     .wrap {{ max-width:1080px; margin:0 auto; padding:28px 18px 72px; }}
+    .top-nav {{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }}
     .hero, .section {{ border:1px solid #d5cbba; border-radius:24px; background:rgba(255,251,244,0.96); box-shadow:0 18px 40px rgba(76,50,28,0.08); }}
     .hero {{ padding:28px; margin-bottom:18px; }}
     .section {{ padding:22px; margin-top:16px; }}
     .actions, .meta, .grid {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    .actions a {{ display:inline-block; background:#9c4f2f; color:white; text-decoration:none; padding:10px 14px; border-radius:999px; }}
+    .top-nav a, .actions a {{ display:inline-block; background:#9c4f2f; color:white; text-decoration:none; padding:10px 14px; border-radius:999px; }}
     .meta {{ color:#6f685c; line-height:1.8; font-size:14px; margin-top:8px; }}
     .progress-shell {{ margin-top:14px; border:1px solid #e3d8c8; border-radius:16px; padding:12px 14px; background:#fffdfa; }}
     .progress-row {{ display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; }}
@@ -1109,11 +1163,14 @@ def build_reading_detail_html(paper_id: str):
     h3 {{ margin:0 0 8px; font-size:20px; }}
     p, li {{ line-height:1.8; }}
     ul {{ margin:0; padding-left:20px; }}
-    @media (max-width: 720px) {{ .cols {{ grid-template-columns:1fr; }} .actions a {{ width:100%; text-align:center; }} h1 {{ font-size:32px; }} }}
+    @media (max-width: 720px) {{ .cols {{ grid-template-columns:1fr; }} .top-nav a, .actions a {{ width:100%; text-align:center; }} h1 {{ font-size:32px; }} }}
   </style>
 </head>
 <body>
   <main class="wrap">
+    <div class="top-nav">
+      <a href="/">返回时间线</a>
+    </div>
     <section class="hero">
       <div class="actions"><a href="/reading">返回深度阅读</a>{pdf_link}<a href="#" id="run-metadata">{metadata_label}</a><a href="#" id="run-analysis">{analyze_label}</a></div>
       <h1>{escape(paper.get("title") or "Untitled Paper")}</h1>
@@ -1686,15 +1743,14 @@ def build_library_html():
             <button id="select-all" type="button">全选 / 取消</button>
             <button id="export-json" type="button">导出所选 JSON</button>
             <button id="manage-groups" type="button">管理 Reading Groups</button>
-            <button id="batch-generate" type="button">一键补全未完成项</button>
           </div>
-          <div id="batch-status" style="display:none; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#faf8f5;">
+          <div id="active-openclaw-jobs" style="display:none; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#faf8f5;">
             <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:center;">
-              <strong>后台批处理</strong>
-              <span class="meta" id="batch-stage">idle</span>
+              <strong>当前正在解析</strong>
+              <span class="meta" id="active-openclaw-summary">idle</span>
             </div>
-            <div class="meta" id="batch-message" style="margin-top:6px;">尚未启动批处理。</div>
-            <div class="meta" id="batch-progress" style="margin-top:6px;">已处理 0 / 0</div>
+            <div class="meta" id="active-openclaw-message" style="margin-top:6px;">当前没有正在运行的解析任务。</div>
+            <div id="active-openclaw-list" style="margin-top:10px; display:grid; gap:10px;"></div>
           </div>
           <div id="openclaw-batch-upload" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:8px; margin-top:14px; padding:14px; border:1px solid #d5cbba; border-radius:14px; background:#f8f4ee;">
             <div style="grid-column:1 / -1; color:#6f685c; font-size:14px;">把一个或多个 PDF 直接交给 OpenClaw 即可。系统会自动读取标题、作者、会议、年份和 DOI，尝试匹配已有文献；如果是重复 PDF 或重复论文，也会自动复用或合并。</div>
@@ -1867,12 +1923,10 @@ def build_library_html():
     const openclawJobStage = document.getElementById('openclaw-job-stage');
     const openclawJobMessage = document.getElementById('openclaw-job-message');
     const openclawJobProgress = document.getElementById('openclaw-job-progress');
-    const batchGenerateBtn = document.getElementById('batch-generate');
-    const batchStatusBox = document.getElementById('batch-status');
-    const batchStage = document.getElementById('batch-stage');
-    const batchMessage = document.getElementById('batch-message');
-    const batchProgress = document.getElementById('batch-progress');
-    let batchPollingTimer = null;
+    const activeOpenClawJobs = document.getElementById('active-openclaw-jobs');
+    const activeOpenClawSummary = document.getElementById('active-openclaw-summary');
+    const activeOpenClawMessage = document.getElementById('active-openclaw-message');
+    const activeOpenClawList = document.getElementById('active-openclaw-list');
     let openclawPollingTimer = null;
     let openclawCurrentJobId = '';
 
@@ -1910,51 +1964,57 @@ def build_library_html():
       }});
     }}
 
-    function renderBatchStatus(payload) {{
-      if (!batchStatusBox) return;
-      batchStatusBox.style.display = 'block';
-      if (batchStage) batchStage.textContent = payload.stage || payload.status || 'idle';
-      if (batchMessage) batchMessage.textContent = payload.message || '尚未启动批处理。';
-      if (batchProgress) {{
-        const processed = Number(payload.processed || 0);
-        const total = Number(payload.total || 0);
-        const metadataCompleted = Number(payload.metadata_completed || 0);
-        const metadataTotal = Number(payload.metadata_total || 0);
-        const analysisCompleted = Number(payload.analysis_completed || 0);
-        const analysisTotal = Number(payload.analysis_total || 0);
-        const current = payload.current_title ? ` · 当前：${{payload.current_title}}` : '';
-        batchProgress.textContent = `已处理 ${{processed}} / ${{total}} · 元数据 ${{metadataCompleted}} / ${{metadataTotal}} · 分析 ${{analysisCompleted}} / ${{analysisTotal}}${{current}}`;
+    function jobProgressPercent(job) {{
+      const total = Math.max(0, Number(job.total || 0));
+      const completed = Math.max(0, Number(job.completed || 0));
+      const failed = Math.max(0, Number(job.failed || 0));
+      if (!total) return job.running ? 8 : 100;
+      return Math.max(8, Math.min(100, Math.round(((completed + failed) / total) * 100)));
+    }}
+
+    function renderActiveOpenClawJobs(jobs) {{
+      if (!activeOpenClawJobs) return;
+      const activeJobs = (jobs || []).filter((job) => job && job.running);
+      if (!activeJobs.length) {{
+        activeOpenClawJobs.style.display = 'block';
+        if (activeOpenClawSummary) activeOpenClawSummary.textContent = 'idle';
+        if (activeOpenClawMessage) activeOpenClawMessage.textContent = '当前没有正在运行的解析任务。';
+        if (activeOpenClawList) activeOpenClawList.innerHTML = '';
+        return;
       }}
-      if (batchGenerateBtn) {{
-        if (payload.running) {{
-          batchGenerateBtn.textContent = '后台补全进行中...';
-          batchGenerateBtn.disabled = true;
-        }} else {{
-          batchGenerateBtn.textContent = '一键补全未完成项';
-          batchGenerateBtn.disabled = false;
-        }}
+      activeOpenClawJobs.style.display = 'block';
+      if (activeOpenClawSummary) activeOpenClawSummary.textContent = `${{activeJobs.length}} 个任务运行中`;
+      if (activeOpenClawMessage) activeOpenClawMessage.textContent = '新上传的 PDF 会自动出现在这里。';
+      if (activeOpenClawList) {{
+        activeOpenClawList.innerHTML = activeJobs.map((job) => {{
+          const total = Number(job.total || 0);
+          const completed = Number(job.completed || 0);
+          const failed = Number(job.failed || 0);
+          const current = job.current_title ? `当前：${{job.current_title}}` : '等待后台开始处理';
+          const percent = jobProgressPercent(job);
+          return `
+            <div style="padding:12px; border:1px solid #e3d5c3; border-radius:12px; background:#fffaf5;">
+              <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:center;">
+                <strong>${{job.kind === 'openclaw_refresh_paper' ? '单篇深度解析' : 'PDF 批量导入'}}</strong>
+                <span class="meta">${{job.status || 'running'}}</span>
+              </div>
+              <div class="meta" style="margin-top:6px;">${{job.message || ''}}</div>
+              <div class="meta" style="margin-top:4px;">${{current}}</div>
+              <div style="margin-top:8px; height:8px; border-radius:999px; background:#ead8ca; overflow:hidden;">
+                <div style="height:100%; width:${{percent}}%; background:linear-gradient(90deg, #b96b33, #7b3f1d);"></div>
+              </div>
+              <div class="meta" style="margin-top:6px;">已完成 ${{completed}} / ${{total}} · 失败 ${{failed}}</div>
+            </div>
+          `;
+        }}).join('');
       }}
     }}
 
-    async function fetchBatchStatus() {{
-      const resp = await fetch('/api/reading/batch-status', {{ credentials: 'same-origin' }});
-      const data = await resp.json().catch(() => ({{ ok:false, error:'批处理状态获取失败' }}));
-      if (!resp.ok || data.ok === false) throw new Error(data.error || '批处理状态获取失败');
-      return data.status || {{}};
-    }}
-
-    async function pollBatchStatus() {{
-      try {{
-        const status = await fetchBatchStatus();
-        renderBatchStatus(status);
-        if (status.running) {{
-          batchPollingTimer = window.setTimeout(pollBatchStatus, 2500);
-          return;
-        }}
-        batchPollingTimer = null;
-      }} catch (error) {{
-        batchPollingTimer = window.setTimeout(pollBatchStatus, 4000);
-      }}
+    async function fetchOpenClawJobs() {{
+      const resp = await fetch('/api/openclaw-intake/jobs', {{ credentials: 'same-origin' }});
+      const data = await resp.json().catch(() => ({{ ok:false, error:'任务列表获取失败' }}));
+      if (!resp.ok || data.ok === false) throw new Error(data.error || '任务列表获取失败');
+      return data.jobs || [];
     }}
 
     function renderOpenClawJob(job) {{
@@ -1983,11 +2043,14 @@ def build_library_html():
     }}
 
     async function pollOpenClawJob() {{
-      if (!openclawCurrentJobId) return;
       try {{
-        const job = await fetchOpenClawJob(openclawCurrentJobId);
-        renderOpenClawJob(job);
-        if (job.running) {{
+        const jobs = await fetchOpenClawJobs();
+        renderActiveOpenClawJobs(jobs);
+        const trackedJob = openclawCurrentJobId ? (jobs.find((job) => job.id === openclawCurrentJobId) || null) : null;
+        if (trackedJob) {{
+          renderOpenClawJob(trackedJob);
+        }}
+        if ((trackedJob && trackedJob.running) || jobs.some((job) => job && job.running)) {{
           openclawPollingTimer = window.setTimeout(pollOpenClawJob, 2500);
           return;
         }}
@@ -2046,23 +2109,6 @@ def build_library_html():
           window.location.reload();
         }}
       }});
-    }}
-
-    if (batchGenerateBtn) {{
-      batchGenerateBtn.addEventListener('click', async () => {{
-        const resp = await fetch('/api/reading/batch-generate', {{
-          method: 'POST',
-          credentials: 'same-origin'
-        }});
-        const data = await resp.json().catch(() => ({{ ok:false, error:'启动批处理失败' }}));
-        if (!resp.ok || data.ok === false) {{
-          alert(data.error || '启动批处理失败');
-          return;
-        }}
-        renderBatchStatus(data.status || {{}});
-        if (!batchPollingTimer) pollBatchStatus();
-      }});
-      pollBatchStatus().catch(() => {{}});
     }}
 
     // Add/remove citation from group
@@ -2196,6 +2242,8 @@ def build_library_html():
         }}
       }});
     }}
+
+    pollOpenClawJob().catch(() => {{}});
   </script>
 </body>
 </html>"""

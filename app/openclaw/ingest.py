@@ -1,8 +1,11 @@
 #!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+import base64
+import io
 import json
 from pathlib import Path
 
 import requests
+from PIL import Image
 from pypdf import PdfReader
 
 
@@ -10,6 +13,8 @@ DEFAULT_OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 DEFAULT_OPENCLAW_MODEL = "joybuilder-plan/DeepSeek-V3.2"
 DEFAULT_OPENCLAW_CHECK_MODEL = "joybuilder-plan/GLM-5"
 DEFAULT_OPENCLAW_FALLBACK_MODEL = "joybuilder-plan/Kimi-K2.5"
+DEFAULT_OPENCLAW_IMAGE_MODEL = "joybuilder-plan/Kimi-K2.5"
+DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL = "joybuilder-plan/DeepSeek-V3.2"
 DEFAULT_RESEARCH_TOP = 100
 ALLOWED_RESEARCH_VENUES = [
     "chi", "uist", "cscw", "ubicomp",
@@ -407,6 +412,7 @@ def _request_chat_completion(
     temperature: float = 0,
     config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
     timeout: int = 240,
+    max_tokens: int | None = None,
 ) -> str:
     resolved = resolve_openclaw_model(model_id=model_id, config_path=config_path)
     provider = resolved["provider"]
@@ -422,6 +428,8 @@ def _request_chat_completion(
         "messages": messages,
         "temperature": temperature,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max(1, int(max_tokens))
     response = requests.post(
         url,
         headers={
@@ -457,6 +465,7 @@ def _request_json_payload(
     config_path: str | Path,
     timeout: int,
     attempts: int = 2,
+    max_tokens: int | None = None,
 ) -> dict:
     last_error = None
     current_messages = list(messages)
@@ -468,6 +477,7 @@ def _request_json_payload(
                 temperature=0,
                 messages=current_messages,
                 timeout=timeout,
+                max_tokens=max_tokens,
             )
             return _extract_json_object(content)
         except Exception as exc:
@@ -481,6 +491,136 @@ def _request_json_payload(
                 }
             ]
     raise OpenClawIngestError(str(last_error) if last_error else "模型 JSON 输出失败。")
+
+
+def _prepare_image_data_url(
+    image_path: str | Path,
+    *,
+    max_side: int = 1200,
+    jpeg_quality: int = 72,
+    min_side: int = 512,
+    min_quality: int = 35,
+    max_base64_chars: int = 260_000,
+) -> str:
+    path = Path(image_path)
+    if not path.exists():
+        raise OpenClawIngestError(f"图片不存在: {path}")
+
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            width, height = img.size
+            scale = min(1.0, max_side / float(max(width, height)))
+            target_width = max(1, int(width * scale))
+            target_height = max(1, int(height * scale))
+            quality = jpeg_quality
+
+            while True:
+                candidate = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                buffer = io.BytesIO()
+                candidate.save(buffer, format="JPEG", quality=quality, optimize=True)
+                encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+                if len(encoded) <= max_base64_chars:
+                    return f"data:image/jpeg;base64,{encoded}"
+
+                next_width = max(int(target_width * 0.82), min_side if target_width >= target_height else int(min_side * target_width / max(target_height, 1)))
+                next_height = max(int(target_height * 0.82), min_side if target_height > target_width else int(min_side * target_height / max(target_width, 1)))
+                shrunk = next_width < target_width or next_height < target_height
+                lowered = quality > min_quality
+                if lowered:
+                    quality = max(min_quality, quality - 10)
+                if shrunk:
+                    target_width, target_height = next_width, next_height
+                    continue
+                if lowered:
+                    continue
+                return f"data:image/jpeg;base64,{encoded}"
+    except OpenClawIngestError:
+        raise
+    except Exception as exc:
+        raise OpenClawIngestError(f"无法处理图片: {exc}") from exc
+
+
+def extract_paper_candidate_from_image(
+    image_path: str | Path,
+    *,
+    model_id: str = DEFAULT_OPENCLAW_IMAGE_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+    timeout: int = 180,
+) -> dict:
+    path = Path(image_path)
+    if not path.exists():
+        raise OpenClawIngestError(f"图片不存在: {path}")
+
+    data_url = _prepare_image_data_url(path, max_base64_chars=180_000)
+    prompt = """
+你会看到一张图片。请判断它是否包含论文截图、论文标题页、摘要页、论文搜索结果中的某篇论文卡片，或足以定位论文的信息。
+
+只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+返回 schema：
+{
+  "is_paper_screenshot": true,
+  "confidence": 0,
+  "title": "",
+  "doi": "",
+  "authors": ["", ""],
+  "year": "",
+  "venue": "",
+  "query": "",
+  "notes": ""
+}
+
+规则：
+- 如果不是论文相关截图，`is_paper_screenshot` 必须为 false。
+- 优先提取论文标题；不要凭空编造。
+- `doi` 只有在图片中明确出现时才填写。
+- `query` 用于后续检索链接，优先等于识别到的英文标题。
+- `confidence` 取 0 到 1 之间的小数。
+""".strip()
+
+    messages = [
+        {"role": "system", "content": "你负责识别图片中的论文信息。只返回严格合法的 JSON。"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+
+    def _run(target_model_id: str) -> dict:
+        payload = _request_json_payload(
+            model_id=target_model_id,
+            messages=messages,
+            config_path=config_path,
+            timeout=timeout,
+            attempts=2,
+            max_tokens=600,
+        )
+        authors = payload.get("authors") or []
+        if not isinstance(authors, list):
+            authors = [str(authors or "").strip()] if str(authors or "").strip() else []
+        return {
+            "is_paper_screenshot": bool(payload.get("is_paper_screenshot")),
+            "confidence": float(payload.get("confidence") or 0),
+            "title": str(payload.get("title") or "").strip(),
+            "doi": str(payload.get("doi") or "").strip(),
+            "authors": [str(item).strip() for item in authors if str(item).strip()],
+            "year": str(payload.get("year") or "").strip(),
+            "venue": str(payload.get("venue") or "").strip(),
+            "query": str(payload.get("query") or "").strip(),
+            "notes": str(payload.get("notes") or "").strip(),
+        }
+
+    try:
+        return _run(model_id)
+    except Exception as exc:
+        if not fallback_model_id:
+            raise OpenClawIngestError(f"图片论文识别失败: {exc}") from exc
+    return _run(fallback_model_id)
 
 
 def extract_pdf_bundle(pdf_path: str | Path) -> dict:

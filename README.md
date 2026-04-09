@@ -7,6 +7,8 @@
 - 按关键词搜索 DBLP 论文并导出网页、CSV、JSON
 - 在网页中发起自然语言 research 搜索
 - 上传一个或多个 PDF，自动去重、建库、生成阅读工作区
+- 从搜索结果页加入深度阅读时，先打开原文链接手动下载 PDF，再上传 PDF
+- 在 OpenClaw 对话侧通过 `picsearch` 标准动作提交论文截图图片，按“图片识别 -> DBLP -> 官方 web 结果筛选 -> DOI fallback”定位论文并加入当天 `webreading` timeline，关键词统一为 `picsearch`
 - 基于论文做引用扩展搜索
 - 在阅读页中查看结构化分析、继续提问、保存笔记
 - 支持多用户数据隔离，每个用户拥有独立的 `searches/`、`reading/`、`library/` 和 SQLite 数据库
@@ -18,6 +20,8 @@
 - 架构说明：[ARCHITECTURE.md](/home/ubuntu/tools/exScholar/docs/ARCHITECTURE.md)
 - OpenClaw PDF 链路补充：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
 - 微信 PDF intake 说明：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
+- Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
+- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
 
 ## 快速开始
 
@@ -90,6 +94,20 @@ systemctl --user restart exscholar-site.service
   --wait --json /absolute/path/to/paper.pdf
 ```
 
+图片找论文：
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+  --wait --json /absolute/path/to/paper-screenshot.png
+```
+
+同步并重载 OpenClaw skills：
+
+```bash
+/home/ubuntu/tools/exScholar/sync_openclaw_skills.sh
+systemctl --user restart openclaw-gateway.service
+```
+
 ## 运行环境
 
 当前项目中的主要入口都已统一到：
@@ -109,7 +127,7 @@ systemctl --user restart exscholar-site.service
 
 - `app/pipeline`：搜索、主爬虫、摘要抓取、导出站点
 - `app/site`：网页、HTTP 接口、用户数据、阅读库、任务管理
-- `app/openclaw`：PDF intake、元数据抽取、分析、问答
+- `app/openclaw`：PDF intake、元数据抽取、分析、问答、图片找论文
 - `app/common`：共享工具
 - `skills/`：面向 Codex / OpenClaw 的技能定义
 
@@ -131,6 +149,13 @@ systemctl --user restart exscholar-site.service
 
 ```bash
 journalctl --user -u exscholar-site.service -n 100 --no-pager
+```
+
+OpenClaw 网关：
+
+```bash
+systemctl --user status openclaw-gateway.service --no-pager
+journalctl --user -u openclaw-gateway.service -n 100 --no-pager
 ```
 
 ## 建议阅读顺序

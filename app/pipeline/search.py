@@ -382,14 +382,61 @@ def write_json(records: list[dict], output_path: str, meta: dict):
 
 def write_site(records: list[dict], output_path: str, meta: dict):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    normalized_records = records.get("papers", []) if isinstance(records, dict) else records
+    normalized_meta = records.get("meta", {}) if isinstance(records, dict) else {}
+    if not isinstance(normalized_records, list):
+        normalized_records = []
+    if not isinstance(meta, dict):
+        meta = {}
+    merged_meta = dict(normalized_meta)
+    merged_meta.update(meta)
+
+    def preview_text(value: str, limit: int = 900) -> str:
+        text = str(value or "暂无内容").strip() or "暂无内容"
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + " ..."
+
+    def render_initial_card(paper: dict) -> str:
+        line_meta = " · ".join(
+            item for item in [
+                f"CSV #{paper.get('csv_index')}" + (f" · 命中词：{paper.get('matched_kw')}" if paper.get("matched_kw") else ""),
+                paper.get("venue") or "",
+                str(paper.get("year") or ""),
+                paper.get("authors") or "",
+            ] if item
+        )
+        doi_text = f"DOI: {escape(str(paper.get('doi') or ''))}" if paper.get("doi") else ""
+        link_html = (
+            f'<a href="{escape(str(paper.get("url") or ""))}" target="_blank" rel="noreferrer">原文链接</a>'
+            if paper.get("url") else ""
+        )
+        meta_line = " · ".join(item for item in [doi_text, link_html] if item)
+        return f"""
+        <article class="card">
+          <div class="card-head">
+            <div class="idx">#{escape(str(paper.get("csv_index") or ""))}</div>
+            <h2 class="paper-title">{escape(str(paper.get("title") or ""))}</h2>
+          </div>
+          <div class="paper-meta">{escape(line_meta)}</div>
+          <div class="paper-meta">{meta_line}</div>
+          <div class="content">{escape(preview_text(paper.get("content") or "暂无内容"))}</div>
+          <div class="actions">
+            <button class="action" type="button" onclick="addCitation({json.dumps(paper.get('csv_index'))})">加入深度阅读</button>
+            <button class="action secondary" type="button" onclick="expandReferences({json.dumps(paper.get('csv_index'))})">延展搜索</button>
+          </div>
+        </article>
+        """
+
     payload = {
-        "meta": meta,
-        "papers": records,
+        "meta": merged_meta,
+        "papers": normalized_records,
     }
     payload_json = json.dumps(payload, ensure_ascii=False)
-    title = escape(f"{meta.get('slug', 'papers')} Papers")
-    keyword_text = escape(" / ".join(meta.get("keywords", [])))
-    venue_text = escape(", ".join(meta.get("venues", [])) or "全局")
+    initial_cards_html = "\n".join(render_initial_card(record) for record in normalized_records) if normalized_records else ""
+    title = escape(f"{merged_meta.get('slug', 'papers')} Papers")
+    keyword_text = escape(" / ".join(merged_meta.get("keywords", [])))
+    venue_text = escape(", ".join(merged_meta.get("venues", [])) or "全局")
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -611,7 +658,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       <h1>{title}</h1>
       <div class="meta">关键词：{keyword_text}</div>
       <div class="meta">范围：{venue_text}</div>
-      <div class="meta">共 <span id="total-count">{len(records)}</span> 篇，支持按标题、关键词、摘要内容检索。</div>
+      <div class="meta">共 <span id="total-count">{len(normalized_records)}</span> 篇，支持按标题、关键词、摘要内容检索。</div>
       <div class="topbar">
         <a class="pill" href="/">返回时间线</a>
         <a class="pill" href="/reading">打开深度阅读</a>
@@ -620,15 +667,18 @@ def write_site(records: list[dict], output_path: str, meta: dict):
 
     <section class="toolbar">
       <input id="q" type="search" placeholder="搜索标题、关键词、摘要内容">
-      <div class="count"><span id="count">{len(records)}</span> 篇可见</div>
+      <div class="count"><span id="count">{len(normalized_records)}</span> 篇可见</div>
     </section>
 
     <section class="filters" id="kw-filters"></section>
 
-    <section id="list" class="list"></section>
+    <section id="list" class="list">{initial_cards_html}</section>
     <template id="empty">
       <div class="empty">没有匹配结果，试试更短的关键词。</div>
     </template>
+    <noscript>
+      <div class="empty" style="margin-top:14px;">当前页面已直接展示论文卡片。若要使用搜索过滤，请开启 JavaScript。</div>
+    </noscript>
   </main>
 
   <script id="papers-data" type="application/json">{payload_json}</script>
@@ -687,13 +737,24 @@ def write_site(records: list[dict], output_path: str, meta: dict):
               <option value="">暂不加入 Group</option>
             </select>
           </label>
+          <div id="citation-source-link-box" style="display:none; margin-bottom:14px; padding:12px; border:1px dashed #d5cbba; border-radius:14px; background:#fffaf4;">
+            <div style="margin-bottom:8px; color:#6f685c;">请先打开原文链接手动下载 PDF，再上传到深度阅读。</div>
+            <a id="citation-source-link" href="#" target="_blank" rel="noreferrer" style="display:none; border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; text-decoration:none;">打开原文链接</a>
+          </div>
           <label style="display:block; margin-bottom:14px;">
-            <div style="margin-bottom:6px; color:#6f685c;">上传 PDF（可选）</div>
+            <div style="margin-bottom:6px; color:#6f685c;">上传 PDF（必填）</div>
             <input id="citation-pdf-input" type="file" accept="application/pdf,.pdf" style="width:100%;">
           </label>
+          <div id="citation-progress-box" style="display:none; margin:-4px 0 14px;">
+            <div style="height:10px; border-radius:999px; background:#eadfce; overflow:hidden;">
+              <div id="citation-progress-bar" style="width:0%; height:100%; background:#9c4f2f; transition:width .2s ease;"></div>
+            </div>
+            <div id="citation-progress-text" style="margin-top:8px; color:#6f685c; font-size:14px;">等待开始...</div>
+          </div>
+          <div id="citation-status" style="display:none; margin:-4px 0 14px; padding:10px 12px; border-radius:12px; background:#f5ede4; color:#6b4b39; line-height:1.6;"></div>
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
-            <button type="submit" value="submit" style="border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">保存</button>
-            <button type="submit" value="cancel" style="border:none; background:#6f6455; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">取消</button>
+            <button id="citation-submit" type="submit" value="submit" style="border:none; background:#9c4f2f; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">保存并解析</button>
+            <button id="citation-cancel" type="submit" value="cancel" style="border:none; background:#6f6455; color:white; padding:10px 14px; border-radius:999px; cursor:pointer;">取消</button>
           </div>
         </form>
       `;
@@ -707,44 +768,114 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       readingGroups = data.ok ? (data.groups || []) : [];
     }}
 
+    function uploadWithProgress(url, formData, onProgress) {{
+      return new Promise((resolve, reject) => {{
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.withCredentials = true;
+        xhr.upload.addEventListener('progress', (event) => {{
+          if (!event.lengthComputable) return;
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onProgress(percent, percent < 100 ? `正在上传 PDF... ${{percent}}%` : '上传完成，等待服务器处理...');
+        }});
+        xhr.onload = () => {{
+          let data = null;
+          try {{
+            data = JSON.parse(xhr.responseText || '{{}}');
+          }} catch (error) {{
+            data = {{ ok: false, error: '响应解析失败' }};
+          }}
+          if (xhr.status >= 200 && xhr.status < 300 && data.ok !== false) {{
+            resolve(data);
+            return;
+          }}
+          reject(new Error((data && data.error) || '上传失败'));
+        }};
+        xhr.onerror = () => reject(new Error('网络错误，上传失败'));
+        xhr.send(formData);
+      }});
+    }}
+
     async function submitCitation(searchSlug, paper) {{
       const dialog = ensureCitationDialog();
       document.getElementById('citation-dialog-title').textContent = paper.title || '';
       const select = document.getElementById('citation-group-select');
       const fileInput = document.getElementById('citation-pdf-input');
+      const progressBox = document.getElementById('citation-progress-box');
+      const progressBar = document.getElementById('citation-progress-bar');
+      const progressText = document.getElementById('citation-progress-text');
+      const statusBox = document.getElementById('citation-status');
+      const sourceLinkBox = document.getElementById('citation-source-link-box');
+      const sourceLink = document.getElementById('citation-source-link');
+      const submitButton = document.getElementById('citation-submit');
+      const cancelButton = document.getElementById('citation-cancel');
       select.innerHTML = '<option value="">暂不加入 Group</option>' + readingGroups.map(
         (group) => `<option value="${{group.id}}">${{esc(group.name)}}</option>`
       ).join('');
       fileInput.value = '';
+      progressBox.style.display = 'none';
+      progressBar.style.width = '0%';
+      progressText.textContent = '等待开始...';
+      statusBox.style.display = 'none';
+      statusBox.textContent = '';
+      const sourceUrl = (paper.url || '').toString().trim();
+      sourceLinkBox.style.display = 'block';
+      sourceLink.href = sourceUrl || '#';
+      sourceLink.style.display = sourceUrl ? 'inline-flex' : 'none';
+      submitButton.disabled = false;
+      cancelButton.disabled = false;
       return new Promise((resolve) => {{
         const form = document.getElementById('citation-form');
+
+        const setBusy = (busy) => {{
+          submitButton.disabled = busy;
+          cancelButton.disabled = busy;
+        }};
+
+        const cleanup = () => {{
+          form.removeEventListener('submit', handler);
+        }};
+
         const handler = async (event) => {{
           event.preventDefault();
           const action = event.submitter && event.submitter.value;
-          form.removeEventListener('submit', handler);
           if (action !== 'submit') {{
+            cleanup();
             dialog.close();
             resolve(null);
             return;
           }}
+          if (!fileInput.files[0]) {{
+            statusBox.textContent = '请先从原文链接下载 PDF，然后上传 PDF 后再加入深度阅读。';
+            statusBox.style.display = 'block';
+            return;
+          }}
+          setBusy(true);
+          progressBox.style.display = 'block';
+          progressBar.style.width = '0%';
+          progressText.textContent = '准备上传 PDF...';
           const formData = new FormData();
           formData.append('search_slug', searchSlug || '');
           formData.append('paper', JSON.stringify(paper));
           if (select.value) formData.append('group_id', select.value);
-          if (fileInput.files[0]) formData.append('pdf', fileInput.files[0]);
-          const resp = await fetch('/api/citations', {{
-            method: 'POST',
-            credentials: 'same-origin',
-            body: formData
-          }});
-          const data = await resp.json().catch(() => ({{ ok: false, error: '请求失败' }}));
-          dialog.close();
-          if (!resp.ok || data.ok === false) {{
-            resolve({{ error: data.error || '请求失败' }});
-            return;
+          formData.append('pdf', fileInput.files[0]);
+          try {{
+            const data = await uploadWithProgress('/api/citations', formData, (percent, text) => {{
+              progressBar.style.width = percent + '%';
+              progressText.textContent = text;
+            }});
+            progressBar.style.width = '100%';
+            progressText.textContent = 'PDF 已上传，正在启动深度解析...';
+            cleanup();
+            dialog.close();
+            resolve(data);
+          }} catch (error) {{
+            cleanup();
+            dialog.close();
+            resolve({{ error: error.message || '请求失败' }});
           }}
-          resolve(data);
         }};
+
         form.addEventListener('submit', handler);
         dialog.showModal();
       }});
@@ -837,6 +968,8 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     window.expandReferences = expandReferences;
 
     function cardHtml(paper) {{
+      const content = text(paper.content || '暂无内容');
+      const previewText = content.length > 900 ? content.slice(0, 900).trimEnd() + ' ...' : content;
       const lineMeta = [
         paper.matched_kw ? `CSV #${{paper.csv_index}} · 命中词：${{paper.matched_kw}}` : `CSV #${{paper.csv_index}}`,
         paper.venue || '',
@@ -858,7 +991,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
           </div>
           <div class="paper-meta">${{esc(lineMeta)}}</div>
           <div class="paper-meta">${{[doi, link].filter(Boolean).join(' · ')}}</div>
-          <div class="content">${{esc(paper.content || '暂无内容')}}</div>
+          <div class="content">${{esc(previewText || '暂无内容')}}</div>
           <div class="actions">
             <button class="action" type="button" onclick="addCitation(${{paper.csv_index}})">加入深度阅读</button>
             <button class="${{expandClass}}" type="button" onclick="expandReferences(${{paper.csv_index}})">${{expandLabel}}</button>
@@ -927,7 +1060,11 @@ def write_site(records: list[dict], output_path: str, meta: dict):
 
     input.addEventListener('input', (event) => render(event.target.value));
     renderKeywordFilters();
-    loadExpansions().finally(() => render());
+    loadExpansions().finally(() => {{
+      if (Object.keys(expansionIndex || {{}}).length) {{
+        render(input.value);
+      }}
+    }});
   </script>
 </body>
 </html>

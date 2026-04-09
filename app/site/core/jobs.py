@@ -1,10 +1,21 @@
 """OpenClaw job orchestration and batch reading helpers for exScholar."""
 
+from app.openclaw import (
+    DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL,
+    DEFAULT_OPENCLAW_IMAGE_MODEL,
+    resolve_paper_lookup_from_image,
+)
+
+from .picsearch import append_picsearch_timeline
 from .shared import *
 
 
 def ensure_openclaw_jobs_dir():
     OPENCLAW_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+OPENCLAW_STALE_JOB_TIMEOUT_SECONDS = 30 * 60
+OPENCLAW_STALE_JOB_MESSAGE = "任务因服务重启或超时被中断，请重新发起。"
 
 
 def build_openclaw_job_id() -> str:
@@ -16,7 +27,17 @@ def openclaw_job_path(job_id: str) -> Path:
     return OPENCLAW_JOBS_DIR / f"{job_id}.json"
 
 
-def summarize_openclaw_job(job: dict) -> dict:
+def parse_openclaw_job_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def refresh_openclaw_job_counters(job: dict, *, touch_updated: bool = False) -> dict:
     items = job.get("items") or []
     total = len(items)
     completed = sum(1 for item in items if (item.get("status") or "") == "completed")
@@ -28,7 +49,80 @@ def summarize_openclaw_job(job: dict) -> dict:
     job["failed"] = failed
     job["running_count"] = running
     job["queued"] = queued
-    job["updated_at"] = utc_now()
+    if touch_updated:
+        job["updated_at"] = utc_now()
+    return job
+
+
+def summarize_openclaw_job(job: dict) -> dict:
+    return refresh_openclaw_job_counters(job, touch_updated=True)
+
+
+def mark_stale_openclaw_reading_item(item: dict, reason: str):
+    paper_id = str(item.get("paper_id") or "").strip()
+    if not paper_id:
+        return
+    bundle = load_reading_bundle(paper_id)
+    if not bundle:
+        return
+    paper_json_path = Path(bundle["workspace"]) / "paper.json"
+    actions = item.get("requested_actions") or ["metadata", "analysis"]
+    current_status = ((bundle.get("paper") or {}).get("status") or {})
+    if "metadata" in actions:
+        if (current_status.get("metadata") or "").strip() == "processing":
+            update_paper_metadata_progress(
+                paper_json_path,
+                state="failed",
+                message=reason,
+            )
+    if "analysis" in actions:
+        if (current_status.get("analysis") or "").strip() == "in_progress":
+            progress = current_status.get("analysis_progress")
+            update_paper_analysis_progress(
+                paper_json_path,
+                state="failed",
+                progress=progress if isinstance(progress, int) else 0,
+                stage="failed",
+                message=reason,
+            )
+
+
+def reconcile_openclaw_job_if_stale(job: dict, path: Path | None = None) -> dict:
+    refresh_openclaw_job_counters(job, touch_updated=False)
+    if not job.get("running"):
+        return job
+    updated_at = parse_openclaw_job_timestamp(job.get("updated_at") or job.get("created_at") or "")
+    if not updated_at:
+        return job
+    age_seconds = (datetime.utcnow() - updated_at).total_seconds()
+    if age_seconds < OPENCLAW_STALE_JOB_TIMEOUT_SECONDS:
+        return job
+    reason = OPENCLAW_STALE_JOB_MESSAGE
+    kind = (job.get("kind") or "").strip()
+    changed = False
+    for item in (job.get("items") or []):
+        item_status = (item.get("status") or "").strip()
+        if item_status not in {"queued", "running"}:
+            continue
+        item["status"] = "failed"
+        item["current_step"] = "failed"
+        item["step_message"] = reason
+        item["error"] = reason
+        changed = True
+        if kind in {"openclaw_refresh_paper", "openclaw_batch_pdf_intake"}:
+            mark_stale_openclaw_reading_item(item, reason)
+    if not changed:
+        return job
+    job["running"] = False
+    job["status"] = "completed_with_errors"
+    job["message"] = reason
+    job["finished_at"] = utc_now()
+    job["current_index"] = None
+    job["current_title"] = ""
+    summarize_openclaw_job(job)
+    if path is not None:
+        with OPENCLAW_JOB_LOCK:
+            write_json_file_atomic(path, job)
     return job
 
 
@@ -42,7 +136,10 @@ def load_openclaw_job(job_id: str) -> dict | None:
     path = openclaw_job_path(job_id)
     if not path.exists():
         return None
-    return read_json_file(path, None)
+    job = read_json_file(path, None)
+    if not job:
+        return None
+    return reconcile_openclaw_job_if_stale(job, path)
 
 
 def list_openclaw_jobs(limit: int = 20) -> list[dict]:
@@ -52,7 +149,7 @@ def list_openclaw_jobs(limit: int = 20) -> list[dict]:
         job = read_json_file(path, None)
         if not job:
             continue
-        jobs.append(summarize_openclaw_job(job))
+        jobs.append(reconcile_openclaw_job_if_stale(job, path))
         if len(jobs) >= limit:
             break
     return jobs
@@ -293,6 +390,21 @@ def start_openclaw_refresh_job_for_paper(
         "error": "",
         "metadata": {},
     }
+    paper_json_path = Path(reading["paper_json_path"])
+    if run_metadata:
+        update_paper_metadata_progress(
+            paper_json_path,
+            state="processing",
+            message="已提交 OpenClaw 元数据识别任务，正在排队。",
+        )
+    if run_analysis:
+        update_paper_analysis_progress(
+            paper_json_path,
+            state="in_progress",
+            progress=5,
+            stage="queued",
+            message="已提交 OpenClaw 深度解析任务，正在排队。",
+        )
     job = {
         "id": build_openclaw_job_id(),
         "username": current_username(),
@@ -447,6 +559,164 @@ def start_openclaw_intake_job(files: list[dict], group_id_raw: str | None = None
     }
     save_openclaw_job(job)
     thread = threading.Thread(target=run_openclaw_intake_job, args=(job["id"], job.get("username") or ""), daemon=True)
+    thread.start()
+    return load_openclaw_job(job["id"]) or job
+
+
+def process_openclaw_picsearch_item(job_id: str, index: int):
+    job = load_openclaw_job(job_id)
+    if not job:
+        raise ValueError("OpenClaw 图片任务不存在")
+    item = (job.get("items") or [])[index]
+    image_rel = (item.get("image_path") or "").strip()
+    if not image_rel:
+        raise ValueError("任务缺少图片路径")
+    image_abs = current_data_dir() / image_rel
+    if not image_abs.exists():
+        raise ValueError(f"图片文件不存在: {image_rel}")
+
+    def update_step(step: str, message: str):
+        def mutate(payload):
+            item_payload = payload["items"][index]
+            item_payload["current_step"] = step
+            item_payload["step_message"] = message
+            payload["message"] = message
+            payload["current_title"] = item_payload.get("filename") or item_payload.get("title") or ""
+        update_openclaw_job(job_id, mutate)
+
+    update_step("recognizing", "正在识别图片中的论文信息。")
+    result = resolve_paper_lookup_from_image(image_abs)
+    update_step("updating_timeline", "正在写入今日 webreading timeline。")
+    timeline = append_picsearch_timeline(result["record"])
+    try:
+        image_abs.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {
+        "paper": result.get("record") or {},
+        "candidate": result.get("candidate") or {},
+        "source": result.get("source") or "",
+        "timeline": timeline,
+    }
+
+
+def run_openclaw_picsearch_job(job_id: str, username: str = ""):
+    with user_context(username):
+        _run_openclaw_picsearch_job_inner(job_id)
+
+
+def _run_openclaw_picsearch_job_inner(job_id: str):
+    update_openclaw_job(job_id, lambda job: job.update({"status": "running", "running": True, "message": "OpenClaw 图片找论文任务进行中。"}))
+    job = load_openclaw_job(job_id) or {}
+    any_failed = False
+    latest_timeline = {}
+    for index, _ in enumerate(job.get("items") or []):
+        def mark_running(payload):
+            payload["current_index"] = index
+            payload["current_title"] = (payload["items"][index].get("filename") or payload["items"][index].get("title") or "")
+            payload["items"][index]["status"] = "running"
+            payload["items"][index]["error"] = ""
+
+        update_openclaw_job(job_id, mark_running)
+        try:
+            result = process_openclaw_picsearch_item(job_id, index)
+            latest_timeline = result.get("timeline") or latest_timeline
+
+            def mark_done(payload):
+                item = payload["items"][index]
+                paper = result.get("paper") or {}
+                item["status"] = "completed"
+                item["title"] = paper.get("title") or item.get("title") or ""
+                item["paper"] = paper
+                item["candidate"] = result.get("candidate") or {}
+                item["source"] = result.get("source") or ""
+                item["timeline"] = result.get("timeline") or {}
+                item["current_step"] = "completed"
+                item["step_message"] = "该图片已处理完成。"
+
+            update_openclaw_job(job_id, mark_done)
+        except Exception as exc:
+            any_failed = True
+
+            def mark_failed(payload):
+                item = payload["items"][index]
+                item["status"] = "failed"
+                item["error"] = str(exc)
+                item["current_step"] = "failed"
+                item["step_message"] = str(exc)
+
+            update_openclaw_job(job_id, mark_failed)
+
+    def finalize(payload):
+        payload["running"] = False
+        payload["status"] = "completed_with_errors" if any_failed else "completed"
+        payload["message"] = "图片找论文任务完成。" if not any_failed else "图片找论文任务完成，但有部分图片失败。"
+        payload["finished_at"] = utc_now()
+        payload["current_index"] = None
+        payload["current_title"] = ""
+        if latest_timeline:
+            payload["links"] = {
+                "timeline": latest_timeline.get("relative_site_url") or "",
+                "timeline_absolute": latest_timeline.get("site_url") or "",
+            }
+
+    update_openclaw_job(job_id, finalize)
+
+
+def start_openclaw_picsearch_job(files: list[dict]) -> dict:
+    allowed_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    temp_dir = current_data_dir() / "tmp_picsearch"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    items = []
+    for file_item in files:
+        filename = (getattr(file_item, "filename", "") or "").strip()
+        suffix = Path(filename).suffix.lower()
+        if suffix not in allowed_suffixes:
+            raise ValueError(f"仅支持 PNG/JPG/JPEG/WEBP/BMP 图片: {filename or 'unnamed'}")
+        stored_name = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}{suffix or '.png'}"
+        rel_path = Path("tmp_picsearch") / stored_name
+        abs_path = current_data_dir() / rel_path
+        file_item.file.seek(0)
+        with abs_path.open("wb") as fh:
+            shutil.copyfileobj(file_item.file, fh)
+        items.append(
+            {
+                "filename": filename or stored_name,
+                "image_path": rel_path.as_posix(),
+                "status": "queued",
+                "current_step": "queued",
+                "step_message": "等待进入图片识别队列。",
+                "title": "",
+                "source": "",
+                "paper": {},
+                "candidate": {},
+                "timeline": {},
+                "error": "",
+            }
+        )
+    if not items:
+        raise ValueError("请至少上传一张图片文件")
+
+    job = {
+        "id": build_openclaw_job_id(),
+        "username": current_username(),
+        "kind": "openclaw_batch_picsearch",
+        "status": "queued",
+        "running": True,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "finished_at": "",
+        "model": DEFAULT_OPENCLAW_IMAGE_MODEL,
+        "fallback_model": DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL,
+        "config_path": str(OPENCLAW_CONFIG_PATH),
+        "message": "图片找论文任务已提交，等待后台处理。",
+        "current_index": None,
+        "current_title": "",
+        "links": {},
+        "items": items,
+    }
+    save_openclaw_job(job)
+    thread = threading.Thread(target=run_openclaw_picsearch_job, args=(job["id"], job.get("username") or ""), daemon=True)
     thread.start()
     return load_openclaw_job(job["id"]) or job
 

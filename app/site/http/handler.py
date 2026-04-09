@@ -19,6 +19,17 @@ class UploadedFormFile:
 
 class SearchSiteHandler(SimpleHTTPRequestHandler):
     # Request parsing and response helpers
+    def is_openclaw_public_api(self) -> bool:
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        return (
+            path == "/api/openclaw-intake/upload"
+            or path == "/api/openclaw-image-intake/upload"
+            or path == "/api/openclaw-intake/jobs"
+            or path == "/api/openclaw-image-intake/jobs"
+            or path.startswith("/api/openclaw-intake/jobs/")
+            or path.startswith("/api/openclaw-image-intake/jobs/")
+        )
+
     def translate_path(self, path):
         path = unquote(path.split("?", 1)[0].split("#", 1)[0]).lstrip("/")
         return str(DATA_DIR / path)
@@ -122,9 +133,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/"):
             self.send_json({"ok": False, "error": "unauthorized"}, status=401)
         else:
-            self.send_response(302)
-            self.send_header("Location", "/login")
-            self.end_headers()
+            self.send_html(build_login_html(has_users=has_users() or bool(PASSWORD_SALT and PASSWORD_HASH)), status=200)
 
     def handle_server_error(self, exc: Exception):
         error_log = Path("/tmp/exscholar-serve-errors.log")
@@ -164,11 +173,25 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             if "application/json" in self.headers.get("Content-Type", ""):
                 self.send_json({"ok": True, "username": user["username"]}, extra_headers=headers)
             else:
-                self.send_response(302)
+                body = (
+                    "<!doctype html><html lang='zh-CN'><head>"
+                    "<meta charset='utf-8'>"
+                    "<meta http-equiv='refresh' content='0;url=/'>"
+                    "<title>Redirecting</title>"
+                    "</head><body>"
+                    "<p>登录成功，正在进入首页。</p>"
+                    "<p><a href='/'>如果没有自动跳转，请点这里。</a></p>"
+                    "<script>window.location.replace('/');</script>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(303)
                 self.send_header("Location", "/")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
                 for key, value in headers.items():
                     self.send_header(key, value)
                 self.end_headers()
+                self.wfile.write(body)
             return True
 
         if self.path == "/api/auth/logout":
@@ -212,6 +235,12 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 pdf_path=pdf_path or None,
                 pdf_sha256=pdf_sha256 or None,
             )
+            citation = get_citation_by_id(citation_id) if citation_id else None
+            if citation and not pdf_path:
+                existing_pdf_path = (citation.get("pdf_path") or "").strip()
+                if existing_pdf_path:
+                    pdf_path = existing_pdf_path
+                    pdf_sha256 = (citation.get("pdf_sha256") or "").strip()
             reading_url = ""
             if group_id_raw not in (None, ""):
                 try:
@@ -224,17 +253,28 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     return True
                 if citation_id:
                     add_citation_to_group(citation_id, group_id)
+            refresh_job = None
             if pdf_path and citation_id:
                 reading = ensure_reading_workspace_for_citation(citation_id)
                 reading_url = reading["reading_url"]
+                try:
+                    refresh_job = start_openclaw_refresh_job_for_paper(
+                        reading["paper_id"],
+                        run_metadata=True,
+                        run_analysis=True,
+                    )
+                except Exception:
+                    refresh_job = None
             self.send_json(
                 {
                     "ok": True,
-                    "message": "已加入深度阅读。",
+                    "message": "已加入深度阅读，OpenClaw 正在自动解析 PDF。",
                     "citation_id": citation_id,
                     "pdf_path": pdf_path or "",
                     "pdf_reused": bool(pdf_record.get("reused")),
                     "reading_url": reading_url,
+                    "job_id": (refresh_job or {}).get("id") or "",
+                    "job": refresh_job or {},
                 }
             )
             return True
@@ -300,18 +340,28 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             update_citation_pdf(citation_id, pdf_path, pdf_sha256)
             citation = get_citation_by_id(citation_id)
             reading_url = ""
+            refresh_job = None
             if citation:
                 try:
-                    reading_url = ensure_reading_workspace_for_citation(citation_id)["reading_url"]
+                    reading = ensure_reading_workspace_for_citation(citation_id)
+                    reading_url = reading["reading_url"]
+                    refresh_job = start_openclaw_refresh_job_for_paper(
+                        reading["paper_id"],
+                        run_metadata=True,
+                        run_analysis=True,
+                    )
                 except Exception:
                     reading_url = ""
+                    refresh_job = None
             self.send_json(
                 {
                     "ok": True,
-                    "message": "PDF 已绑定到该文献。",
+                    "message": "PDF 已绑定到该文献，OpenClaw 正在自动解析。",
                     "pdf_path": pdf_path,
                     "pdf_reused": bool(pdf_record.get("reused")),
                     "reading_url": reading_url,
+                    "job_id": (refresh_job or {}).get("id") or "",
+                    "job": refresh_job or {},
                 }
             )
             return True
@@ -383,6 +433,31 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         return files
 
     def _handle_openclaw_post(self) -> bool:
+        if self.path == "/api/openclaw-image-intake/upload":
+            data = self.parse_body()
+            files = self._collect_uploaded_files(data)
+            if not files:
+                self.send_json({"ok": False, "error": "请至少上传一张图片文件"}, status=400)
+                return True
+            try:
+                with user_context(openclaw_default_username()):
+                    job = start_openclaw_picsearch_job(files)
+            except (ValueError, OpenClawIngestError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+                return True
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"图片找论文任务启动失败: {exc}"}, status=500)
+                return True
+            self.send_json(
+                {
+                    "ok": True,
+                    "job_id": job["id"],
+                    "job": job,
+                    "message": f"已提交 {len(job.get('items') or [])} 张图片到 picsearch 队列，系统会依次识别并追加到今日 webreading timeline。",
+                }
+            )
+            return True
+
         if self.path != "/api/openclaw-intake/upload":
             return False
         data = self.parse_body()
@@ -431,22 +506,6 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     "started": bool(result.get("started")),
                     "status": result.get("status") or {},
                     "job": result.get("job"),
-                }
-            )
-            return True
-
-        if self.path == "/api/reading/batch-generate":
-            try:
-                result = start_batch_generation_job()
-            except Exception as exc:
-                self.send_json({"ok": False, "error": f"启动批处理失败: {exc}"}, status=500)
-                return True
-            self.send_json(
-                {
-                    "ok": True,
-                    "message": "批处理任务已启动。" if result.get("started") else "批处理任务已在运行。",
-                    "started": bool(result.get("started")),
-                    "status": result.get("status") or {},
                 }
             )
             return True
@@ -761,7 +820,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_html(build_login_html(has_users=has_users() or bool(PASSWORD_SALT and PASSWORD_HASH)))
             return
 
-        if not self.is_authenticated():
+        if not self.is_authenticated() and not self.is_openclaw_public_api():
             self.reject_unauthorized()
             return
 
@@ -792,13 +851,15 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_html("<!doctype html><html lang='zh-CN'><body><h1>该阅读页缺少可访问的 PDF，暂时不能打开。</h1></body></html>", status=404)
                 return
 
-        if self.path == "/api/reading/batch-status":
-            self.send_json({"ok": True, "status": get_batch_reading_job_payload()})
-            return
-
         if self.path == "/api/openclaw-intake/jobs":
             with user_context(openclaw_default_username()):
                 self.send_json({"ok": True, "jobs": list_openclaw_jobs()})
+            return
+
+        if self.path == "/api/openclaw-image-intake/jobs":
+            with user_context(openclaw_default_username()):
+                jobs = [job for job in list_openclaw_jobs() if (job.get("kind") or "") == "openclaw_batch_picsearch"]
+                self.send_json({"ok": True, "jobs": jobs})
             return
 
         if self.path == "/api/research/jobs":
@@ -825,6 +886,19 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             with user_context(openclaw_default_username()):
                 job = load_openclaw_job(job_id)
             if not job:
+                self.send_json({"ok": False, "error": "任务不存在"}, status=404)
+                return
+            self.send_json({"ok": True, "job": job})
+            return
+
+        if self.path.startswith("/api/openclaw-image-intake/jobs/"):
+            job_id = unquote(self.path[len("/api/openclaw-image-intake/jobs/"):]).strip().strip("/")
+            if not job_id:
+                self.send_json({"ok": False, "error": "job id 不合法"}, status=400)
+                return
+            with user_context(openclaw_default_username()):
+                job = load_openclaw_job(job_id)
+            if not job or (job.get("kind") or "") != "openclaw_batch_picsearch":
                 self.send_json({"ok": False, "error": "任务不存在"}, status=404)
                 return
             self.send_json({"ok": True, "job": job})
@@ -869,7 +943,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         if self._handle_auth_post():
             return
 
-        if not self.is_authenticated():
+        if not self.is_authenticated() and not self.is_openclaw_public_api():
             self.reject_unauthorized()
             return
 

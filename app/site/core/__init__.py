@@ -7,5 +7,6 @@ from .citations import *
 from .reading import *
 from .shared import *
 from .jobs import *
+from .picsearch import *
 from .references import *
 from .research_jobs import *

@@ -49,6 +49,8 @@ OpenClaw 相关：
 
 - [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
 - [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
+- [paper_lookup.py](/home/ubuntu/tools/exScholar/app/openclaw/paper_lookup.py)
+- [picsearch_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/picsearch_cli.py)
 
 站点与数据相关：
 
@@ -96,9 +98,19 @@ data/users/<username>/
 - 阅读页元数据识别
 - 阅读页重新分析
 - 阅读页问答
-- 批量补全未完成项
 - 本地 CLI
 - 微信附件触发
+- OpenClaw 对话侧 `picsearch` 标准动作
+
+搜索结果页的“加入深度阅读”当前不做自动 PDF 抓取。
+该入口只负责展示原文链接，并要求用户手动下载后上传 PDF。
+
+`picsearch` 当前查找顺序是：
+
+- 图片识别
+- DBLP 模糊匹配
+- 在前 20 条 web 结果中优先筛官方来源并按标题相似度排序
+- DOI fallback
 
 ### 4.3 搜索并发
 
@@ -166,6 +178,12 @@ python -m playwright install chromium
   $(find app -name '*.py' | sort) set_site_password.py
 ```
 
+同步 skills 到 OpenClaw：
+
+```bash
+/home/ubuntu/tools/exScholar/sync_openclaw_skills.sh
+```
+
 启动站点：
 
 ```bash
@@ -194,6 +212,13 @@ systemctl --user status exscholar-site.service --no-pager
 ```bash
 /home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
   --wait --json /absolute/path/to/paper.pdf
+```
+
+图片找论文：
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+  --wait --json /absolute/path/to/paper-screenshot.png
 ```
 
 运行主爬虫：
@@ -231,6 +256,14 @@ systemctl --user daemon-reload
 journalctl --user -u exscholar-site.service -n 100 --no-pager
 ```
 
+OpenClaw 网关：
+
+```bash
+systemctl --user restart openclaw-gateway.service
+systemctl --user status openclaw-gateway.service --no-pager
+journalctl --user -u openclaw-gateway.service -n 100 --no-pager
+```
+
 ## 9. 最小验证清单
 
 改动后优先做最小验证：
@@ -247,5 +280,7 @@ journalctl --user -u exscholar-site.service -n 100 --no-pager
 - 用户说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
 - 架构说明：[ARCHITECTURE.md](/home/ubuntu/tools/exScholar/docs/ARCHITECTURE.md)
 - OpenClaw 补充说明：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
+- Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
+- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
 - 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
 - 搜索 skill：[SKILL.md](/home/ubuntu/tools/exScholar/skills/ccf-research/SKILL.md)

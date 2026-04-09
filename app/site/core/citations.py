@@ -570,7 +570,11 @@ def store_uploaded_pdf(file_item, title: str = "") -> dict:
     filename = (getattr(file_item, "filename", "") or "").strip()
     content_type = (getattr(file_item, "type", "") or "").lower()
     suffix = Path(filename).suffix.lower()
-    if suffix != ".pdf" and content_type != "application/pdf":
+    file_item.file.seek(0)
+    header = file_item.file.read(5)
+    file_item.file.seek(0)
+    is_pdf_payload = header.startswith(b"%PDF-")
+    if suffix != ".pdf" and content_type != "application/pdf" and not is_pdf_payload:
         raise ValueError("仅支持上传 PDF 文件。")
     pdf_sha256 = compute_stream_sha256(file_item.file)
     existing = find_existing_pdf_by_hash(pdf_sha256)
@@ -582,6 +586,29 @@ def store_uploaded_pdf(file_item, title: str = "") -> dict:
     file_item.file.seek(0)
     with dest.open("wb") as fh:
         shutil.copyfileobj(file_item.file, fh)
+    return {"pdf_path": f"library/{unique_name}", "pdf_sha256": pdf_sha256, "reused": False}
+
+
+def store_pdf_bytes(pdf_bytes: bytes, title: str = "", filename_hint: str = "") -> dict:
+    ensure_db()
+    payload = pdf_bytes or b""
+    if not payload:
+        raise ValueError("empty_response")
+    if not payload.startswith(b"%PDF-"):
+        raise ValueError("response_not_pdf")
+
+    stream = io.BytesIO(payload)
+    pdf_sha256 = compute_stream_sha256(stream)
+    existing = find_existing_pdf_by_hash(pdf_sha256)
+    if existing:
+        return {"pdf_path": existing["pdf_path"], "pdf_sha256": pdf_sha256, "reused": True}
+
+    hint_name = Path((filename_hint or "").split("?", 1)[0]).name
+    stem = safe_file_stem(title or Path(hint_name).stem or "paper")
+    unique_name = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}-{stem}.pdf"
+    dest = LIBRARY_DIR / unique_name
+    with dest.open("wb") as fh:
+        fh.write(payload)
     return {"pdf_path": f"library/{unique_name}", "pdf_sha256": pdf_sha256, "reused": False}
 
 

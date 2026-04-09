@@ -11,6 +11,7 @@ exScholar 目前支持以下工作流：
 - 上传单篇或多篇 PDF
 - 自动识别元数据、去重、建 citation 库
 - 自动生成结构化论文分析
+- 在阅读页可视化查看当前正在解析的任务
 - 在阅读页继续问答和记笔记
 - 创建和使用 Reading Group
 - 按用户隔离数据目录和阅读库
@@ -34,12 +35,6 @@ exScholar 目前支持以下工作流：
 conda env create -f environment.yml
 conda activate openclaw-analytics
 python -m playwright install chromium
-```
-
-如果你使用 OpenClaw 包装器：
-
-```bash
-oc-conda-run -- /home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m playwright install chromium
 ```
 
 ## 3. 基础配置
@@ -109,6 +104,13 @@ systemctl --user status exscholar-site.service --no-pager
 journalctl --user -u exscholar-site.service -n 100 --no-pager
 ```
 
+OpenClaw 网关：
+
+```bash
+systemctl --user status openclaw-gateway.service --no-pager
+journalctl --user -u openclaw-gateway.service -n 100 --no-pager
+```
+
 站点默认入口示例：
 
 ```text
@@ -149,6 +151,14 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 
 当前网页 PDF 上传统一走 OpenClaw 链路。
 
+从搜索结果页点击“加入深度阅读”时，当前流程是：
+
+- 先在弹窗里打开原文链接
+- 手动下载 PDF
+- 上传 PDF 后再加入深度阅读
+
+系统当前不再自动抓取论文 PDF。
+
 ### 6.3 Reading Group
 
 在 `/reading` 页面可以：
@@ -165,6 +175,7 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 - 查看论文元数据
 - 重新识别元数据
 - 重新生成分析
+- 查看当前正在解析的任务和进度
 - 基于全文问答
 - 保存 Notes
 - 删除问答历史
@@ -202,10 +213,19 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
   --wait --json /path/a.pdf /path/b.pdf
 ```
 
+### 7.4 图片找论文
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+  --wait --json /absolute/path/to/paper-screenshot.png
+```
+
 说明：
 
 - OpenClaw 默认用户现在是 `qioyo`
 - 非网页登录触发的 OpenClaw intake 和默认 CCF research 搜索会默认写入 `data/users/qioyo/`
+- 图片找论文会把结果加入当天 `webreading` timeline，关键词固定为 `picsearch`
+- `picsearch` 当前顺序是：图片识别 -> DBLP -> 从前 20 条 web 结果里优先筛官方论文链接 -> DOI fallback
 
 ## 8. 数据目录
 
@@ -231,3 +251,5 @@ data/users/<username>/
 - 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
 - OpenClaw 补充说明：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
 - 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
+- Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
+- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)

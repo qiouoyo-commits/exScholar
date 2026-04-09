@@ -179,9 +179,9 @@ OpenClaw 相关主逻辑位于：
 - `/reading` 页面 PDF 上传
 - 阅读页元数据识别
 - 阅读页重新分析
-- 批量补全未完成项
 - 本地 CLI
 - 微信 / 外部自动化入口
+- OpenClaw 对话侧 `picsearch`
 
 核心流程：
 
