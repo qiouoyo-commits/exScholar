@@ -46,6 +46,14 @@ def list_research_jobs(limit: int = 20) -> list[dict]:
     return jobs
 
 
+def delete_research_job(job_id: str) -> bool:
+    path = research_job_path(job_id)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
 def update_research_job(job_id: str, mutate):
     with RESEARCH_JOB_LOCK:
         path = research_job_path(job_id)
@@ -66,7 +74,159 @@ def _research_relative_url(abs_path: str | Path) -> str:
     return f"/{relative}"
 
 
-def _run_research_job(job_id: str):
+def _parse_search_cli_line(job_id: str, line: str):
+    text = " ".join(str(line or "").split())
+    if not text:
+        return
+
+    def mutate(payload):
+        payload["status"] = "running"
+        payload["stdout_tail"] = text
+        logs = payload.setdefault("logs", [])
+        logs.append({"at": utc_now(), "step": payload.get("current_step") or "running", "message": text})
+        payload["logs"] = logs[-60:]
+
+        if "开始搜索" in text:
+            payload["current_step"] = "searching"
+            payload["step_message"] = text
+        elif "合并去重后共" in text:
+            payload["current_step"] = "search_completed"
+            payload["step_message"] = text
+        elif "开始爬取摘要" in text:
+            payload["current_step"] = "fetching_abstracts"
+            payload["step_message"] = text
+        elif "摘要爬取完成" in text or "摘要获取完成" in text:
+            payload["current_step"] = "abstracts_completed"
+            payload["step_message"] = text
+        elif "已跳过摘要爬取" in text:
+            payload["current_step"] = "abstracts_skipped"
+            payload["step_message"] = text
+        elif "输出目录:" in text:
+            payload["current_step"] = "writing_outputs"
+            payload["step_message"] = "搜索已完成，正在整理输出文件。"
+            payload["result_dir"] = text.split("输出目录:", 1)[1].strip()
+        elif "site_url" in text:
+            payload["site_url"] = text.split(":", 1)[1].strip()
+        elif "papers.csv" in text:
+            payload["csv_path"] = text.split(":", 1)[1].strip()
+        elif "papers.json" in text:
+            payload["json_path"] = text.split(":", 1)[1].strip()
+        elif "search.json" in text:
+            payload["meta_path"] = text.split(":", 1)[1].strip()
+        elif "site.html" in text:
+            payload["site_path"] = text.split(":", 1)[1].strip()
+
+    update_research_job(job_id, mutate)
+
+
+def _run_search_in_openclaw_analytics(job_id: str, plan: dict) -> dict:
+    keywords = [str(item).strip() for item in (plan.get("keywords") or []) if str(item).strip()]
+    venues = [str(item).strip() for item in (plan.get("venues") or []) if str(item).strip()]
+    slug = " ".join(str(plan.get("slug") or "").split())
+    if not keywords or not slug:
+        raise ValueError("research 方案缺少可执行的 keywords 或 slug")
+
+    command = [
+        OPENCLAW_ANALYTICS_PYTHON,
+        "-m",
+        "app.pipeline.search",
+        "--keywords",
+        ";".join(keywords),
+        "--slug",
+        slug,
+        "--top",
+        str(int(plan.get("top") or 100)),
+    ]
+    if venues:
+        command.extend(["--venues", ",".join(venues)])
+    year_from = int(plan.get("year_from") or 0)
+    if year_from > 0:
+        command.extend(["--year-from", str(year_from)])
+    if not bool(plan.get("fetch_abstract", True)):
+        command.append("--no-abstract")
+
+    update_research_job(
+        job_id,
+        lambda payload: payload.update(
+            {
+                "status": "running",
+                "current_step": "queued",
+                "step_message": f"正在切换到 openclaw-analytics 环境执行搜索：{OPENCLAW_ANALYTICS_PYTHON}",
+                "command": command,
+            }
+        ),
+    )
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(ROOT_DIR),
+        env={
+            **os.environ,
+            "EXSCHOLAR_DATA_DIR": str(DATA_DIR),
+            "EXSCHOLAR_SEARCHES_DIR": str(SEARCHES_DIR),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        _parse_search_cli_line(job_id, raw_line)
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"搜索子进程退出失败，exit code={return_code}")
+
+    job = load_research_job(job_id) or {}
+    result_dir = job.get("result_dir") or ""
+    csv_path = job.get("csv_path") or ""
+    json_path = job.get("json_path") or ""
+    meta_path = job.get("meta_path") or ""
+    site_path = job.get("site_path") or ""
+    site_url = job.get("site_url") or ""
+    if not result_dir:
+        raise RuntimeError("搜索执行完成，但未解析到输出目录。")
+
+    csv_url = _research_relative_url(csv_path)
+    json_url = _research_relative_url(json_path)
+    search_url = _research_relative_url(meta_path)
+    site_relative_url = ""
+    try:
+        relative_dir = Path(result_dir).relative_to(DATA_DIR).as_posix()
+        site_relative_url = f"/{relative_dir}/site/"
+    except Exception:
+        site_relative_url = ""
+
+    total_papers = None
+    hit_counts = {}
+    try:
+        meta_payload = read_json_file(meta_path, {})
+        total_papers = meta_payload.get("total_papers")
+    except Exception:
+        total_papers = None
+
+    return {
+        "out_dir": result_dir,
+        "csv_path": csv_path,
+        "json_path": json_path,
+        "meta_path": meta_path,
+        "site_path": site_path,
+        "site_url": site_url,
+        "site_relative_url": site_relative_url,
+        "csv_url": csv_url,
+        "json_url": json_url,
+        "search_url": search_url,
+        "total_papers": total_papers,
+        "hit_counts": hit_counts,
+    }
+
+
+def _run_research_job(job_id: str, username: str = ""):
+    with user_context(username):
+        _run_research_job_inner(job_id)
+
+
+def _run_research_job_inner(job_id: str):
     def set_step(step: str, message: str, **extra):
         def mutate(job):
             job["status"] = "running"
@@ -114,38 +274,7 @@ def _run_research_job(job_id: str):
             update_research_job(job_id, lambda payload: payload.update({"plan": plan}))
             set_step("planned", "已生成搜索方案，开始执行搜索。")
 
-        def on_progress(stage: str, message: str, extra: dict):
-            update_research_job(
-                job_id,
-                lambda payload: payload.update(
-                    {
-                        "status": "running",
-                        "current_step": stage,
-                        "step_message": message,
-                        "progress": extra or {},
-                    }
-                ),
-            )
-
-        result = run_topic_search(
-            keywords=plan.get("keywords") or [],
-            venues=plan.get("venues") or [],
-            slug=plan.get("slug") or "",
-            top=int(plan.get("top") or 100),
-            year_from=int(plan.get("year_from") or 0),
-            fetch_abstract=bool(plan.get("fetch_abstract", True)),
-            progress_callback=on_progress,
-        )
-
-        csv_url = _research_relative_url(result["csv_path"])
-        json_url = _research_relative_url(result["json_path"])
-        search_url = _research_relative_url(result["meta_path"])
-        site_relative_url = ""
-        try:
-            relative_dir = Path(result["out_dir"]).relative_to(DATA_DIR).as_posix()
-            site_relative_url = f"/{relative_dir}/site/"
-        except Exception:
-            site_relative_url = ""
+        result = _run_search_in_openclaw_analytics(job_id, plan)
 
         update_research_job(
             job_id,
@@ -156,10 +285,10 @@ def _run_research_job(job_id: str):
                     "step_message": "Research 搜索已完成。",
                     "result_dir": str(result["out_dir"]),
                     "site_url": result["site_url"],
-                    "site_relative_url": site_relative_url,
-                    "csv_url": csv_url,
-                    "json_url": json_url,
-                    "search_url": search_url,
+                    "site_relative_url": result.get("site_relative_url") or "",
+                    "csv_url": result.get("csv_url") or "",
+                    "json_url": result.get("json_url") or "",
+                    "search_url": result.get("search_url") or "",
                     "total_papers": result["total_papers"],
                     "hit_counts": result["hit_counts"],
                 }
@@ -211,6 +340,7 @@ def compose_research_plan_request(latest_input: str, current_prompt: str = "", c
         reviewer_model_id=OPENCLAW_INGEST_CHECK_MODEL,
         fallback_model_id=OPENCLAW_INGEST_FALLBACK_MODEL,
         config_path=OPENCLAW_CONFIG_PATH,
+        fast_preview=True,
     )
 
 
@@ -247,9 +377,11 @@ def start_research_job_with_plan(prompt: str, plan: dict | None) -> dict:
     if not text:
         raise ValueError("research 需求不能为空")
     ensure_research_jobs_dir()
+    username = current_username() or openclaw_default_username()
     job = {
         "id": build_research_job_id(),
         "type": "natural_language_research",
+        "username": username,
         "status": "queued",
         "prompt": text,
         "plan": plan or None,
@@ -261,6 +393,6 @@ def start_research_job_with_plan(prompt: str, plan: dict | None) -> dict:
         "updated_at": utc_now(),
     }
     save_research_job(job)
-    thread = threading.Thread(target=_run_research_job, args=(job["id"],), daemon=True)
+    thread = threading.Thread(target=_run_research_job, args=(job["id"], job.get("username") or ""), daemon=True)
     thread.start()
     return load_research_job(job["id"]) or job

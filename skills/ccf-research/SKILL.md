@@ -8,7 +8,7 @@ metadata:
   openclaw:
     os: ["linux"]
     requires:
-      bins: ["bash", "python3", "oc-conda-run"]
+      bins: ["bash"]
 ---
 
 # exScholar Research Skill
@@ -19,11 +19,13 @@ metadata:
 
 ## 数据存储结构
 
-每次搜索结果保存在独立目录下，不互相覆盖：
+当前项目是多用户模式。网页登录触发的搜索会写入当前登录用户自己的目录；非网页登录触发的默认 OpenClaw 搜索会写入 `data/users/qioyo/`。
+
+每次搜索结果保存在独立目录下，不互相覆盖。典型目录形态如下：
 
 ```
-/home/ubuntu/tools/exScholar/data/searches/
-/home/ubuntu/tools/exScholar/data/expansions/
+/home/ubuntu/tools/exScholar/data/users/<username>/searches/
+/home/ubuntu/tools/exScholar/data/users/<username>/expansions/
 └── YYYY-MM-DD_<slug>/          ← 日期 + 话题简称，每次搜索独立一个目录
     ├── search.json             ← 搜索参数记录（关键词/venues/日期/是否含摘要）
     ├── papers.csv              ← 论文列表（matched_kw/title/venue/year/authors/doi/url/abstract）
@@ -84,7 +86,8 @@ metadata:
 
 ### 运行环境要求
 
-- 必须在 `openclaw-analytics` conda 环境中执行，优先使用 `oc-conda-run`
+- 必须在 `openclaw-analytics` conda 环境中执行
+- Python 解释器统一使用 `/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python`
 - 仓库固定入口为 `/home/ubuntu/tools/exScholar/run_search.sh`，关键词搜索优先走这个脚本
 - 静态站点固定服务端口为 `38128`，公开基址由 `.env.local` 中的 `PUBLIC_SITE_BASE_URL` 控制
 - 不要直接使用系统默认 `python` 或 base 环境的 Python 3.13；该环境下摘要依赖 `aiohttp` 可能不可用
@@ -92,7 +95,7 @@ metadata:
 - 首次使用前确保已安装 Playwright 浏览器：
 
 ```bash
-oc-conda-run -- python -m playwright install chromium
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m playwright install chromium
 ```
 
 ### 命令格式
@@ -109,7 +112,7 @@ oc-conda-run -- python -m playwright install chromium
 如需排查问题或直接执行 Python 命令，再退回到：
 
 ```bash
-oc-conda-run -- python -m app.pipeline.search ...
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.pipeline.search ...
 ```
 
 参数说明：
@@ -123,10 +126,10 @@ oc-conda-run -- python -m app.pipeline.search ...
 > 默认爬取摘要：无代理，并发数 2，请求间随机延迟 2-4 秒。
 > 预计耗时 = 命中篇数 × 3 秒 ÷ 60（分钟）。
 
-如果用户要求跑主爬虫而不是关键词搜索，也同样使用 `oc-conda-run`：
+如果用户要求跑主爬虫而不是关键词搜索，也同样使用 `openclaw-analytics` 的 Python：
 
 ```bash
-oc-conda-run -- python -m app.pipeline.main -ccf a -c conf -m 20 -p 10
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.pipeline.main -ccf a -c conf -m 20 -p 10
 ```
 
 ### 分步反馈规则

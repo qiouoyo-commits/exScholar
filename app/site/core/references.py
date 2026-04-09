@@ -323,3 +323,18 @@ def list_search_entries():
 
     entries.sort(key=lambda item: (item["sort_key"], item["dir_name"]), reverse=True)
     return entries
+
+
+def delete_search_entry(relative_dir: str) -> bool:
+    normalized = " ".join(str(relative_dir or "").split())
+    if not normalized:
+        return False
+    target = (DATA_DIR / normalized.lstrip("/")).resolve()
+    try:
+        target.relative_to(DATA_DIR.resolve())
+    except Exception:
+        return False
+    if not target.exists() or not target.is_dir():
+        return False
+    shutil.rmtree(target)
+    return True

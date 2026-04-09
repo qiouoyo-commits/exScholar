@@ -1,7 +1,20 @@
 """HTTP handlers and server entrypoint for the exScholar site."""
 
+from dataclasses import dataclass
+from email.parser import BytesParser
+from email.policy import default
+from urllib.parse import parse_qs
+
 from ..core import *
 from ..ui.pages import *
+
+
+@dataclass
+class UploadedFormFile:
+    name: str
+    filename: str
+    type: str
+    file: io.BytesIO
 
 
 class SearchSiteHandler(SimpleHTTPRequestHandler):
@@ -10,42 +23,55 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         path = unquote(path.split("?", 1)[0].split("#", 1)[0]).lstrip("/")
         return str(DATA_DIR / path)
 
+    @staticmethod
+    def _append_form_value(data: dict, name: str, value):
+        if name in data:
+            current = data[name]
+            if isinstance(current, list):
+                current.append(value)
+            else:
+                data[name] = [current, value]
+        else:
+            data[name] = value
+
+    def _parse_multipart_form_data(self, raw: bytes, content_type: str) -> dict:
+        header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+        message = BytesParser(policy=default).parsebytes(header + raw)
+        data: dict[str, object] = {}
+        if not message.is_multipart():
+            return data
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                continue
+            field_name = part.get_param("name", header="content-disposition") or ""
+            if not field_name:
+                continue
+            filename = part.get_filename()
+            payload = part.get_payload(decode=True) or b""
+            if filename:
+                value = UploadedFormFile(
+                    name=field_name,
+                    filename=filename,
+                    type=part.get_content_type() or "",
+                    file=io.BytesIO(payload),
+                )
+            else:
+                charset = part.get_content_charset() or "utf-8"
+                value = payload.decode(charset, errors="replace")
+            self._append_form_value(data, field_name, value)
+        return data
+
     def parse_body(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
         if "multipart/form-data" in content_type:
-            environ = {
-                "REQUEST_METHOD": self.command,
-                "CONTENT_TYPE": content_type,
-                "CONTENT_LENGTH": str(length),
-            }
-            form = __import__("cgi").FieldStorage(
-                fp=io.BytesIO(raw),
-                headers=self.headers,
-                environ=environ,
-                keep_blank_values=True,
-            )
-            data = {}
-            if getattr(form, "list", None):
-                for field in form.list:
-                    if field.filename:
-                        data[field.name] = field
-                    elif field.name in data:
-                        current = data[field.name]
-                        if isinstance(current, list):
-                            current.append(field.value)
-                        else:
-                            data[field.name] = [current, field.value]
-                    else:
-                        data[field.name] = field.value
-            return data
+            return self._parse_multipart_form_data(raw, content_type)
         if "application/json" in content_type:
             return json.loads(raw.decode("utf-8") or "{}")
         if "application/x-www-form-urlencoded" in content_type:
-            text = raw.decode("utf-8")
-            pairs = [part.split("=", 1) for part in text.split("&") if "=" in part]
-            return {k: unquote(v.replace("+", " ")) for k, v in pairs}
+            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            return {key: values[0] if len(values) == 1 else values for key, values in parsed.items()}
         return {}
 
     def send_json(self, payload: dict, status: int = 200, extra_headers: dict | None = None):
@@ -53,6 +79,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
         if extra_headers:
             for key, value in extra_headers.items():
                 self.send_header(key, value)
@@ -64,6 +92,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
         if extra_headers:
             for key, value in extra_headers.items():
                 self.send_header(key, value)
@@ -72,7 +102,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
     def current_session(self):
         if not require_password():
-            return {"id": "no-password", "created_at": time.time()}
+            return {"id": "no-password", "created_at": time.time(), "username": ""}
         cookie_header = self.headers.get("Cookie", "")
         jar = cookies.SimpleCookie()
         jar.load(cookie_header)
@@ -80,6 +110,10 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         if not token:
             return None
         return SESSIONS.get(token.value)
+
+    def current_username(self) -> str:
+        session = self.current_session() or {}
+        return sanitize_username(session.get("username") or "")
 
     def is_authenticated(self) -> bool:
         return self.current_session() is not None
@@ -112,21 +146,23 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
     def _handle_auth_post(self) -> bool:
         if self.path == "/api/auth/login":
             data = self.parse_body()
+            username = data.get("username", "")
             password = data.get("password", "")
-            if not verify_password(password):
+            user = authenticate_user(username, password)
+            if not user:
                 if "application/json" in self.headers.get("Content-Type", ""):
-                    self.send_json({"ok": False, "error": "invalid_password"}, status=403)
+                    self.send_json({"ok": False, "error": "invalid_credentials"}, status=403)
                 else:
-                    self.send_html(build_login_html("密码错误，请重试。"), status=403)
+                    self.send_html(build_login_html("用户名或密码错误，请重试。"), status=403)
                 return True
 
             token = secrets.token_urlsafe(32)
-            SESSIONS[token] = {"created_at": time.time()}
+            SESSIONS[token] = {"created_at": time.time(), "username": user["username"]}
             headers = {
                 "Set-Cookie": f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax",
             }
             if "application/json" in self.headers.get("Content-Type", ""):
-                self.send_json({"ok": True}, extra_headers=headers)
+                self.send_json({"ok": True, "username": user["username"]}, extra_headers=headers)
             else:
                 self.send_response(302)
                 self.send_header("Location", "/")
@@ -355,7 +391,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": False, "error": "请至少上传一个 PDF 文件"}, status=400)
             return True
         try:
-            job = start_openclaw_intake_job(files, data.get("group_id"))
+            with user_context(openclaw_default_username()):
+                job = start_openclaw_intake_job(files, data.get("group_id"))
         except (ValueError, OpenClawIngestError) as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=400)
             return True
@@ -671,10 +708,48 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "message": "提问记录已删除。"})
         return True
 
+    def _handle_research_delete(self) -> bool:
+        if not self.path.startswith("/api/research/jobs/"):
+            return False
+        job_id = unquote(self.path[len("/api/research/jobs/"):]).strip().strip("/")
+        if not job_id:
+            self.send_json({"ok": False, "error": "job id 不合法"}, status=400)
+            return True
+        if not delete_research_job(job_id):
+            self.send_json({"ok": False, "error": "任务不存在"}, status=404)
+            return True
+        self.send_json({"ok": True, "message": "Research 记录已删除。"})
+        return True
+
+    def _handle_search_entry_delete(self) -> bool:
+        if not self.path.startswith("/api/search-entries/"):
+            return False
+        relative_dir = unquote(self.path[len("/api/search-entries/"):]).strip().strip("/")
+        if not relative_dir:
+            self.send_json({"ok": False, "error": "搜索目录不合法"}, status=400)
+            return True
+        if not delete_search_entry(relative_dir):
+            self.send_json({"ok": False, "error": "搜索结果不存在或无法删除"}, status=404)
+            return True
+        self.send_json({"ok": True, "message": "Timeline 搜索结果已删除。"})
+        return True
+
     # HTTP verb handlers
     def do_GET(self):
+        with user_context(self.current_username()):
+            self._do_GET_impl()
+
+    def _do_GET_impl(self):
         if self.path == "/api/auth/status":
-            self.send_json({"ok": True, "authenticated": self.is_authenticated(), "require_password": require_password()})
+            self.send_json(
+                {
+                    "ok": True,
+                    "authenticated": self.is_authenticated(),
+                    "require_password": require_password(),
+                    "username": self.current_username(),
+                    "has_users": has_users(),
+                }
+            )
             return
 
         if self.path == "/login":
@@ -683,7 +758,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                 self.send_header("Location", "/")
                 self.end_headers()
                 return
-            self.send_html(build_login_html())
+            self.send_html(build_login_html(has_users=has_users() or bool(PASSWORD_SALT and PASSWORD_HASH)))
             return
 
         if not self.is_authenticated():
@@ -722,7 +797,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             return
 
         if self.path == "/api/openclaw-intake/jobs":
-            self.send_json({"ok": True, "jobs": list_openclaw_jobs()})
+            with user_context(openclaw_default_username()):
+                self.send_json({"ok": True, "jobs": list_openclaw_jobs()})
             return
 
         if self.path == "/api/research/jobs":
@@ -746,7 +822,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             if not job_id:
                 self.send_json({"ok": False, "error": "job id 不合法"}, status=400)
                 return
-            job = load_openclaw_job(job_id)
+            with user_context(openclaw_default_username()):
+                job = load_openclaw_job(job_id)
             if not job:
                 self.send_json({"ok": False, "error": "任务不存在"}, status=404)
                 return
@@ -783,7 +860,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            self._do_POST_impl()
+            with user_context(self.current_username()):
+                self._do_POST_impl()
         except Exception as exc:
             self.handle_server_error(exc)
 
@@ -810,7 +888,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         try:
-            self._do_DELETE_impl()
+            with user_context(self.current_username()):
+                self._do_DELETE_impl()
         except Exception as exc:
             self.handle_server_error(exc)
 
@@ -823,6 +902,8 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self._handle_group_delete,
             self._handle_citation_delete,
             self._handle_reading_delete,
+            self._handle_research_delete,
+            self._handle_search_entry_delete,
         ):
             if handler():
                 return
@@ -832,11 +913,14 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
 # Server entrypoint
 def main():
-    SEARCHES_DIR.mkdir(parents=True, exist_ok=True)
-    EXPANSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    ensure_db()
+    ROOT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    USERS_DIR.mkdir(parents=True, exist_ok=True)
+    if not has_users() and not require_password():
+        SEARCHES_DIR.mkdir(parents=True, exist_ok=True)
+        EXPANSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_db()
     server = ReusableThreadingHTTPServer((HOST, PORT), SearchSiteHandler)
-    print(f"[site] serving {DATA_DIR} at http://{HOST}:{PORT}")
+    print(f"[site] serving {ROOT_DATA_DIR} at http://{HOST}:{PORT}")
     server.serve_forever()
 
 

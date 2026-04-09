@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
 import json
 from pathlib import Path
 
@@ -650,6 +650,9 @@ def plan_research_request(
     reviewer_model_id: str | None = DEFAULT_OPENCLAW_CHECK_MODEL,
     fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
     config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+    skip_review: bool = False,
+    timeout: int = 180,
+    attempts: int = 2,
 ) -> dict:
     text = " ".join(str(requirement_text or "").split())
     if not text:
@@ -666,8 +669,8 @@ def plan_research_request(
                 {"role": "user", "content": _research_plan_prompt(text)},
             ],
             config_path=config_path,
-            timeout=180,
-            attempts=2,
+            timeout=timeout,
+            attempts=attempts,
         )
         return _normalize_research_plan_payload(payload)
 
@@ -675,6 +678,8 @@ def plan_research_request(
     try:
         primary = _run_generation(model_id)
         if _research_plan_is_usable(primary):
+            if skip_review or not reviewer_model_id:
+                return primary
             review = _review_candidate(
                 task_name="论文 research 搜索方案",
                 source_text=text,
@@ -838,6 +843,7 @@ def compose_research_plan(
     reviewer_model_id: str | None = DEFAULT_OPENCLAW_CHECK_MODEL,
     fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
     config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+    fast_preview: bool = False,
 ) -> dict:
     latest = " ".join(str(latest_input or "").split())
     current_prompt = " ".join(str(current_prompt or "").split())
@@ -853,11 +859,14 @@ def compose_research_plan(
             reviewer_model_id=reviewer_model_id,
             fallback_model_id=fallback_model_id,
             config_path=config_path,
+            skip_review=fast_preview,
+            timeout=60 if fast_preview else 180,
+            attempts=1 if fast_preview else 2,
         )
         return {
             "mode": "create",
             "prompt": latest,
-            "message": "已根据新的 research 需求生成方案。",
+            "message": "已根据你的需求生成一份搜索方案草案。" if fast_preview else "已根据新的 research 需求生成方案。",
             "plan": plan,
         }
 
@@ -875,8 +884,8 @@ def compose_research_plan(
                 },
             ],
             config_path=config_path,
-            timeout=180,
-            attempts=2,
+            timeout=60 if fast_preview else 180,
+            attempts=1 if fast_preview else 2,
         )
 
     raw = None
@@ -893,17 +902,39 @@ def compose_research_plan(
     prompt = " ".join(str(raw.get("prompt") or "").split()) or (latest if mode == "create" else current_prompt)
     message = " ".join(str(raw.get("message") or "").split())
     candidate_plan = _normalize_research_plan_payload(raw.get("plan") or {})
-    validated_plan = validate_research_plan(
-        prompt,
-        candidate_plan,
-        reviewer_model_id=reviewer_model_id,
-        fallback_model_id=fallback_model_id,
-        config_path=config_path,
-    )
+    if fast_preview:
+        if _research_plan_is_usable(candidate_plan):
+            validated_plan = candidate_plan
+        elif fallback_model_id:
+            validated_plan = plan_research_request(
+                latest if mode == "create" else prompt,
+                model_id=fallback_model_id,
+                reviewer_model_id=None,
+                fallback_model_id=None,
+                config_path=config_path,
+                skip_review=True,
+                timeout=60,
+                attempts=1,
+            )
+        else:
+            raise OpenClawIngestError("生成方案草案失败，请重试。")
+    else:
+        validated_plan = validate_research_plan(
+            prompt,
+            candidate_plan,
+            reviewer_model_id=reviewer_model_id,
+            fallback_model_id=fallback_model_id,
+            config_path=config_path,
+        )
     return {
         "mode": mode,
         "prompt": prompt,
-        "message": message or ("已重新生成方案。" if mode == "create" else "已基于当前方案更新。"),
+        "message": message or (
+            "已重新生成方案草案。" if fast_preview and mode == "create"
+            else "已更新当前方案草案。" if fast_preview
+            else "已重新生成方案。" if mode == "create"
+            else "已基于当前方案更新。"
+        ),
         "plan": validated_plan,
     }
 

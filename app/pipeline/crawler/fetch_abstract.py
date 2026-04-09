@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
 """
 DBLP API 论文获取模块
 通过DBLP API获取指定会议或期刊的论文信息(异步版本)

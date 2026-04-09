@@ -46,6 +46,9 @@ from dotenv import load_dotenv
 ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / ".env.local")
 MAX_CONCURRENT_RESEARCH_JOBS = max(1, int((os.getenv("MAX_CONCURRENT_RESEARCH_JOBS") or "2").strip() or "2"))
+DATA_DIR = Path((os.getenv("EXSCHOLAR_DATA_DIR") or str(ROOT_DIR / "data")).strip())
+SEARCHES_BASE_DIR = Path((os.getenv("EXSCHOLAR_SEARCHES_DIR") or str(DATA_DIR / "searches")).strip())
+TMP_SEARCH_BASE_DIR = Path((os.getenv("EXSCHOLAR_TMP_SEARCH_DIR") or str(DATA_DIR / "tmp_search")).strip())
 RESEARCH_RUNTIME_DIR = ROOT_DIR / "data" / "research_runtime"
 RESEARCH_SLOT_DIR = RESEARCH_RUNTIME_DIR / "slots"
 
@@ -157,7 +160,7 @@ def _release_research_slot(slot_index: int, lock_file):
 
 def _build_search_output_dir(slug: str) -> tuple[str, str]:
     dated_slug = f"{date.today().isoformat()}_{slug}"
-    base_dir = Path(ROOT_DIR) / "data" / "searches"
+    base_dir = SEARCHES_BASE_DIR
     out_dir = base_dir / dated_slug
     suffix = 2
     while out_dir.exists():
@@ -944,7 +947,7 @@ def build_site_url(out_dir: str, site_path: str) -> str:
             base_url = f"http://{host}"
 
     if base_url:
-        relative_dir = os.path.relpath(out_dir, os.path.join(ROOT_DIR, "data"))
+        relative_dir = os.path.relpath(out_dir, DATA_DIR)
         relative_dir = quote(relative_dir.replace(os.sep, "/"))
         return f"{base_url}/{relative_dir}/site/"
 
@@ -977,7 +980,7 @@ def run_topic_search(
     json_path = os.path.join(out_dir, "papers.json")
     meta_path = os.path.join(out_dir, "search.json")
     site_path = os.path.join(out_dir, "site", "index.html")
-    tmp_dir = os.path.join(ROOT_DIR, "data", "tmp_search", f"{date.today().isoformat()}_{slug}_{int(time.time() * 1000)}_{secrets.token_hex(2)}")
+    tmp_dir = os.path.join(str(TMP_SEARCH_BASE_DIR), f"{date.today().isoformat()}_{slug}_{int(time.time() * 1000)}_{secrets.token_hex(2)}")
 
     def report(stage: str, message: str, **extra):
         if callable(progress_callback):

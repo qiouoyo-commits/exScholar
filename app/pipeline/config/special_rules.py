@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
 """
 CCF A类会议的DBLP查询规则和特殊处理规则
 用于统一管理各个会议在DBLP中的venue名称映射和特殊处理逻辑

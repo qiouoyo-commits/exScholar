@@ -1,51 +1,139 @@
 # exScholar
 
-`exScholar` 是一套本地优先的论文搜索、扩展检索与深度阅读工作台。当前代码和文档已经统一到 `app/` 主结构，并默认通过 OpenClaw 接管 PDF 解析链路。
+`exScholar` 是一套面向本地部署的论文搜索、PDF intake、深度阅读与阅读库管理工具。项目当前统一运行在 `openclaw-analytics` conda 环境中，并通过 OpenClaw 处理 PDF 元数据抽取、结构化分析和问答链路。
 
-仓库说明分成两份：
+## 主要功能
 
-- 用户使用版：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
-- 开发与 Vibecoding 版：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
+- 按关键词搜索 DBLP 论文并导出网页、CSV、JSON
+- 在网页中发起自然语言 research 搜索
+- 上传一个或多个 PDF，自动去重、建库、生成阅读工作区
+- 基于论文做引用扩展搜索
+- 在阅读页中查看结构化分析、继续提问、保存笔记
+- 支持多用户数据隔离，每个用户拥有独立的 `searches/`、`reading/`、`library/` 和 SQLite 数据库
 
-如果你只是想启动网页、上传 PDF、做 search 或 reading，请先看用户版。  
-如果你准备继续开发、让 coding model 接手、修改 OpenClaw 链路、改网页或改搜索逻辑，请看开发版。
+## 文档结构
 
-## 当前状态
+- 用户使用说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
+- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
+- 架构说明：[ARCHITECTURE.md](/home/ubuntu/tools/exScholar/docs/ARCHITECTURE.md)
+- OpenClaw PDF 链路补充：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
+- 微信 PDF intake 说明：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
 
-- `/reading` 页面现在只保留一个 OpenClaw PDF 上传入口，单篇和多篇 PDF 都走同一条 `app.openclaw` 链路
-- 上传后的 PDF 会自动做哈希去重，并尝试匹配或合并到已有 citation
-- 网页 research 和 OpenClaw `ccf-research` skill 现在共用同一套搜索并发槽位
-- 默认最多同时运行 `2` 个搜索任务，超出的任务会排队
+## 快速开始
 
-## 当前代码结构
+1. 创建并激活环境
 
-- `app/pipeline`：关键词搜索、主爬虫、摘要抓取、导出静态站点
-- `app/site`：阅读站点、SQLite 文献库、阅读工作区、HTTP 接口
-- `app/openclaw`：PDF intake、元数据提取、论文结构化分析、问答链路
-- `app/common`：共享工具
+```bash
+conda env create -f environment.yml
+conda activate openclaw-analytics
+python -m playwright install chromium
+```
 
-补充文档：
+2. 配置 `.env.local`
 
-- [OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
-- [WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
+建议从 [.env.local.example](/home/ubuntu/tools/exScholar/.env.local.example) 复制：
 
-## 高频入口
+```bash
+cp .env.local.example .env.local
+```
+
+至少确认以下项目：
+
+- `PUBLIC_SITE_BASE_URL`
+- `PUBLIC_SITE_PORT`
+- `SITE_SERVER_HOST`
+- `OPENCLAW_CONFIG_PATH`
+- `OPENCLAW_ANALYTICS_PYTHON`
+
+3. 创建登录账号
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python set_site_password.py \
+  --username admin \
+  --password 'your-password'
+```
+
+4. 启动服务
+
+```bash
+systemctl --user restart exscholar-site.service
+systemctl --user status exscholar-site.service --no-pager
+```
+
+默认访问地址示例：
+
+```text
+http://<your-host>:38128/
+```
+
+## 常用入口
 
 启动站点：
 
 ```bash
-oc-conda-run -- python -m app.site.http.handler
+systemctl --user restart exscholar-site.service
+```
+
+运行关键词搜索：
+
+```bash
+./run_search.sh \
+  --keywords "example keyword" \
+  --venues "chi" \
+  --slug "example"
 ```
 
 本地导入 PDF：
 
 ```bash
-cd /home/ubuntu/tools/exScholar
-python -m app.openclaw.intake_cli --wait --json /absolute/path/to/paper.pdf
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+  --wait --json /absolute/path/to/paper.pdf
 ```
 
-运行搜索：
+## 运行环境
+
+当前项目中的主要入口都已统一到：
+
+```text
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+```
+
+包括：
+
+- systemd 服务 `exscholar-site.service`
+- `run_search.sh`
+- 本地 Python 入口脚本 shebang
+- research 子进程解释器 `OPENCLAW_ANALYTICS_PYTHON`
+
+## 当前代码结构
+
+- `app/pipeline`：搜索、主爬虫、摘要抓取、导出站点
+- `app/site`：网页、HTTP 接口、用户数据、阅读库、任务管理
+- `app/openclaw`：PDF intake、元数据抽取、分析、问答
+- `app/common`：共享工具
+- `skills/`：面向 Codex / OpenClaw 的技能定义
+
+## 服务管理
+
+查看服务状态：
 
 ```bash
-./run_search.sh --keywords "example keyword" --venues "chi" --slug "example"
+systemctl --user status exscholar-site.service --no-pager
 ```
+
+重启服务：
+
+```bash
+systemctl --user restart exscholar-site.service
+```
+
+查看日志：
+
+```bash
+journalctl --user -u exscholar-site.service -n 100 --no-pager
+```
+
+## 建议阅读顺序
+
+- 想直接使用：先看 [README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
+- 想修改代码或继续开发：看 [README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)

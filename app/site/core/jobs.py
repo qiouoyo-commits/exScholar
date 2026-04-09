@@ -295,6 +295,7 @@ def start_openclaw_refresh_job_for_paper(
     }
     job = {
         "id": build_openclaw_job_id(),
+        "username": current_username(),
         "kind": "openclaw_refresh_paper",
         "status": "queued",
         "running": True,
@@ -315,12 +316,17 @@ def start_openclaw_refresh_job_for_paper(
         "items": [item],
     }
     save_openclaw_job(job)
-    thread = threading.Thread(target=run_openclaw_intake_job, args=(job["id"],), daemon=True)
+    thread = threading.Thread(target=run_openclaw_intake_job, args=(job["id"], job.get("username") or ""), daemon=True)
     thread.start()
     return load_openclaw_job(job["id"]) or job
 
 
-def run_openclaw_intake_job(job_id: str):
+def run_openclaw_intake_job(job_id: str, username: str = ""):
+    with user_context(username):
+        _run_openclaw_intake_job_inner(job_id)
+
+
+def _run_openclaw_intake_job_inner(job_id: str):
     update_openclaw_job(job_id, lambda job: job.update({"status": "running", "running": True, "message": "OpenClaw 批量导入任务进行中。"}))
     job = load_openclaw_job(job_id) or {}
     any_failed = False
@@ -419,6 +425,7 @@ def start_openclaw_intake_job(files: list[dict], group_id_raw: str | None = None
 
     job = {
         "id": build_openclaw_job_id(),
+        "username": current_username(),
         "kind": "openclaw_batch_pdf_intake",
         "status": "queued",
         "running": True,
@@ -439,7 +446,7 @@ def start_openclaw_intake_job(files: list[dict], group_id_raw: str | None = None
         "items": items,
     }
     save_openclaw_job(job)
-    thread = threading.Thread(target=run_openclaw_intake_job, args=(job["id"],), daemon=True)
+    thread = threading.Thread(target=run_openclaw_intake_job, args=(job["id"], job.get("username") or ""), daemon=True)
     thread.start()
     return load_openclaw_job(job["id"]) or job
 
@@ -612,7 +619,12 @@ def reset_batch_reading_job():
     )
 
 
-def run_batch_generation_job():
+def run_batch_generation_job(username: str = ""):
+    with user_context(username):
+        _run_batch_generation_job_inner()
+
+
+def _run_batch_generation_job_inner():
     try:
         citations = list_citations()
         work_items = []
@@ -725,12 +737,13 @@ def start_batch_generation_job() -> dict:
     update_batch_reading_job(
         status="running",
         running=True,
+        username=current_username(),
         stage="starting",
         message="正在收集待处理文献。",
         started_at=utc_now(),
         ended_at="",
     )
-    thread = threading.Thread(target=run_batch_generation_job, daemon=True)
+    thread = threading.Thread(target=run_batch_generation_job, args=(current_username(),), daemon=True)
     thread.start()
     return {"started": True, "status": get_batch_reading_job_payload()}
 

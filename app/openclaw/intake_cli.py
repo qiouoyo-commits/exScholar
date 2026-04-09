@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
 import argparse
 import json
 import mimetypes
@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from app.site.core import ensure_db, load_openclaw_job, start_openclaw_intake_job
+from app.site.core import ensure_db, load_openclaw_job, openclaw_default_username, start_openclaw_intake_job, user_context
 
 
 class LocalPDFUpload:
@@ -73,19 +73,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    ensure_db()
-    paths = [Path(os.path.expanduser(item)).resolve() for item in args.pdfs]
-    job = ingest_paths(paths, group_id=args.group_id)
-    if args.wait:
-        job = wait_for_job(
-            job["id"],
-            poll_interval=max(args.poll_interval, 0.2),
-            timeout=max(args.timeout, 1.0),
-        )
+    default_username = openclaw_default_username()
+    with user_context(default_username):
+        ensure_db()
+        paths = [Path(os.path.expanduser(item)).resolve() for item in args.pdfs]
+        job = ingest_paths(paths, group_id=args.group_id)
+        if args.wait:
+            job = wait_for_job(
+                job["id"],
+                poll_interval=max(args.poll_interval, 0.2),
+                timeout=max(args.timeout, 1.0),
+            )
 
     if args.json:
         print(json.dumps(job, ensure_ascii=False, indent=2))
     else:
+        print(f"username={default_username}")
         print(f"job_id={job['id']}")
         print(f"status={job.get('status')}")
         print(f"running={job.get('running')}")

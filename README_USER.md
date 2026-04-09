@@ -1,24 +1,34 @@
 # exScholar 用户使用说明
 
-`exScholar` 可以用来搜索论文、扩展引用、上传 PDF、生成论文解析，并在网页中继续问答和整理阅读笔记。
+这份文档面向部署和日常使用 exScholar 的用户，覆盖安装、账号配置、网页使用、CLI 使用和服务管理。
 
-## 你可以做什么
+## 1. 项目能做什么
 
-- 按关键词搜索 DBLP 论文
-- 浏览摘要和导出结果
-- 基于已有论文继续做参考文献扩展
-- 上传一个或多个 PDF
-- 自动识别元数据并创建阅读工作区
-- 自动生成论文结构化分析
-- 在阅读页继续提问并保存问答历史
+exScholar 目前支持以下工作流：
 
-## 环境要求
+- 搜索 DBLP 论文并生成网页结果
+- 在网页中用自然语言发起 research 搜索
+- 上传单篇或多篇 PDF
+- 自动识别元数据、去重、建 citation 库
+- 自动生成结构化论文分析
+- 在阅读页继续问答和记笔记
+- 创建和使用 Reading Group
+- 按用户隔离数据目录和阅读库
 
-- Python `3.11+`
-- 推荐 Conda 环境：`openclaw-analytics`
+## 2. 环境要求
+
+- Conda
+- Python `3.11`
 - Playwright `chromium`
+- OpenClaw 配置文件
 
-安装方式：
+项目当前统一使用：
+
+```text
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+```
+
+安装：
 
 ```bash
 conda env create -f environment.yml
@@ -26,53 +36,142 @@ conda activate openclaw-analytics
 python -m playwright install chromium
 ```
 
-如果通过 OpenClaw 的 conda 包装器执行：
+如果你使用 OpenClaw 包装器：
 
 ```bash
-oc-conda-run -- python -m playwright install chromium
+oc-conda-run -- /home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m playwright install chromium
 ```
 
-## 基础配置
+## 3. 基础配置
 
-复制 `.env.local.example` 为 `.env.local` 后填写。
+在仓库根目录准备 `.env.local`。
 
-最常用的配置包括：
-
-- 站点地址与端口：
-  `PUBLIC_SITE_BASE_URL`
-  `PUBLIC_SITE_PORT`
-  `SITE_SERVER_HOST`
-- 站点登录：
-  `SITE_PASSWORD_SALT`
-  `SITE_PASSWORD_HASH`
-  `SITE_SESSION_SECRET`
-- OpenClaw PDF 处理：
-  `OPENCLAW_INGEST_MODEL`
-  `OPENCLAW_INGEST_CHECK_MODEL`
-  `OPENCLAW_INGEST_FALLBACK_MODEL`
-  `OPENCLAW_CONFIG_PATH`
-
-默认 OpenClaw 模型链路是：
-
-- 主读取：`joybuilder-plan/DeepSeek-V3.2`
-- 检查：`joybuilder-plan/GLM-5`
-- 回退：`joybuilder-plan/Kimi-K2.5`
-
-## 常用命令
-
-启动站点：
+建议直接从 [.env.local.example](/home/ubuntu/tools/exScholar/.env.local.example) 复制：
 
 ```bash
-oc-conda-run -- python -m app.site.http.handler
+cp .env.local.example .env.local
 ```
 
-设置站点密码：
+最常用配置：
+
+- `PUBLIC_SITE_BASE_URL`
+- `PUBLIC_SITE_PORT`
+- `SITE_SERVER_HOST`
+- `OPENCLAW_CONFIG_PATH`
+- `OPENCLAW_INGEST_MODEL`
+- `OPENCLAW_INGEST_CHECK_MODEL`
+- `OPENCLAW_INGEST_FALLBACK_MODEL`
+- `OPENCLAW_ANALYTICS_PYTHON`
+
+推荐确认：
+
+```text
+OPENCLAW_ANALYTICS_PYTHON=/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+```
+
+## 4. 创建登录用户
+
+站点现在使用用户名 + 密码登录，不再是单一全站密码。
+
+创建用户：
 
 ```bash
-oc-conda-run -- python set_site_password.py --password 'your-password'
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python set_site_password.py \
+  --username admin \
+  --password 'your-password'
 ```
 
-跑一个关键词搜索：
+说明：
+
+- 用户名会被规范化为小写
+- 每个用户都有独立目录：`data/users/<username>/`
+- 每个用户都有独立的 `searches/`、`reading/`、`library/`、`expansions/` 和 SQLite 数据库
+
+## 5. 启动和管理服务
+
+推荐使用 user-level systemd 服务。
+
+启动或重启：
+
+```bash
+systemctl --user restart exscholar-site.service
+```
+
+查看状态：
+
+```bash
+systemctl --user status exscholar-site.service --no-pager
+```
+
+查看日志：
+
+```bash
+journalctl --user -u exscholar-site.service -n 100 --no-pager
+```
+
+站点默认入口示例：
+
+```text
+http://<your-host>:38128/
+```
+
+## 6. 网页使用
+
+主要页面：
+
+- `/`
+  搜索时间线，显示当前登录用户自己的搜索结果
+- `/keywords`
+  当前用户的关键词索引
+- `/reading`
+  当前用户的阅读库、PDF 上传入口、Reading Group 管理
+- `/reading/<paper_id>`
+  单篇论文阅读页，可查看分析、继续提问、保存笔记
+
+### 6.1 搜索
+
+你可以通过两种方式搜索：
+
+- 在首页直接使用自然语言 research
+- 在命令行运行关键词搜索
+
+Research 搜索结果会进入当前用户自己的 `searches/` 目录。
+
+### 6.2 PDF 上传
+
+`/reading` 页面支持：
+
+- 上传单篇 PDF
+- 批量上传多个 PDF
+- 自动去重
+- 自动匹配已有 citation
+- 自动创建阅读工作区
+
+当前网页 PDF 上传统一走 OpenClaw 链路。
+
+### 6.3 Reading Group
+
+在 `/reading` 页面可以：
+
+- 创建 Reading Group
+- 把文章加入 Group
+- 从 Group 中移除文章
+- 删除 Group
+
+### 6.4 阅读页
+
+在单篇阅读页中可以：
+
+- 查看论文元数据
+- 重新识别元数据
+- 重新生成分析
+- 基于全文问答
+- 保存 Notes
+- 删除问答历史
+
+## 7. 常用命令
+
+### 7.1 关键词搜索
 
 ```bash
 ./run_search.sh \
@@ -83,70 +182,52 @@ oc-conda-run -- python set_site_password.py --password 'your-password'
   --year-from 2020
 ```
 
-本地导入单个 PDF：
+说明：
+
+- `run_search.sh` 已固定走 `openclaw-analytics`
+- 同一天相同 `slug` 会自动避让为 `slug-2`、`slug-3`
+- 搜索结果会导出 CSV、JSON 和静态网页
+
+### 7.2 本地导入单个 PDF
 
 ```bash
-cd /home/ubuntu/tools/exScholar
-python -m app.openclaw.intake_cli --wait --json /absolute/path/to/paper.pdf
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+  --wait --json /absolute/path/to/paper.pdf
 ```
 
-一次导入多个 PDF：
+### 7.3 本地导入多个 PDF
 
 ```bash
-cd /home/ubuntu/tools/exScholar
-python -m app.openclaw.intake_cli --wait --json /path/a.pdf /path/b.pdf
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+  --wait --json /path/a.pdf /path/b.pdf
 ```
 
-## 网页使用
+说明：
 
-主要页面：
+- OpenClaw 默认用户现在是 `qioyo`
+- 非网页登录触发的 OpenClaw intake 和默认 CCF research 搜索会默认写入 `data/users/qioyo/`
 
-- `/`
-  搜索时间线
-- `/keywords`
-  所有关键词索引
-- `/reading`
-  阅读库，支持通过 OpenClaw 上传一个或多个 PDF、批量处理、筛选和分组
-- `/reading/<paper_id>`
-  单篇论文阅读页，可识别元数据、重新分析和问答
+## 8. 数据目录
 
-## OpenClaw PDF 链路
+多用户模式下，运行产物主要位于：
 
-当前这些入口都统一走 `app.openclaw`：
+```text
+data/users/<username>/
+```
 
-- `/reading` 页面唯一的 PDF 上传入口
-- 阅读页手动识别元数据
-- 阅读页开始分析 / 重新分析
-- 阅读页问答
-- `/reading` 一键补全未完成项
-- 本地 CLI
-- 微信附件触发
+每个用户目录中常见内容：
 
-这条链路会自动：
+- `searches/`
+- `expansions/`
+- `library/`
+- `reading/`
+- `openclaw_jobs/`
+- `research_jobs/`
+- `citation_library.sqlite3`
 
-- 按 PDF 哈希去重
-- 尝试匹配已有文献
-- 将识别出的重复文献合并到现有 citation
+## 9. 相关文档
 
-## 搜索并发
-
-网页 Research 和 OpenClaw `ccf-research` skill 共用同一套搜索并发控制：
-
-- 默认最多同时运行 `2` 个搜索任务
-- 超出的任务会自动排队
-- 同一天重复使用相同 `slug` 时，会自动生成 `-2`、`-3` 后缀，避免覆盖已有搜索结果
-
-## 数据目录
-
-运行产物主要位于 [data](/home/ubuntu/tools/exScholar/data)：
-
-- [searches](/home/ubuntu/tools/exScholar/data/searches)
-- [expansions](/home/ubuntu/tools/exScholar/data/expansions)
-- [library](/home/ubuntu/tools/exScholar/data/library)
-- [reading](/home/ubuntu/tools/exScholar/data/reading)
-- [citation_library.sqlite3](/home/ubuntu/tools/exScholar/data/citation_library.sqlite3)
-
-## 相关文档
-
-- [OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
-- [WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
+- 项目总览：[README.md](/home/ubuntu/tools/exScholar/README.md)
+- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
+- OpenClaw 补充说明：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
+- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)

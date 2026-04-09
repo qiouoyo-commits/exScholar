@@ -1,32 +1,104 @@
-# OpenClaw Addon
+# OpenClaw 链路说明
 
-这份文档说明 `exScholar` 当前使用的 OpenClaw 论文处理链路。
+这份文档说明 exScholar 当前使用的 OpenClaw PDF 处理链路，以及它和网页、CLI、阅读页之间的关系。
 
-真实代码位置：
+## 1. 相关代码位置
 
-- [app/openclaw/ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
-- [app/openclaw/intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
-- [app/site](/home/ubuntu/tools/exScholar/app/site)
+- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
+- [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
+- [jobs.py](/home/ubuntu/tools/exScholar/app/site/core/jobs.py)
+- [handler.py](/home/ubuntu/tools/exScholar/app/site/http/handler.py)
+- [reading.py](/home/ubuntu/tools/exScholar/app/site/core/reading.py)
 
-推荐命令：
+## 2. 当前链路覆盖范围
 
-```bash
-cd /home/ubuntu/tools/exScholar
-python -m app.openclaw.intake_cli --wait --json /absolute/path/to/paper.pdf
-```
+OpenClaw 当前统一接管以下入口：
 
-这条链路已经接管：
-
-- `/reading` 页面唯一的 PDF 上传入口
+- `/reading` 页面 PDF 上传
 - 阅读页元数据识别
-- 阅读页开始分析 / 重新分析
-- 阅读页问答
-- `/reading` 页面一键补全未完成项
+- 阅读页重新分析
+- 阅读页问答相关全文准备
+- 批量补全未完成项
 - 本地 CLI
 - 微信附件触发
 
-现在网页端只保留 `/api/openclaw-intake/upload` 这一个 PDF 上传接口。上传一个或多个 PDF 都走同一条链路，并保留：
+当前网页端只保留一个 PDF 上传接口：
+
+```text
+/api/openclaw-intake/upload
+```
+
+单篇和多篇 PDF 都走同一条链路。
+
+## 3. 核心行为
+
+OpenClaw intake 链路会自动完成：
 
 - PDF 哈希去重
 - citation 匹配
 - 重复文献合并
+- reading workspace 创建或刷新
+- 元数据抽取
+- 结构化分析生成
+
+## 4. 本地 CLI 用法
+
+项目当前统一使用 `openclaw-analytics` 环境。
+
+单个 PDF：
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+  --wait --json /absolute/path/to/paper.pdf
+```
+
+多个 PDF：
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+  --wait --json /path/a.pdf /path/b.pdf
+```
+
+## 5. 多用户模式下的数据写入
+
+exScholar 当前是多用户模式。
+
+网页登录场景下：
+
+- PDF 上传会写入当前登录用户自己的数据目录
+
+非网页登录触发的 OpenClaw 默认入口当前会写入：
+
+```text
+data/users/qioyo/
+```
+
+常见输出位置：
+
+- `data/users/<username>/library/`
+- `data/users/<username>/reading/`
+- `data/users/<username>/openclaw_jobs/`
+- `data/users/<username>/citation_library.sqlite3`
+
+## 6. 模型与环境
+
+OpenClaw 相关入口当前统一运行在：
+
+```text
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+```
+
+常见配置来源：
+
+- `OPENCLAW_INGEST_MODEL`
+- `OPENCLAW_INGEST_CHECK_MODEL`
+- `OPENCLAW_INGEST_FALLBACK_MODEL`
+- `OPENCLAW_CONFIG_PATH`
+- `OPENCLAW_ANALYTICS_PYTHON`
+
+## 7. 相关文档
+
+- 项目总览：[README.md](/home/ubuntu/tools/exScholar/README.md)
+- 用户说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
+- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
+- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
