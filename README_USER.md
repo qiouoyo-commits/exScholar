@@ -2,12 +2,17 @@
 
 这份文档面向部署和日常使用 exScholar 的用户，覆盖安装、账号配置、网页使用、CLI 使用和服务管理。
 
+为避免文档和单台机器路径绑定，下面统一使用两个占位写法：
+
+- `<repo-root>`：仓库根目录
+- `<openclaw-python>`：`openclaw-analytics` 环境中的 Python，可通过 `OPENCLAW_ANALYTICS_PYTHON` 指向
+
 ## 1. 项目能做什么
 
 exScholar 目前支持以下工作流：
 
 - 搜索 DBLP 论文并生成网页结果
-- 在网页中用自然语言发起 research 搜索
+- 在网页中用自然语言发起 research 搜索，并自动生成更贴合学术表达的检索词建议
 - 上传单篇或多篇 PDF
 - 自动识别元数据、去重、建 citation 库
 - 自动生成结构化论文分析
@@ -26,7 +31,7 @@ exScholar 目前支持以下工作流：
 项目当前统一使用：
 
 ```text
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+<openclaw-python>
 ```
 
 安装：
@@ -61,7 +66,7 @@ cp .env.local.example .env.local
 推荐确认：
 
 ```text
-OPENCLAW_ANALYTICS_PYTHON=/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+OPENCLAW_ANALYTICS_PYTHON=<openclaw-python>
 ```
 
 ## 4. 创建登录用户
@@ -71,7 +76,7 @@ OPENCLAW_ANALYTICS_PYTHON=/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/py
 创建用户：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python set_site_password.py \
+<openclaw-python> <repo-root>/set_site_password.py \
   --username admin \
   --password 'your-password'
 ```
@@ -138,6 +143,8 @@ http://<your-host>:38128/
 - 在命令行运行关键词搜索
 
 Research 搜索结果会进入当前用户自己的 `searches/` 目录。
+自然语言 research 当前会先生成建议检索词，再执行搜索；结果页会补充相关性等级和自动标签，方便快速筛选高相关论文。
+如果你在 OpenClaw 对话里做普通主题搜论文，这条链也会被 `ccf-research` skill 复用。
 
 ### 6.2 PDF 上传
 
@@ -202,21 +209,21 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 ### 7.2 本地导入单个 PDF
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /absolute/path/to/paper.pdf
 ```
 
 ### 7.3 本地导入多个 PDF
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /path/a.pdf /path/b.pdf
 ```
 
 ### 7.4 图片找论文
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+<openclaw-python> -m app.openclaw.picsearch_cli \
   --wait --json /absolute/path/to/paper-screenshot.png
 ```
 
@@ -224,8 +231,25 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 
 - OpenClaw 默认用户现在是 `qioyo`
 - 非网页登录触发的 OpenClaw intake 和默认 CCF research 搜索会默认写入 `data/users/qioyo/`
-- 图片找论文会把结果加入当天 `webreading` timeline，关键词固定为 `picsearch`
-- `picsearch` 当前顺序是：图片识别 -> DBLP -> 从前 20 条 web 结果里优先筛官方论文链接 -> DOI fallback
+- 图片找论文会把结果加入当天 `Picsearch` timeline
+- 文本补链接会把结果加入当天 `Textsearch` timeline
+- `picsearch` 除了单篇论文截图，也支持 Google Scholar 页面截图；如果识别到页面中有多篇论文标题，会自动逐条补链接
+- `picsearch` 和 `textsearch` 现在都会在补链接后尽量继续抓取摘要，因此返回会比纯补链接稍慢一些
+- 从 `Picsearch` / `Textsearch` 结果加入深度阅读时，如果你不手动选 Group，系统会优先按论文主题自动创建或复用一个更合适的 Reading Group
+
+### 7.5 文本补链接
+
+```bash
+<openclaw-python> -m app.openclaw.textsearch_cli \
+  --wait --json "Paper Title A\nPaper Title B"
+```
+
+说明：
+
+- OpenClaw 对话里推荐主口令使用 `textsearch`
+- 支持单个标题或多个标题
+- 多个标题默认按换行拆分
+- 旧的 `titlesearch` 名称已经废弃，当前统一使用 `textsearch`
 
 ## 8. 数据目录
 

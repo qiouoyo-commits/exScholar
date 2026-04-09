@@ -4,10 +4,10 @@ import json
 import mimetypes
 import os
 import sys
-import time
 from pathlib import Path
 
-from app.site.core import ensure_db, load_openclaw_job, openclaw_default_username, start_openclaw_picsearch_job, user_context
+from app.openclaw._cli_utils import wait_for_job
+from app.site.core import ensure_db, openclaw_default_username, start_openclaw_picsearch_job, user_context
 
 
 class LocalImageUpload:
@@ -26,7 +26,7 @@ class LocalImageUpload:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="把一张或多张论文截图交给 OpenClaw 识别，并把结果加入当天 webreading timeline。",
+        description="把一张或多张论文截图交给 OpenClaw 识别，并把结果加入当天 Picsearch timeline。",
     )
     parser.add_argument("images", nargs="+", help="一个或多个本地图片绝对路径或可展开路径")
     parser.add_argument("--wait", action="store_true", help="等待后台任务完成后再返回")
@@ -47,26 +47,6 @@ def ingest_paths(paths: list[Path]) -> dict:
     finally:
         for item in uploads:
             item.close()
-
-
-def wait_for_job(job_id: str, *, poll_interval: float = 2.0, timeout: float = 1800.0) -> dict:
-    deadline = time.time() + timeout
-    missing_streak = 0
-    while time.time() < deadline:
-        job = load_openclaw_job(job_id)
-        if not job:
-            missing_streak += 1
-            if missing_streak >= 5:
-                raise RuntimeError(f"任务不存在: {job_id}")
-            time.sleep(min(poll_interval, 0.5))
-            continue
-        missing_streak = 0
-        if not job.get("running"):
-            return job
-        time.sleep(poll_interval)
-    raise TimeoutError(f"等待任务超时: {job_id}")
-
-
 def main() -> int:
     args = build_parser().parse_args()
     username = openclaw_default_username()
@@ -93,13 +73,26 @@ def main() -> int:
         if timeline:
             print(f"timeline={timeline}")
         for item in job.get("items") or []:
-            paper = item.get("paper") or {}
-            url = paper.get("url") or ((paper.get("ee") or [""])[0] if isinstance(paper.get("ee"), list) else "")
-            print(f"- {(item.get('status') or '')}: {paper.get('title') or item.get('filename') or ''}")
-            if item.get("source"):
-                print(f"  source={item['source']}")
-            if url:
-                print(f"  url={url}")
+            papers = item.get("papers") or []
+            if papers:
+                mode = item.get("mode") or ""
+                if mode == "scholar_list":
+                    print(f"- {(item.get('status') or '')}: {item.get('filename') or ''} -> detected Scholar page, linked {len(papers)} paper(s)")
+                else:
+                    print(f"- {(item.get('status') or '')}: {item.get('filename') or ''} -> {len(papers)} result(s)")
+                for paper in papers:
+                    url = paper.get("url") or ((paper.get("ee") or [""])[0] if isinstance(paper.get("ee"), list) else "")
+                    print(f"  title={paper.get('title') or ''}")
+                    if url:
+                        print(f"  url={url}")
+            else:
+                paper = item.get("paper") or {}
+                url = paper.get("url") or ((paper.get("ee") or [""])[0] if isinstance(paper.get("ee"), list) else "")
+                print(f"- {(item.get('status') or '')}: {paper.get('title') or item.get('filename') or ''}")
+                if item.get("source"):
+                    print(f"  source={item['source']}")
+                if url:
+                    print(f"  url={url}")
             if item.get("error"):
                 print(f"  error={item['error']}")
     return 0

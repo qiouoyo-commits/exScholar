@@ -4,6 +4,27 @@ from .base import *
 from .storage import *
 
 
+SYSTEM_TAG_KEYWORDS = {
+    "picsearch",
+    "textsearch",
+    "titlesearch",
+    "citation",
+    "reference",
+    "deep-reading-upload",
+}
+
+MAX_AUTO_TAG_WORDS = 8
+MAX_AUTO_TAG_CHARS = 80
+AUTO_TAG_PREFIXES = (
+    "specifically ",
+    "especially ",
+    "including ",
+    "such as ",
+    "focused on ",
+    "focusing on ",
+)
+
+
 def list_keyword_entries() -> list[dict]:
     grouped: dict[str, dict] = {}
     for out_dir in iter_search_dirs():
@@ -120,11 +141,13 @@ def get_source_matched_kw(meta: dict) -> str:
 def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha256: str = None):
     ensure_db()
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    default_tags = (
-        ", ".join(paper.get("tags", []))
-        if isinstance(paper.get("tags"), list)
-        else (paper.get("tags") or paper.get("matched_kw") or "")
+    default_tags = merge_tag_values(
+        paper.get("tags", [] if isinstance(paper.get("tags"), list) else None),
+        paper.get("tags") if not isinstance(paper.get("tags"), list) else "",
+        normalize_generated_tags(paper.get("autotags") or []),
+        paper.get("matched_kw") or "",
     )
+    normalized_tags = normalize_tags(default_tags)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -139,7 +162,6 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha
                 venue=excluded.venue,
                 abstract=excluded.abstract,
                 matched_kw=excluded.matched_kw,
-                tags=COALESCE(NULLIF(citations.tags, ''), excluded.tags),
                 source_search_slug=excluded.source_search_slug,
                 source_csv_index=excluded.source_csv_index,
                 pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path),
@@ -154,7 +176,7 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha
                 paper.get("venue", ""),
                 paper.get("content", ""),
                 paper.get("matched_kw", ""),
-                normalize_tags(default_tags),
+                normalized_tags,
                 search_slug,
                 paper.get("csv_index"),
                 pdf_path,
@@ -175,7 +197,6 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha
                     venue=excluded.venue,
                     abstract=excluded.abstract,
                     matched_kw=excluded.matched_kw,
-                    tags=COALESCE(NULLIF(citations.tags, ''), excluded.tags),
                     source_search_slug=excluded.source_search_slug,
                     source_csv_index=excluded.source_csv_index,
                     pdf_path=COALESCE(excluded.pdf_path, citations.pdf_path),
@@ -190,7 +211,7 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha
                     paper.get("venue", ""),
                     paper.get("content", ""),
                     paper.get("matched_kw", ""),
-                    normalize_tags(default_tags),
+                    normalized_tags,
                     search_slug,
                     paper.get("csv_index"),
                     pdf_path,
@@ -209,6 +230,13 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha
                 (paper.get("title", ""), str(paper.get("year", "") or "")),
             ).fetchone()
             citation_id = row[0] if row else None
+        if citation_id and normalized_tags:
+            existing_row = conn.execute("SELECT tags FROM citations WHERE id = ?", (citation_id,)).fetchone()
+            existing_tags = existing_row[0] if existing_row else ""
+            conn.execute(
+                "UPDATE citations SET tags = ? WHERE id = ?",
+                (merge_tag_values(existing_tags, normalized_tags), citation_id),
+            )
         conn.commit()
         return citation_id
 
@@ -291,11 +319,53 @@ def normalize_tags(raw) -> str:
     for part in parts:
         tag = " ".join(str(part).strip().split())
         low = tag.lower()
-        if not tag or low in seen:
+        if not tag or low in seen or low in SYSTEM_TAG_KEYWORDS:
             continue
         seen.add(low)
         cleaned.append(tag)
     return ", ".join(cleaned)
+
+
+def merge_tag_values(*values) -> str:
+    merged = []
+    for value in values:
+        if isinstance(value, list):
+            merged.extend(str(item).strip() for item in value if str(item).strip())
+            continue
+        text = str(value or "").replace(";", ",")
+        merged.extend(part.strip() for part in text.split(",") if part.strip())
+    return normalize_tags(merged)
+
+
+def normalize_generated_tags(raw) -> list[str]:
+    if isinstance(raw, str):
+        parts = [raw]
+    elif isinstance(raw, list):
+        parts = raw
+    else:
+        parts = []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in parts:
+        chunks = re.split(r"[;,/|，；、]+|\s+\band\b\s+", str(item or ""), flags=re.IGNORECASE)
+        for chunk in chunks:
+            value = " ".join(str(chunk).strip().split()).strip(" .;:，；、")
+            lowered = value.lower()
+            for prefix in AUTO_TAG_PREFIXES:
+                if lowered.startswith(prefix):
+                    value = value[len(prefix):].strip(" .;:，；、")
+                    lowered = value.lower()
+                    break
+            low = value.lower()
+            if not value or low in seen or low in SYSTEM_TAG_KEYWORDS:
+                continue
+            if len(value) > MAX_AUTO_TAG_CHARS:
+                continue
+            if len(value.split()) > MAX_AUTO_TAG_WORDS:
+                continue
+            seen.add(low)
+            cleaned.append(value)
+    return cleaned
 
 
 def normalize_doi(raw: str) -> str:
@@ -311,6 +381,17 @@ def update_citation_tags(citation_id: int, tags: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE citations SET tags = ? WHERE id = ?", (normalize_tags(tags), citation_id))
         conn.commit()
+
+
+def merge_metadata_keywords_into_citation(citation_id: int, metadata: dict):
+    citation = get_citation_by_id(citation_id)
+    if not citation:
+        return
+    generated = normalize_generated_tags(metadata.get("keywords") or [])
+    if not generated:
+        return
+    merged_tags = merge_tag_values(citation.get("tags") or "", list(generated))
+    update_citation_tags(citation_id, merged_tags)
 
 
 def extract_theme_keywords(theme_text: str) -> list[str]:
@@ -334,12 +415,10 @@ def merge_analysis_theme_into_citation(paper_id: str, analysis_payload: dict):
     if not citation:
         return
     overview = (((analysis_payload or {}).get("modules") or {}).get("overview") or {}).get("data") or {}
-    theme_words = extract_theme_keywords(overview.get("research_theme") or "")
+    theme_words = normalize_generated_tags(extract_theme_keywords(overview.get("research_theme") or ""))
     if not theme_words:
         return
-    merged_tags = normalize_tags(
-        [part.strip() for part in (citation.get("tags") or "").split(",") if part.strip()] + theme_words
-    )
+    merged_tags = merge_tag_values(citation.get("tags") or "", theme_words)
     update_citation_tags(int(citation["id"]), merged_tags)
     refreshed = get_citation_by_id(int(citation["id"])) or citation
     workspace = reading_workspace_path(paper_id)
@@ -389,6 +468,7 @@ def update_citation_metadata(citation_id: int, metadata: dict):
             ),
         )
         conn.commit()
+    merge_metadata_keywords_into_citation(citation_id, metadata)
 
 
 def update_citation_reading_paper_id(citation_id: int, paper_id: str):
@@ -469,6 +549,47 @@ def create_reading_group(name: str, description: str = ""):
         )
         conn.commit()
         return cursor.lastrowid
+
+
+def find_reading_group_by_name(name: str):
+    normalized = " ".join(str(name or "").split())
+    if not normalized:
+        return None
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, name, description, created_at
+            FROM reading_groups
+            WHERE lower(name) = lower(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (normalized,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_or_create_reading_group(name: str, description: str = ""):
+    normalized = " ".join(str(name or "").split())
+    if not normalized:
+        raise ValueError("Group 名称不能为空")
+    existing = find_reading_group_by_name(normalized)
+    if existing:
+        return existing
+    try:
+        group_id = create_reading_group(normalized, description)
+    except sqlite3.IntegrityError:
+        existing = find_reading_group_by_name(normalized)
+        if existing:
+            return existing
+        raise
+    return {
+        "id": group_id,
+        "name": normalized,
+        "description": description.strip(),
+    }
 
 
 def delete_reading_group(group_id: int):

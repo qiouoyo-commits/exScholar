@@ -4,10 +4,10 @@ import json
 import mimetypes
 import os
 import sys
-import time
 from pathlib import Path
 
-from app.site.core import ensure_db, load_openclaw_job, openclaw_default_username, start_openclaw_intake_job, user_context
+from app.openclaw._cli_utils import wait_for_job
+from app.site.core import ensure_db, openclaw_default_username, start_openclaw_intake_job, user_context
 
 
 class LocalPDFUpload:
@@ -37,26 +37,6 @@ def ingest_paths(paths: list[Path], *, group_id: int | None = None) -> dict:
     finally:
         for item in uploads:
             item.close()
-
-
-def wait_for_job(job_id: str, *, poll_interval: float = 2.0, timeout: float = 1800.0) -> dict:
-    deadline = time.time() + timeout
-    missing_streak = 0
-    while time.time() < deadline:
-        job = load_openclaw_job(job_id)
-        if not job:
-            missing_streak += 1
-            if missing_streak >= 5:
-                raise RuntimeError(f"任务不存在: {job_id}")
-            time.sleep(min(poll_interval, 0.5))
-            continue
-        missing_streak = 0
-        if not job.get("running"):
-            return job
-        time.sleep(poll_interval)
-    raise TimeoutError(f"等待任务超时: {job_id}")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="把一个或多个本地 PDF 送进 exScholar 的 OpenClaw 附加 intake 流程。",

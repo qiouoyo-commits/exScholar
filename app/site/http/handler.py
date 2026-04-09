@@ -9,6 +9,49 @@ from ..core import *
 from ..ui.pages import *
 
 
+def _load_search_meta_for_slug(search_slug: str) -> dict:
+    normalized = " ".join(str(search_slug or "").split()).strip().strip("/")
+    if not normalized:
+        return {}
+    searches_dir = Path(current_searches_dir())
+    direct = searches_dir / normalized / "search.json"
+    if direct.exists():
+        return read_json_file(direct, {}) or {}
+    matches: list[tuple[float, dict]] = []
+    for meta_path in searches_dir.glob("*/search.json"):
+        payload = read_json_file(meta_path, {}) or {}
+        if payload.get("output_slug") == normalized or payload.get("slug") == normalized:
+            try:
+                score = meta_path.stat().st_mtime
+            except Exception:
+                score = 0.0
+            matches.append((score, payload))
+    if not matches:
+        return {}
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[0][1]
+
+
+def _resolve_search_group_name(search_slug: str, paper: dict | None = None) -> str:
+    meta = _load_search_meta_for_slug(search_slug)
+    source_slug = " ".join(str(meta.get("slug") or "").split())
+    source_keywords = [str(item or "").strip().lower() for item in (meta.get("keywords") or []) if str(item or "").strip()]
+    if source_slug in {PICSEARCH_SLUG, TEXTSEARCH_SLUG} or any(item in {PICSEARCH_KEYWORD, TEXTSEARCH_KEYWORD} for item in source_keywords):
+        derived = suggest_lookup_group_name(paper or {}, keyword=(paper or {}).get("matched_kw") or (source_keywords[0] if source_keywords else ""))
+        if derived:
+            return derived
+    if meta:
+        name = " ".join(str(meta.get("group_name") or meta.get("summary_name") or "").split())
+        if name:
+            return name
+    fallback = build_search_summary_name(
+        (paper or {}).get("matched_kw") or "",
+        (paper or {}).get("title") or "",
+        str(search_slug or "").replace("-", " "),
+    )
+    return fallback
+
+
 @dataclass
 class UploadedFormFile:
     name: str
@@ -120,7 +163,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         token = jar.get(SESSION_COOKIE)
         if not token:
             return None
-        return SESSIONS.get(token.value)
+        return get_session(token.value)
 
     def current_username(self) -> str:
         session = self.current_session() or {}
@@ -165,8 +208,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     self.send_html(build_login_html("用户名或密码错误，请重试。"), status=403)
                 return True
 
-            token = secrets.token_urlsafe(32)
-            SESSIONS[token] = {"created_at": time.time(), "username": user["username"]}
+            token, _session = create_session(user["username"])
             headers = {
                 "Set-Cookie": f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax",
             }
@@ -199,7 +241,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             jar.load(self.headers.get("Cookie", ""))
             token = jar.get(SESSION_COOKIE)
             if token:
-                SESSIONS.pop(token.value, None)
+                delete_session(token.value)
             self.send_json(
                 {"ok": True},
                 extra_headers={"Set-Cookie": f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"},
@@ -242,6 +284,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     pdf_path = existing_pdf_path
                     pdf_sha256 = (citation.get("pdf_sha256") or "").strip()
             reading_url = ""
+            assigned_group = None
             if group_id_raw not in (None, ""):
                 try:
                     group_id = int(group_id_raw)
@@ -253,6 +296,15 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     return True
                 if citation_id:
                     add_citation_to_group(citation_id, group_id)
+                    assigned_group = next((item for item in list_reading_groups() if int(item.get("id") or 0) == group_id), None)
+            elif citation_id and search_slug:
+                group_name = _resolve_search_group_name(search_slug, paper)
+                if group_name:
+                    assigned_group = get_or_create_reading_group(
+                        group_name,
+                        f"自动为搜索「{group_name}」创建的深度阅读分组。",
+                    )
+                    add_citation_to_group(citation_id, int(assigned_group["id"]))
             refresh_job = None
             if pdf_path and citation_id:
                 reading = ensure_reading_workspace_for_citation(citation_id)
@@ -275,6 +327,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     "reading_url": reading_url,
                     "job_id": (refresh_job or {}).get("id") or "",
                     "job": refresh_job or {},
+                    "group": assigned_group or {},
                 }
             )
             return True
@@ -453,7 +506,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     "ok": True,
                     "job_id": job["id"],
                     "job": job,
-                    "message": f"已提交 {len(job.get('items') or [])} 张图片到 picsearch 队列，系统会依次识别并追加到今日 webreading timeline。",
+                    "message": f"已提交 {len(job.get('items') or [])} 张图片到 picsearch 队列，系统会依次识别并追加到今日 Picsearch timeline。",
                 }
             )
             return True
@@ -795,8 +848,11 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
     # HTTP verb handlers
     def do_GET(self):
-        with user_context(self.current_username()):
-            self._do_GET_impl()
+        try:
+            with user_context(self.current_username()):
+                self._do_GET_impl()
+        except Exception as exc:
+            self.handle_server_error(exc)
 
     def _do_GET_impl(self):
         if self.path == "/api/auth/status":

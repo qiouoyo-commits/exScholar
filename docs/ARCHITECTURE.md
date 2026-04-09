@@ -150,11 +150,13 @@ data/users/<username>/
 其流程大致为：
 
 1. 前端提交 research prompt
-2. 后端生成或校验搜索方案
-3. 在后台线程中创建 job
-4. 使用 `OPENCLAW_ANALYTICS_PYTHON` 启动 `app.pipeline.search`
-5. 解析 stdout，实时回写 job 状态
-6. 将结果路径映射为站点可访问 URL
+2. 后端先生成一版更贴合学术表达的检索词建议
+3. 基于建议词生成或校验搜索方案
+4. 在后台线程中创建 job
+5. 使用 `OPENCLAW_ANALYTICS_PYTHON` 启动 `app.pipeline.search`
+6. 搜索完成后结合标题和摘要做相关性复核与自动标签
+7. 解析 stdout，实时回写 job 状态
+8. 将结果路径映射为站点可访问 URL
 
 ### 6.3 并发控制
 

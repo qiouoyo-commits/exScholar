@@ -3,10 +3,13 @@
 from app.openclaw import (
     DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL,
     DEFAULT_OPENCLAW_IMAGE_MODEL,
+    generate_keywords_from_metadata,
     resolve_paper_lookup_from_image,
+    resolve_paper_lookups_from_image,
+    resolve_paper_lookup_from_title,
 )
 
-from .picsearch import append_picsearch_timeline
+from .picsearch import append_picsearch_timeline, append_textsearch_timeline, append_titlesearch_timeline
 from .shared import *
 
 
@@ -288,6 +291,12 @@ def process_openclaw_intake_item(job_id: str, index: int):
             filename=pdf_abs.name,
             model_id=OPENCLAW_INGEST_MODEL,
             reviewer_model_id=OPENCLAW_INGEST_CHECK_MODEL,
+            fallback_model_id=OPENCLAW_INGEST_FALLBACK_MODEL,
+            config_path=OPENCLAW_CONFIG_PATH,
+        )
+        metadata["keywords"] = generate_keywords_from_metadata(
+            metadata,
+            model_id=OPENCLAW_INGEST_MODEL,
             fallback_model_id=OPENCLAW_INGEST_FALLBACK_MODEL,
             config_path=OPENCLAW_CONFIG_PATH,
         )
@@ -584,19 +593,52 @@ def process_openclaw_picsearch_item(job_id: str, index: int):
             payload["current_title"] = item_payload.get("filename") or item_payload.get("title") or ""
         update_openclaw_job(job_id, mutate)
 
+    def enrich_from_timeline(records: list[dict], paper: dict) -> dict:
+        if not paper:
+            return {}
+        target_doi = str(paper.get("doi") or "").strip().lower()
+        target_title = " ".join(str(paper.get("title") or "").strip().lower().split())
+        for item in records or []:
+            item_doi = str(item.get("doi") or "").strip().lower()
+            item_title = " ".join(str(item.get("title") or "").strip().lower().split())
+            if target_doi and item_doi == target_doi:
+                return dict(item)
+            if target_title and item_title == target_title:
+                return dict(item)
+        return dict(paper)
+
     update_step("recognizing", "正在识别图片中的论文信息。")
-    result = resolve_paper_lookup_from_image(image_abs)
-    update_step("updating_timeline", "正在写入今日 webreading timeline。")
-    timeline = append_picsearch_timeline(result["record"])
+    batch_result = resolve_paper_lookups_from_image(image_abs)
+    update_step("updating_timeline", "正在写入今日 Picsearch timeline。")
+    papers = []
+    latest_timeline = {}
+    sources = []
+    result_records = []
+    for result in batch_result.get("results") or []:
+        record = result.get("record") or {}
+        if record:
+            result_records.append(record)
+            papers.append(record)
+        if result.get("source"):
+            sources.append(result.get("source") or "")
+    if result_records:
+        latest_timeline = append_picsearch_timeline(result_records)
+        enriched_records = latest_timeline.get("raw_records") or []
+        if enriched_records:
+            papers = [enrich_from_timeline(enriched_records, paper) for paper in papers]
     try:
         image_abs.unlink(missing_ok=True)
     except Exception:
         pass
+    first_paper = papers[0] if papers else {}
     return {
-        "paper": result.get("record") or {},
-        "candidate": result.get("candidate") or {},
-        "source": result.get("source") or "",
-        "timeline": timeline,
+        "paper": first_paper,
+        "papers": papers,
+        "candidate": batch_result.get("candidate") or {},
+        "source": sources[0] if sources else "",
+        "sources": sources,
+        "timeline": latest_timeline,
+        "mode": batch_result.get("mode") or "single_paper",
     }
 
 
@@ -610,6 +652,8 @@ def _run_openclaw_picsearch_job_inner(job_id: str):
     job = load_openclaw_job(job_id) or {}
     any_failed = False
     latest_timeline = {}
+    scholar_list_hits = 0
+    scholar_list_papers = 0
     for index, _ in enumerate(job.get("items") or []):
         def mark_running(payload):
             payload["current_index"] = index
@@ -621,6 +665,9 @@ def _run_openclaw_picsearch_job_inner(job_id: str):
         try:
             result = process_openclaw_picsearch_item(job_id, index)
             latest_timeline = result.get("timeline") or latest_timeline
+            if (result.get("mode") or "") == "scholar_list":
+                scholar_list_hits += 1
+                scholar_list_papers += len(result.get("papers") or [])
 
             def mark_done(payload):
                 item = payload["items"][index]
@@ -628,11 +675,17 @@ def _run_openclaw_picsearch_job_inner(job_id: str):
                 item["status"] = "completed"
                 item["title"] = paper.get("title") or item.get("title") or ""
                 item["paper"] = paper
+                item["papers"] = result.get("papers") or ([paper] if paper else [])
                 item["candidate"] = result.get("candidate") or {}
                 item["source"] = result.get("source") or ""
+                item["sources"] = result.get("sources") or []
+                item["mode"] = result.get("mode") or "single_paper"
                 item["timeline"] = result.get("timeline") or {}
                 item["current_step"] = "completed"
-                item["step_message"] = "该图片已处理完成。"
+                if (result.get("mode") or "") == "scholar_list":
+                    item["step_message"] = f"该图片已处理完成，识别出 {len(result.get('papers') or [])} 篇论文。"
+                else:
+                    item["step_message"] = "该图片已处理完成。"
 
             update_openclaw_job(job_id, mark_done)
         except Exception as exc:
@@ -650,7 +703,13 @@ def _run_openclaw_picsearch_job_inner(job_id: str):
     def finalize(payload):
         payload["running"] = False
         payload["status"] = "completed_with_errors" if any_failed else "completed"
-        payload["message"] = "图片找论文任务完成。" if not any_failed else "图片找论文任务完成，但有部分图片失败。"
+        if scholar_list_hits:
+            base_message = f"图片找论文任务完成；检测到 {scholar_list_hits} 张 Scholar 页面截图，共补链 {scholar_list_papers} 篇论文。"
+        else:
+            base_message = "图片找论文任务完成。"
+        if any_failed:
+            base_message += " 但有部分图片失败。"
+        payload["message"] = base_message
         payload["finished_at"] = utc_now()
         payload["current_index"] = None
         payload["current_title"] = ""
@@ -719,6 +778,186 @@ def start_openclaw_picsearch_job(files: list[dict]) -> dict:
     thread = threading.Thread(target=run_openclaw_picsearch_job, args=(job["id"], job.get("username") or ""), daemon=True)
     thread.start()
     return load_openclaw_job(job["id"]) or job
+
+
+def process_openclaw_textsearch_item(job_id: str, index: int):
+    job = load_openclaw_job(job_id)
+    if not job:
+        raise ValueError("OpenClaw 文本找论文任务不存在")
+    item = (job.get("items") or [])[index]
+    title = (item.get("title_query") or "").strip()
+    if not title:
+        raise ValueError("任务缺少论文标题")
+
+    def update_step(step: str, message: str):
+        def mutate(payload):
+            item_payload = payload["items"][index]
+            item_payload["current_step"] = step
+            item_payload["step_message"] = message
+            payload["message"] = message
+            payload["current_title"] = item_payload.get("title_query") or item_payload.get("title") or ""
+        update_openclaw_job(job_id, mutate)
+
+    def enrich_from_timeline(records: list[dict], paper: dict) -> dict:
+        if not paper:
+            return {}
+        target_doi = str(paper.get("doi") or "").strip().lower()
+        target_title = " ".join(str(paper.get("title") or "").strip().lower().split())
+        for item in records or []:
+            item_doi = str(item.get("doi") or "").strip().lower()
+            item_title = " ".join(str(item.get("title") or "").strip().lower().split())
+            if target_doi and item_doi == target_doi:
+                return dict(item)
+            if target_title and item_title == target_title:
+                return dict(item)
+        return dict(paper)
+
+    update_step("resolving", "正在根据标题匹配论文链接。")
+    result = resolve_paper_lookup_from_title(title)
+    update_step("updating_timeline", "正在写入今日 Textsearch timeline。")
+    timeline = append_textsearch_timeline(result["record"])
+    enriched = enrich_from_timeline(timeline.get("raw_records") or [], result.get("record") or {})
+    return {
+        "paper": enriched,
+        "candidate": result.get("candidate") or {},
+        "source": result.get("source") or "",
+        "timeline": timeline,
+    }
+
+
+def process_openclaw_titlesearch_item(job_id: str, index: int):
+    return process_openclaw_textsearch_item(job_id, index)
+
+
+def run_openclaw_textsearch_job(job_id: str, username: str = ""):
+    with user_context(username):
+        _run_openclaw_textsearch_job_inner(job_id)
+
+
+def run_openclaw_titlesearch_job(job_id: str, username: str = ""):
+    return run_openclaw_textsearch_job(job_id, username)
+
+
+def _run_openclaw_textsearch_job_inner(job_id: str):
+    update_openclaw_job(job_id, lambda job: job.update({"status": "running", "running": True, "message": "OpenClaw 文本找论文任务进行中。"}))
+    job = load_openclaw_job(job_id) or {}
+    any_failed = False
+    latest_timeline = {}
+    for index, _ in enumerate(job.get("items") or []):
+        def mark_running(payload):
+            payload["current_index"] = index
+            payload["current_title"] = (payload["items"][index].get("title_query") or payload["items"][index].get("title") or "")
+            payload["items"][index]["status"] = "running"
+            payload["items"][index]["error"] = ""
+
+        update_openclaw_job(job_id, mark_running)
+        try:
+            result = process_openclaw_textsearch_item(job_id, index)
+            latest_timeline = result.get("timeline") or latest_timeline
+
+            def mark_done(payload):
+                item = payload["items"][index]
+                paper = result.get("paper") or {}
+                item["status"] = "completed"
+                item["title"] = paper.get("title") or item.get("title_query") or ""
+                item["paper"] = paper
+                item["candidate"] = result.get("candidate") or {}
+                item["source"] = result.get("source") or ""
+                item["timeline"] = result.get("timeline") or {}
+                item["current_step"] = "completed"
+                item["step_message"] = "该标题已处理完成。"
+
+            update_openclaw_job(job_id, mark_done)
+        except Exception as exc:
+            any_failed = True
+
+            def mark_failed(payload):
+                item = payload["items"][index]
+                item["status"] = "failed"
+                item["error"] = str(exc)
+                item["current_step"] = "failed"
+                item["step_message"] = str(exc)
+
+            update_openclaw_job(job_id, mark_failed)
+
+    def finalize(payload):
+        payload["running"] = False
+        payload["status"] = "completed_with_errors" if any_failed else "completed"
+        payload["message"] = "文本找论文任务完成。" if not any_failed else "文本找论文任务完成，但有部分条目失败。"
+        payload["finished_at"] = utc_now()
+        payload["current_index"] = None
+        payload["current_title"] = ""
+        if latest_timeline:
+            payload["links"] = {
+                "timeline": latest_timeline.get("relative_site_url") or "",
+                "timeline_absolute": latest_timeline.get("site_url") or "",
+            }
+
+    update_openclaw_job(job_id, finalize)
+
+
+def _build_textsearch_job(title_items: list[str], *, kind: str, message_prefix: str) -> dict:
+    items = []
+    for raw in title_items:
+        title = " ".join(str(raw or "").split())
+        if not title:
+            continue
+        items.append(
+            {
+                "title_query": title,
+                "status": "queued",
+                "current_step": "queued",
+                "step_message": "等待进入标题匹配队列。",
+                "title": "",
+                "source": "",
+                "paper": {},
+                "candidate": {},
+                "timeline": {},
+                "error": "",
+            }
+        )
+    if not items:
+        raise ValueError("请至少提供一个论文标题")
+
+    job = {
+        "id": build_openclaw_job_id(),
+        "username": current_username(),
+        "kind": kind,
+        "status": "queued",
+        "running": True,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "finished_at": "",
+        "message": message_prefix,
+        "current_index": None,
+        "current_title": "",
+        "links": {},
+        "items": items,
+    }
+    save_openclaw_job(job)
+    thread = threading.Thread(target=run_openclaw_textsearch_job, args=(job["id"], job.get("username") or ""), daemon=True)
+    thread.start()
+    return load_openclaw_job(job["id"]) or job
+
+
+def start_openclaw_textsearch_job(texts: list[str]) -> dict:
+    return _build_textsearch_job(
+        texts,
+        kind="openclaw_batch_textsearch",
+        message_prefix="文本找论文任务已提交，等待后台处理。",
+    )
+
+
+def _run_openclaw_titlesearch_job_inner(job_id: str):
+    return _run_openclaw_textsearch_job_inner(job_id)
+
+
+def start_openclaw_titlesearch_job(titles: list[str]) -> dict:
+    return _build_textsearch_job(
+        titles,
+        kind="openclaw_batch_titlesearch",
+        message_prefix="标题找论文任务已提交，等待后台处理。",
+    )
 
 
 # Reading batch maintenance

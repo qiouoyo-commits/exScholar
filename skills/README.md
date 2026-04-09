@@ -6,19 +6,33 @@
 
 - [ccf-research/SKILL.md](/home/ubuntu/tools/exScholar/skills/ccf-research/SKILL.md)
   - 用途：按研究主题搜索论文，生成搜索结果网页、CSV、JSON
-  - 典型触发：普通“找论文 / 查论文 / 搜论文 / 读文献”
+  - 主要触发：普通“找论文 / 查论文 / 搜论文 / 读文献”
+  - 当前链路：智能建议检索词 -> 生成 research plan -> 执行搜索 -> 标题/摘要相关性复核 -> autotag
 - [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
-  - 用途：从论文截图中识别论文并加入当天 `webreading` timeline
-  - 典型触发：用户明确说出魔法词 `picsearch`
+  - 用途：从论文截图中识别论文并加入当天 `Picsearch` timeline，也支持 Google Scholar 页面截图批量补链接
+  - 主口令：`picsearch`
   - 交互方式：先发 `picsearch` 开启收图模式，发完图片后再回复“开始”
-  - 查找顺序：图片识别 -> DBLP -> 官方 web 候选筛选 -> DOI fallback
+  - 查找顺序：图片识别或 Scholar 页面识别 -> DBLP -> 官方 web 候选筛选 -> DOI fallback
+  - 结果补全：补链接后尽量继续抓取摘要
   - 返回格式：汇总成功/失败数量、timeline 链接、逐张结果
+- [textsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/textsearch/SKILL.md)
+  - 用途：根据一个标题或多个标题批量补链接并加入当天 `Textsearch` timeline
+  - 主口令：`textsearch`
+  - 交互方式：先发 `textsearch` 开启文本收集模式，发完标题后再回复“开始”
+  - 查找顺序：标题匹配 -> DBLP -> 官方 web 候选筛选 -> DOI fallback
+  - 结果补全：补链接后尽量继续抓取摘要
+  - 返回格式：汇总成功/失败数量、timeline 链接、逐条结果
 
 边界约定：
 
 - 普通论文搜索需求走 `ccf-research`
 - 图片 / 截图找论文只走 `picsearch`
+- 明确按标题批量补链接时走 `textsearch`
 - `picsearch` 不应覆盖普通“找论文”请求
+- 旧的 `titlesearch` 名称已经废弃，当前统一使用 `textsearch`
+- `ccf-research` 的网页端 research 和 OpenClaw skill 现在共用同一条智能搜索链路
+- `picsearch` / `textsearch` 的 timeline 名只表示来源；加入深度阅读时会按论文主题自动生成或复用更合适的 Reading Group 名
+- 推荐记忆方式：普通搜论文用 `ccf-research` 语义触发；图片找论文用 `picsearch`；文本补链接用 `textsearch`
 
 运行环境：
 

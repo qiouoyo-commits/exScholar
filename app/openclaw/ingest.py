@@ -2,6 +2,7 @@
 import base64
 import io
 import json
+import re
 from pathlib import Path
 
 import requests
@@ -18,6 +19,7 @@ DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL = "joybuilder-plan/DeepSeek-V3.2"
 DEFAULT_RESEARCH_TOP = 100
 ALLOWED_RESEARCH_VENUES = [
     "chi", "uist", "cscw", "ubicomp",
+    "dis", "nime", "iui", "tei", "mobilehci", "assets", "imwut", "its", "hri", "gi", "muc",
     "aaai", "nips", "acl", "cvpr", "iccv", "icml", "ijcai", "iclr", "emnlp", "naacl", "coling", "eccv",
     "asplos", "osdi", "sosp", "eurosys", "usenix_atc", "fast", "isca", "micro", "hpca",
     "ccs", "sp", "uss", "ndss", "crypto", "eurocrypt",
@@ -26,6 +28,19 @@ ALLOWED_RESEARCH_VENUES = [
     "icse", "fse_esec", "ase", "issta",
     "siggraph", "mm", "vis",
     "stoc", "focs", "soda",
+]
+
+ACM_HCI_VENUES = [
+    "chi",
+    "uist",
+    "cscw",
+    "ubicomp",
+    "imwut",
+    "dis",
+    "iui",
+    "tei",
+    "mobilehci",
+    "assets",
 ]
 
 
@@ -117,7 +132,194 @@ def _normalize_metadata_payload(payload: dict) -> dict:
         "year": str(payload.get("year") or "").strip(),
         "doi": doi.strip(),
         "abstract": " ".join(str(payload.get("abstract") or "").split()),
+        "keywords": _normalize_keyword_list(payload.get("keywords") or []),
     }
+
+
+def _normalize_keyword_list(raw) -> list[str]:
+    if isinstance(raw, str):
+        parts = re.split(r"[;\n,，；]+", raw)
+    elif isinstance(raw, list):
+        parts = raw
+    else:
+        parts = []
+    cleaned = []
+    seen = set()
+    for item in parts:
+        value = " ".join(str(item or "").strip().split())
+        low = value.lower()
+        if not value or low in seen:
+            continue
+        seen.add(low)
+        cleaned.append(value)
+        if len(cleaned) >= 5:
+            break
+    return cleaned
+
+
+def _normalize_research_query_suggestion(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "summary": " ".join(str(payload.get("summary") or "").split()),
+        "core_concepts": _normalize_keyword_list(payload.get("core_concepts") or []),
+        "candidate_keywords": _normalize_keyword_list(payload.get("candidate_keywords") or []),
+        "avoid_keywords": _normalize_keyword_list(payload.get("avoid_keywords") or []),
+        "notes": " ".join(str(payload.get("notes") or "").split()),
+    }
+
+
+_SUMMARY_STOPWORDS = {
+    "a", "an", "and", "for", "from", "in", "of", "on", "the", "to", "with",
+    "about", "since", "after", "before", "between", "using", "based", "study",
+    "research", "papers", "paper", "latest", "recent", "new", "topic",
+}
+_SUMMARY_ACRONYMS = {
+    "acm", "ai", "ar", "chi", "cscw", "cv", "cvpr", "dis", "gi", "hci", "hri",
+    "iui", "its", "llm", "ml", "mm", "muc", "nime", "nlp", "sigir", "tei",
+    "uist", "ui", "ux", "vis", "vr",
+}
+
+
+def _render_summary_token(token: str) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if lowered in _SUMMARY_ACRONYMS:
+        return lowered.upper()
+    if value.isdigit():
+        return value
+    return value.capitalize()
+
+
+def _short_research_summary(*sources: str) -> str:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    fallback_tokens: list[str] = []
+    for source in sources:
+        for raw in re.findall(r"[A-Za-z0-9]+", str(source or "")):
+            lowered = raw.lower()
+            if lowered not in seen:
+                seen.add(lowered)
+                fallback_tokens.append(raw)
+            if lowered in _SUMMARY_STOPWORDS:
+                continue
+            if lowered.isdigit() and len(lowered) == 4:
+                continue
+            if len(lowered) <= 1 and lowered not in _SUMMARY_ACRONYMS:
+                continue
+            if lowered not in {item.lower() for item in candidates}:
+                candidates.append(raw)
+            if len(candidates) >= 3:
+                break
+        if len(candidates) >= 3:
+            break
+    if len(candidates) < 2:
+        for raw in fallback_tokens:
+            lowered = raw.lower()
+            if lowered.isdigit() and len(lowered) == 4:
+                continue
+            if lowered in {item.lower() for item in candidates}:
+                continue
+            candidates.append(raw)
+            if len(candidates) >= 2:
+                break
+    if not candidates:
+        return "Research Topic"
+    return " ".join(_render_summary_token(item) for item in candidates[:3] if _render_summary_token(item))
+
+
+def _research_query_suggestion_prompt(requirement_text: str) -> str:
+    return f"""
+你是一个学术检索词规划器。用户会用自然语言描述研究主题，你需要把它转成更贴合论文标题、摘要和学术检索的关键词建议。
+
+只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+规则：
+- `core_concepts` 是 2 到 5 个主题核心概念，优先英文名词短语。
+- `candidate_keywords` 是 4 到 8 个更适合学术检索的英文关键词或短语。
+- `avoid_keywords` 是 0 到 5 个应尽量避免的过泛词、歧义词或容易引入噪声的词。
+- 关键词要尽量贴近学术论文标题和摘要中常出现的表达。
+- 如果用户给的是口语表达，请转成更学术的写法。
+- 不要输出 venue 名、作者名、年份。
+
+schema:
+{{
+  "summary": "",
+  "core_concepts": ["", ""],
+  "candidate_keywords": ["", "", ""],
+  "avoid_keywords": ["", ""],
+  "notes": ""
+}}
+
+用户需求：
+{requirement_text}
+""".strip()
+
+
+def _research_query_suggestion_is_usable(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("candidate_keywords"))
+
+
+def suggest_research_queries(
+    requirement_text: str,
+    *,
+    model_id: str = DEFAULT_OPENCLAW_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+) -> dict:
+    text = " ".join(str(requirement_text or "").split())
+    if not text:
+        raise OpenClawIngestError("研究需求不能为空。")
+
+    def _run(target_model_id: str) -> dict:
+        payload = _request_json_payload(
+            model_id=target_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责把自然语言研究需求转换成更学术化的检索词建议。只返回严格合法的 JSON。",
+                },
+                {"role": "user", "content": _research_query_suggestion_prompt(text)},
+            ],
+            config_path=config_path,
+            timeout=120,
+            attempts=2,
+            max_tokens=300,
+        )
+        return _normalize_research_query_suggestion(payload)
+
+    try:
+        suggestion = _run(model_id)
+        if _research_query_suggestion_is_usable(suggestion):
+            return suggestion
+    except Exception:
+        pass
+    if fallback_model_id:
+        try:
+            suggestion = _run(fallback_model_id)
+            if _research_query_suggestion_is_usable(suggestion):
+                return suggestion
+        except Exception:
+            pass
+    lowered = text.lower()
+    heuristic_keywords = []
+    for phrase in re.split(r"[，,;；/]|\\band\\b|\\bwith\\b", lowered):
+        value = " ".join(phrase.strip().split())
+        if value:
+            heuristic_keywords.append(value)
+    return _normalize_research_query_suggestion(
+        {
+            "summary": text,
+            "core_concepts": heuristic_keywords[:4],
+            "candidate_keywords": heuristic_keywords[:6],
+            "avoid_keywords": [],
+            "notes": "",
+        }
+    )
 
 
 def _blank_analysis_payload() -> dict:
@@ -201,6 +403,105 @@ def _metadata_is_usable(payload: dict) -> bool:
     return any(_has_meaningful_text(item) for item in supporting)
 
 
+def _keyword_prompt(metadata: dict) -> str:
+    title = " ".join(str(metadata.get("title") or "").split())
+    authors = ", ".join(metadata.get("authors") or [])
+    venue = " ".join(str(metadata.get("venue") or "").split())
+    year = str(metadata.get("year") or "").strip()
+    doi = str(metadata.get("doi") or "").strip()
+    abstract = " ".join(str(metadata.get("abstract") or "").split())[:4000]
+    return f"""
+你正在根据一篇学术论文的元数据规划 3 到 5 个学术关键词。
+请只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+规则：
+- 关键词应适合学术检索、主题归类和阅读分组。
+- 优先输出英文名词短语。
+- 不要输出过泛的词，例如 "paper"、"study"、"research"、"method"。
+- 不要重复标题中的整句，不要输出作者名。
+- 返回 3 到 5 个关键词。
+
+schema:
+{{
+  "keywords": ["", "", ""]
+}}
+
+metadata:
+title: {title}
+authors: {authors}
+venue: {venue}
+year: {year}
+doi: {doi}
+abstract: {abstract}
+""".strip()
+
+
+def _heuristic_metadata_keywords(metadata: dict) -> list[str]:
+    title = " ".join(str(metadata.get("title") or "").split())
+    abstract = " ".join(str(metadata.get("abstract") or "").split())
+    source = f"{title}. {abstract}".strip()
+    if not source:
+        return []
+    candidates = []
+    for part in re.split(r"[:;,.()\\[\\]|/]+", source):
+        value = " ".join(part.strip().split())
+        if not value:
+            continue
+        lower = value.lower()
+        if len(lower) < 4:
+            continue
+        if lower in {"paper", "study", "research", "method", "approach", "analysis"}:
+            continue
+        if 1 <= len(value.split()) <= 6:
+            candidates.append(value)
+    normalized = _normalize_keyword_list(candidates)
+    return normalized[:5]
+
+
+def generate_keywords_from_metadata(
+    metadata: dict,
+    *,
+    model_id: str = DEFAULT_OPENCLAW_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+) -> list[str]:
+    title = " ".join(str(metadata.get("title") or "").split())
+    if not title:
+        return []
+
+    def _run(target_model_id: str) -> list[str]:
+        payload = _request_json_payload(
+            model_id=target_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责生成学术检索关键词。只返回严格合法的 JSON，不要输出任何额外说明。",
+                },
+                {"role": "user", "content": _keyword_prompt(metadata)},
+            ],
+            config_path=config_path,
+            timeout=120,
+            attempts=2,
+            max_tokens=180,
+        )
+        return _normalize_keyword_list(payload.get("keywords") or [])
+
+    try:
+        keywords = _run(model_id)
+        if 3 <= len(keywords) <= 5:
+            return keywords
+    except Exception:
+        pass
+    if fallback_model_id:
+        try:
+            keywords = _run(fallback_model_id)
+            if 3 <= len(keywords) <= 5:
+                return keywords
+        except Exception:
+            pass
+    return _heuristic_metadata_keywords(metadata)
+
+
 def _analysis_is_usable(payload: dict) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -219,6 +520,83 @@ def _safe_slug(value: str, fallback: str = "research-topic") -> str:
             chars.append("-")
     slug = "".join(chars).strip("-")
     return (slug[:60] or fallback).strip("-") or fallback
+
+
+def _apply_research_plan_heuristics(payload: dict) -> dict:
+    normalized = dict(payload or {})
+    keywords = [item for item in (normalized.get("keywords") or []) if str(item).strip()]
+    venues = [item for item in (normalized.get("venues") or []) if str(item).strip()]
+    theme_text = " ".join(
+        [
+            str(normalized.get("summary") or ""),
+            str(normalized.get("notes") or ""),
+            " ".join(str(item) for item in keywords),
+        ]
+    ).lower()
+
+    audio_theme_markers = ("timbre", "sound", "audio", "music", "synth", "voice interaction")
+    if any(marker in theme_text for marker in audio_theme_markers):
+        preferred_audio_hci_venues = ["dis", "tei", "iui", "mobilehci", "assets", "chi", "uist", "mm"]
+        reordered = []
+        seen = set()
+        for venue in preferred_audio_hci_venues + venues:
+            if venue in seen:
+                continue
+            seen.add(venue)
+            reordered.append(venue)
+        normalized["venues"] = reordered[:8]
+
+        keyword_expansions = []
+        if "timbre" in theme_text:
+            keyword_expansions.extend([
+                "timbre exploration interface",
+                "timbre interaction design",
+                "sound authoring interface",
+                "musical timbre interface",
+            ])
+        if "voice" in theme_text:
+            keyword_expansions.append("voice interaction timbre")
+        expanded_keywords = []
+        seen_keywords = set()
+        for keyword in keywords + keyword_expansions:
+            lowered = str(keyword).strip().lower()
+            if not lowered or lowered in seen_keywords:
+                continue
+            seen_keywords.add(lowered)
+            expanded_keywords.append(" ".join(str(keyword).split()))
+        normalized["keywords"] = expanded_keywords[:6]
+
+    return normalized
+
+
+def _prefer_acm_hci_venues_for_create(requirement_text: str, payload: dict) -> dict:
+    normalized = dict(payload or {})
+    text = " ".join(str(requirement_text or "").lower().split())
+    if not text:
+        return normalized
+
+    hci_markers = (
+        " hci ",
+        "human-computer interaction",
+        "human computer interaction",
+        "人机交互",
+    )
+    padded = f" {text} "
+    if not any(marker in padded for marker in hci_markers):
+        return normalized
+
+    explicit_venue_markers = set(ALLOWED_RESEARCH_VENUES) | {"acm", "springer", "ieee"}
+    if any(marker in padded for marker in explicit_venue_markers):
+        return normalized
+
+    existing_keywords = normalized.get("keywords") or []
+    audio_theme = " ".join(str(item) for item in existing_keywords).lower()
+    if any(marker in audio_theme for marker in ("timbre", "sound", "audio", "music", "voice")):
+        preferred = ["dis", "tei", "iui", "mobilehci", "assets", "chi", "uist", "mm"]
+    else:
+        preferred = ACM_HCI_VENUES[:8]
+    normalized["venues"] = preferred[:8]
+    return normalized
 
 
 def _normalize_research_plan_payload(payload: dict) -> dict:
@@ -272,9 +650,14 @@ def _normalize_research_plan_payload(payload: dict) -> dict:
             keywords[0] if keywords else "",
         ] if part
     )
+    summary = _short_research_summary(
+        str(payload.get("summary") or "").strip(),
+        " ".join(keywords),
+        str(payload.get("slug") or "").replace("-", " "),
+    )
 
-    return {
-        "summary": " ".join(str(payload.get("summary") or "").split()),
+    normalized = {
+        "summary": summary,
         "slug": _safe_slug(slug_source or "research-topic"),
         "keywords": keywords,
         "venues": venues,
@@ -283,6 +666,10 @@ def _normalize_research_plan_payload(payload: dict) -> dict:
         "fetch_abstract": bool(payload.get("fetch_abstract", True)),
         "notes": " ".join(str(payload.get("notes") or "").split()),
     }
+    suggestion = payload.get("query_suggestion")
+    if isinstance(suggestion, dict):
+        normalized["query_suggestion"] = _normalize_research_query_suggestion(suggestion)
+    return _apply_research_plan_heuristics(normalized)
 
 
 def _research_plan_is_usable(payload: dict) -> bool:
@@ -555,15 +942,19 @@ def extract_paper_candidate_from_image(
 
     data_url = _prepare_image_data_url(path, max_base64_chars=180_000)
     prompt = """
-你会看到一张图片。请判断它是否包含论文截图、论文标题页、摘要页、论文搜索结果中的某篇论文卡片，或足以定位论文的信息。
+你会看到一张图片。请判断它是否包含以下任一情况：
+1. 单篇论文的截图、标题页、摘要页，或足以定位单篇论文的信息
+2. Google Scholar 作者主页或论文列表截图，其中列出了多篇论文标题
 
 只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
 
 返回 schema：
 {
   "is_paper_screenshot": true,
+  "screenshot_kind": "single_paper",
   "confidence": 0,
   "title": "",
+  "titles": ["", ""],
   "doi": "",
   "authors": ["", ""],
   "year": "",
@@ -574,7 +965,11 @@ def extract_paper_candidate_from_image(
 
 规则：
 - 如果不是论文相关截图，`is_paper_screenshot` 必须为 false。
-- 优先提取论文标题；不要凭空编造。
+- 如果是 Google Scholar 论文列表截图，`screenshot_kind` 设为 `scholar_list`，并把可见论文标题写入 `titles`。
+- 如果是单篇论文截图，`screenshot_kind` 设为 `single_paper`，优先提取 `title`。
+- 如果无法判断类型但明显与论文有关，优先按 `single_paper` 处理。
+- `titles` 最多返回 20 条。
+- 不要凭空编造标题。
 - `doi` 只有在图片中明确出现时才填写。
 - `query` 用于后续检索链接，优先等于识别到的英文标题。
 - `confidence` 取 0 到 1 之间的小数。
@@ -603,10 +998,26 @@ def extract_paper_candidate_from_image(
         authors = payload.get("authors") or []
         if not isinstance(authors, list):
             authors = [str(authors or "").strip()] if str(authors or "").strip() else []
+        titles = payload.get("titles") or []
+        if not isinstance(titles, list):
+            titles = [str(titles or "").strip()] if str(titles or "").strip() else []
+        normalized_titles = []
+        seen = set()
+        for item in titles:
+            value = " ".join(str(item or "").split()).strip()
+            key = value.lower()
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            normalized_titles.append(value)
+            if len(normalized_titles) >= 20:
+                break
         return {
             "is_paper_screenshot": bool(payload.get("is_paper_screenshot")),
+            "screenshot_kind": str(payload.get("screenshot_kind") or "single_paper").strip() or "single_paper",
             "confidence": float(payload.get("confidence") or 0),
             "title": str(payload.get("title") or "").strip(),
+            "titles": normalized_titles,
             "doi": str(payload.get("doi") or "").strip(),
             "authors": [str(item).strip() for item in authors if str(item).strip()],
             "year": str(payload.get("year") or "").strip(),
@@ -653,6 +1064,7 @@ def extract_pdf_bundle(pdf_path: str | Path) -> dict:
 
 def _research_plan_prompt(requirement_text: str) -> str:
     allowed_venues = ", ".join(ALLOWED_RESEARCH_VENUES)
+    default_hci_venues = ", ".join(ACM_HCI_VENUES)
     return f"""
 你是一个论文 research 规划器。用户会用自然语言描述研究方向，你需要把它转换成 exScholar 可直接执行的搜索参数。
 
@@ -667,9 +1079,13 @@ def _research_plan_prompt(requirement_text: str) -> str:
 - `fetch_abstract` 默认 true，除非用户明确只要快速看标题。
 - `top` 默认 100；如果用户明显只想快速浏览，可以降到 30 或 50。
 - 不要编造用户没表达过的非常具体技术细节。
+- 如果用户只是笼统说 HCI / 人机交互，没有明确指定 venue，默认优先收窄到 ACM 收录的 HCI venues。
 
 允许 venues：
 {allowed_venues}
+
+默认 ACM HCI venues：
+{default_hci_venues}
 
 返回 schema：
 {{
@@ -686,6 +1102,226 @@ def _research_plan_prompt(requirement_text: str) -> str:
 用户需求：
 {requirement_text}
 """.strip()
+
+
+def _research_plan_prompt_with_suggestion(requirement_text: str, suggestion: dict | None) -> str:
+    base = _research_plan_prompt(requirement_text)
+    if not isinstance(suggestion, dict) or not (suggestion.get("candidate_keywords") or suggestion.get("core_concepts")):
+        return base
+    return (
+        base
+        + "\n\n检索词建议（请尽量参考，但不要机械复制）：\n"
+        + json.dumps(suggestion, ensure_ascii=False, indent=2)
+    )
+
+
+def _review_research_results_prompt(requirement_text: str, plan: dict, papers: list[dict]) -> str:
+    plan_json = json.dumps(
+        {
+            "summary": plan.get("summary") or "",
+            "keywords": plan.get("keywords") or [],
+            "venues": plan.get("venues") or [],
+            "year_from": plan.get("year_from") or 0,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    papers_json = json.dumps(papers, ensure_ascii=False, indent=2)
+    return f"""
+你是一个学术搜索结果复核器。现在有一批根据研究需求检索回来的论文候选，请你根据标题、venue 和摘要判断它们是否真的相关，并自动生成标签。
+
+只返回一个 JSON 对象，不要输出 Markdown、解释或代码块。
+
+规则：
+- `relevance_label` 只能是 `high`、`medium`、`low`。
+- `relevance_score` 是 0 到 1 之间的小数。
+- `autotags` 输出 0 到 5 个英文标签，优先名词短语。
+- 如果论文主题明显偏离需求，即使 venue 合适，也应该给 `low`。
+- 如果论文主题接近但不是核心目标，给 `medium`。
+- 如果标题和摘要都高度贴合，给 `high`。
+- `reason` 用简短中文解释判断依据。
+
+schema:
+{{
+  "items": [
+    {{
+      "index": 0,
+      "relevance_label": "medium",
+      "relevance_score": 0.5,
+      "autotags": ["", ""],
+      "reason": ""
+    }}
+  ]
+}}
+
+用户需求：
+{requirement_text}
+
+搜索方案：
+{plan_json}
+
+候选论文：
+{papers_json}
+""".strip()
+
+
+def _normalize_research_result_review_item(item: dict) -> dict:
+    if not isinstance(item, dict):
+        item = {}
+    label = str(item.get("relevance_label") or "").strip().lower()
+    if label not in {"high", "medium", "low"}:
+        label = "medium"
+    try:
+        score = float(item.get("relevance_score") or 0)
+    except Exception:
+        score = 0.0
+    score = max(0.0, min(score, 1.0))
+    return {
+        "index": int(item.get("index") or 0),
+        "relevance_label": label,
+        "relevance_score": score,
+        "autotags": _normalize_keyword_list(item.get("autotags") or []),
+        "reason": " ".join(str(item.get("reason") or "").split()),
+    }
+
+
+def _heuristic_review_tags(requirement_text: str, plan: dict, paper: dict) -> dict:
+    title = " ".join(str(paper.get("title") or "").lower().split())
+    abstract = " ".join(str(paper.get("content") or paper.get("abstract") or "").lower().split())
+    haystack = f"{title} {abstract}".strip()
+    tags = []
+    for keyword in (plan.get("keywords") or []):
+        value = " ".join(str(keyword or "").strip().split())
+        low = value.lower()
+        if low and low in haystack:
+            tags.append(value)
+    for token in ("timbre", "sonification", "auditory", "sound design", "musical interface", "voice interaction"):
+        if token in haystack:
+            tags.append(token.title() if " " in token else token)
+    tags = _normalize_keyword_list(tags)
+    score = 0.18
+    if any(low in haystack for low in [str(k).lower() for k in (plan.get("keywords") or []) if str(k).strip()]):
+        score = 0.58
+    if "timbre" in haystack or "sonification" in haystack:
+        score = max(score, 0.78)
+    if score >= 0.75:
+        label = "high"
+    elif score >= 0.4:
+        label = "medium"
+    else:
+        label = "low"
+    return {
+        "relevance_label": label,
+        "relevance_score": score,
+        "autotags": tags[:5],
+        "reason": "基于标题和摘要中的关键词重合进行启发式判断。",
+    }
+
+
+def review_research_results(
+    requirement_text: str,
+    plan: dict,
+    papers: list[dict],
+    *,
+    model_id: str = DEFAULT_OPENCLAW_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+    chunk_size: int = 6,
+    progress_callback=None,
+) -> list[dict]:
+    text = " ".join(str(requirement_text or "").split())
+    if not text:
+        return papers
+    if not isinstance(papers, list) or not papers:
+        return papers
+
+    reviewed_records = [dict(item or {}) for item in papers]
+
+    def _run(target_model_id: str, chunk: list[dict]) -> list[dict]:
+        payload = _request_json_payload(
+            model_id=target_model_id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你负责复核学术检索结果并输出相关性与自动标签。只返回严格合法的 JSON。",
+                },
+                {
+                    "role": "user",
+                    "content": _review_research_results_prompt(text, plan, chunk),
+                },
+            ],
+            config_path=config_path,
+            timeout=75,
+            attempts=2,
+            max_tokens=700,
+        )
+        items = payload.get("items") or []
+        return [_normalize_research_result_review_item(item) for item in items]
+
+    total_chunks = max(1, (len(reviewed_records) + max(1, chunk_size) - 1) // max(1, chunk_size))
+    completed_chunks = 0
+    for start in range(0, len(reviewed_records), max(1, chunk_size)):
+        chunk_records = reviewed_records[start : start + max(1, chunk_size)]
+        chunk_payload = []
+        for local_index, paper in enumerate(chunk_records):
+            chunk_payload.append(
+                {
+                    "index": local_index,
+                    "title": paper.get("title") or "",
+                    "venue": paper.get("venue") or "",
+                    "year": paper.get("year") or "",
+                    "matched_kw": paper.get("matched_kw") or paper.get("_matched_kw") or "",
+                    "abstract": (paper.get("content") or paper.get("abstract") or "")[:800],
+                }
+            )
+        chunk_number = completed_chunks + 1
+        if callable(progress_callback):
+            progress_callback(
+                {
+                    "stage": "reviewing_results",
+                    "completed_chunks": completed_chunks,
+                    "total_chunks": total_chunks,
+                    "message": f"正在复核第 {chunk_number}/{total_chunks} 批结果，并生成相关性标签。",
+                    "papers": reviewed_records,
+                }
+            )
+        review_items = []
+        used_fallback = False
+        try:
+            review_items = _run(model_id, chunk_payload)
+        except Exception:
+            if fallback_model_id:
+                try:
+                    review_items = _run(fallback_model_id, chunk_payload)
+                except Exception:
+                    used_fallback = True
+                    review_items = []
+            else:
+                used_fallback = True
+        review_by_index = {item["index"]: item for item in review_items if isinstance(item, dict)}
+        for local_index, paper in enumerate(chunk_records):
+            review = review_by_index.get(local_index) or _heuristic_review_tags(text, plan, paper)
+            paper["relevance_label"] = review.get("relevance_label") or "medium"
+            paper["relevance_score"] = review.get("relevance_score") or 0
+            paper["autotags"] = review.get("autotags") or []
+            paper["review_reason"] = review.get("reason") or ""
+        completed_chunks += 1
+        if callable(progress_callback):
+            progress_callback(
+                {
+                    "stage": "reviewing_results",
+                    "completed_chunks": completed_chunks,
+                    "total_chunks": total_chunks,
+                    "used_fallback": used_fallback,
+                    "message": (
+                        f"第 {completed_chunks}/{total_chunks} 批结果复核完成。"
+                        + (" 本批已退回启发式标签。" if used_fallback else "")
+                    ),
+                    "papers": reviewed_records,
+                }
+            )
+
+    return reviewed_records
 
 
 def _research_refine_prompt(requirement_text: str, current_plan: dict, modify_request: str) -> str:
@@ -797,6 +1433,12 @@ def plan_research_request(
     text = " ".join(str(requirement_text or "").split())
     if not text:
         raise OpenClawIngestError("研究需求不能为空。")
+    query_suggestion = suggest_research_queries(
+        text,
+        model_id=model_id,
+        fallback_model_id=fallback_model_id,
+        config_path=config_path,
+    )
 
     def _run_generation(target_model_id: str) -> dict:
         payload = _request_json_payload(
@@ -806,13 +1448,16 @@ def plan_research_request(
                     "role": "system",
                     "content": "你负责把自然语言研究需求转换为 exScholar 搜索参数。只返回严格合法的 JSON。",
                 },
-                {"role": "user", "content": _research_plan_prompt(text)},
+                {"role": "user", "content": _research_plan_prompt_with_suggestion(text, query_suggestion)},
             ],
             config_path=config_path,
             timeout=timeout,
             attempts=attempts,
         )
-        return _normalize_research_plan_payload(payload)
+        normalized = _normalize_research_plan_payload(payload)
+        normalized = _prefer_acm_hci_venues_for_create(text, normalized)
+        normalized["query_suggestion"] = query_suggestion
+        return normalized
 
     primary_error = None
     try:
@@ -1100,7 +1745,8 @@ schema:
   "venue": "",
   "year": "",
   "doi": "",
-  "abstract": ""
+  "abstract": "",
+  "keywords": ["", "", ""]
 }}
 
 文件名: {filename}

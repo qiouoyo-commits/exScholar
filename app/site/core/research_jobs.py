@@ -2,6 +2,10 @@
 
 from .shared import *
 
+RESEARCH_STALE_JOB_TIMEOUT_SECONDS = 10 * 60
+RESEARCH_STALE_COMPLETION_MESSAGE = "搜索输出已生成，但后台复核阶段因服务重启或超时中断；结果已保留。"
+RESEARCH_STALE_FAILURE_MESSAGE = "Research 任务因服务重启或超时被中断，请重新发起。"
+
 
 def ensure_research_jobs_dir():
     RESEARCH_JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -14,6 +18,99 @@ def build_research_job_id() -> str:
 def research_job_path(job_id: str) -> Path:
     ensure_research_jobs_dir()
     return RESEARCH_JOBS_DIR / f"{job_id}.json"
+
+
+def parse_research_job_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def _existing_research_output_urls(job: dict) -> dict:
+    csv_path = Path(str(job.get("csv_path") or "").strip()) if job.get("csv_path") else None
+    json_path = Path(str(job.get("json_path") or "").strip()) if job.get("json_path") else None
+    meta_path = Path(str(job.get("meta_path") or "").strip()) if job.get("meta_path") else None
+    site_path = Path(str(job.get("site_path") or "").strip()) if job.get("site_path") else None
+    result = {
+        "csv_url": _research_relative_url(csv_path) if csv_path and csv_path.exists() else "",
+        "json_url": _research_relative_url(json_path) if json_path and json_path.exists() else "",
+        "search_url": _research_relative_url(meta_path) if meta_path and meta_path.exists() else "",
+        "site_relative_url": "",
+    }
+    if site_path and site_path.exists():
+        try:
+            relative_dir = site_path.parent.parent.relative_to(DATA_DIR).as_posix()
+            result["site_relative_url"] = f"/{relative_dir}/site/"
+        except Exception:
+            result["site_relative_url"] = ""
+    return result
+
+
+def _infer_research_review_summary(job: dict) -> dict:
+    summary = {"high": 0, "medium": 0, "low": 0}
+    json_path = Path(str(job.get("json_path") or "").strip()) if job.get("json_path") else None
+    meta_path = Path(str(job.get("meta_path") or "").strip()) if job.get("meta_path") else None
+    if meta_path and meta_path.exists():
+        meta_payload = read_json_file(meta_path, {})
+        existing = meta_payload.get("review_summary")
+        if isinstance(existing, dict):
+            return {
+                "high": int(existing.get("high") or 0),
+                "medium": int(existing.get("medium") or 0),
+                "low": int(existing.get("low") or 0),
+            }
+    if not json_path or not json_path.exists():
+        return summary
+    payload = read_json_file(json_path, {})
+    for paper in payload.get("papers") or []:
+        label = str(paper.get("relevance_label") or "").strip().lower()
+        if label in summary:
+            summary[label] += 1
+    return summary
+
+
+def reconcile_research_job_if_stale(job: dict, path: Path | None = None) -> dict:
+    status = str(job.get("status") or "").strip().lower()
+    if status in {"completed", "failed"}:
+        return job
+    updated_at = parse_research_job_timestamp(job.get("updated_at") or job.get("created_at") or "")
+    if not updated_at:
+        return job
+    age_seconds = (datetime.utcnow() - updated_at).total_seconds()
+    if age_seconds < RESEARCH_STALE_JOB_TIMEOUT_SECONDS:
+        return job
+
+    csv_path = Path(str(job.get("csv_path") or "").strip()) if job.get("csv_path") else None
+    json_path = Path(str(job.get("json_path") or "").strip()) if job.get("json_path") else None
+    meta_path = Path(str(job.get("meta_path") or "").strip()) if job.get("meta_path") else None
+    site_path = Path(str(job.get("site_path") or "").strip()) if job.get("site_path") else None
+    has_outputs = all(path_obj and path_obj.exists() for path_obj in (csv_path, json_path, meta_path, site_path))
+
+    if has_outputs:
+        meta_payload = read_json_file(meta_path, {}) if meta_path else {}
+        output_urls = _existing_research_output_urls(job)
+        review_summary = _infer_research_review_summary(job)
+        job["status"] = "completed"
+        job["current_step"] = "completed"
+        job["step_message"] = RESEARCH_STALE_COMPLETION_MESSAGE
+        job["warning"] = RESEARCH_STALE_COMPLETION_MESSAGE
+        job["total_papers"] = meta_payload.get("total_papers") if isinstance(meta_payload, dict) else job.get("total_papers")
+        job["review_summary"] = review_summary
+        job.update(output_urls)
+    else:
+        job["status"] = "failed"
+        job["current_step"] = "failed"
+        job["step_message"] = RESEARCH_STALE_FAILURE_MESSAGE
+        job["error"] = RESEARCH_STALE_FAILURE_MESSAGE
+
+    if path is not None:
+        with RESEARCH_JOB_LOCK:
+            write_json_file_atomic(path, summarize_research_job(job))
+    return job
 
 
 def summarize_research_job(job: dict) -> dict:
@@ -30,7 +127,10 @@ def load_research_job(job_id: str) -> dict | None:
     path = research_job_path(job_id)
     if not path.exists():
         return None
-    return read_json_file(path, None)
+    job = read_json_file(path, None)
+    if not job:
+        return None
+    return reconcile_research_job_if_stale(job, path)
 
 
 def list_research_jobs(limit: int = 20) -> list[dict]:
@@ -40,7 +140,7 @@ def list_research_jobs(limit: int = 20) -> list[dict]:
         payload = read_json_file(path, None)
         if not payload:
             continue
-        jobs.append(summarize_research_job(payload))
+        jobs.append(reconcile_research_job_if_stale(payload, path))
         if len(jobs) >= limit:
             break
     return jobs
@@ -134,6 +234,8 @@ def _run_search_in_openclaw_analytics(job_id: str, plan: dict) -> dict:
         ";".join(keywords),
         "--slug",
         slug,
+        "--summary-name",
+        " ".join(str(plan.get("summary") or "").split()),
         "--top",
         str(int(plan.get("top") or 100)),
     ]
@@ -186,6 +288,20 @@ def _run_search_in_openclaw_analytics(job_id: str, plan: dict) -> dict:
     site_url = job.get("site_url") or ""
     if not result_dir:
         raise RuntimeError("搜索执行完成，但未解析到输出目录。")
+    required_outputs = {
+        "papers.csv": csv_path,
+        "papers.json": json_path,
+        "search.json": meta_path,
+    }
+    missing_outputs = [name for name, path in required_outputs.items() if not path or not Path(path).exists()]
+    if missing_outputs:
+        raise RuntimeError(f"搜索执行完成，但缺少输出文件: {', '.join(missing_outputs)}")
+    if not site_path or not Path(site_path).exists():
+        fallback_site_path = Path(result_dir) / "site" / "index.html"
+        if fallback_site_path.exists():
+            site_path = str(fallback_site_path)
+        else:
+            raise RuntimeError("搜索执行完成，但缺少 site/index.html。")
 
     csv_url = _research_relative_url(csv_path)
     json_url = _research_relative_url(json_path)
@@ -219,6 +335,93 @@ def _run_search_in_openclaw_analytics(job_id: str, plan: dict) -> dict:
         "total_papers": total_papers,
         "hit_counts": hit_counts,
     }
+
+
+def _apply_research_result_review(job_id: str, prompt: str, plan: dict, result: dict) -> dict:
+    json_path = Path(result.get("json_path") or "")
+    csv_path = Path(result.get("csv_path") or "")
+    site_path = Path(result.get("site_path") or "")
+    meta_path = Path(result.get("meta_path") or "")
+    if not json_path.exists() or not csv_path.exists() or not site_path.exists() or not meta_path.exists():
+        return result
+
+    payload = read_json_file(json_path, {})
+    records = payload.get("papers") or []
+    meta = payload.get("meta") or read_json_file(meta_path, {})
+    if not isinstance(records, list) or not records:
+        meta["review_summary"] = {"high": 0, "medium": 0, "low": 0}
+        write_json(records, str(json_path), meta)
+        write_site(records, str(site_path), meta)
+        return {**result, "review_summary": meta["review_summary"]}
+
+    def persist_review_progress(snapshot: list[dict], *, message: str):
+        summary = {"high": 0, "medium": 0, "low": 0}
+        for item in snapshot:
+            label = str(item.get("relevance_label") or "").strip().lower()
+            if label in summary:
+                summary[label] += 1
+        interim_meta = dict(meta)
+        interim_meta["review_summary"] = summary
+        interim_meta["total_papers"] = len(snapshot)
+        write_csv(snapshot, str(csv_path))
+        write_json(snapshot, str(json_path), interim_meta)
+        write_site(snapshot, str(site_path), interim_meta)
+        with meta_path.open("w", encoding="utf-8") as fh:
+            json.dump(interim_meta, fh, ensure_ascii=False, indent=2)
+        update_research_job(
+            job_id,
+            lambda payload: payload.update(
+                {
+                    "status": "running",
+                    "current_step": "reviewing_results",
+                    "step_message": message,
+                    "review_summary": summary,
+                    "total_papers": len(snapshot),
+                }
+            ),
+        )
+
+    def on_review_progress(event: dict):
+        papers_snapshot = [dict(item or {}) for item in (event.get("papers") or [])]
+        if not papers_snapshot:
+            return
+        message = str(event.get("message") or "正在复核搜索结果。").strip()
+        persist_review_progress(papers_snapshot, message=message)
+
+    reviewed = review_research_results(
+        prompt,
+        plan,
+        records,
+        model_id=OPENCLAW_INGEST_MODEL,
+        fallback_model_id=OPENCLAW_INGEST_FALLBACK_MODEL,
+        config_path=OPENCLAW_CONFIG_PATH,
+        progress_callback=on_review_progress,
+    )
+    reviewed.sort(
+        key=lambda item: (
+            -(float(item.get("relevance_score") or 0)),
+            -(int(item.get("year") or 0) if str(item.get("year") or "").isdigit() else 0),
+            str(item.get("title") or ""),
+        )
+    )
+    for index, item in enumerate(reviewed, start=1):
+        item["csv_index"] = index
+
+    summary = {"high": 0, "medium": 0, "low": 0}
+    for item in reviewed:
+        label = str(item.get("relevance_label") or "medium").strip().lower()
+        if label not in summary:
+            label = "medium"
+        summary[label] += 1
+
+    meta["review_summary"] = summary
+    meta["total_papers"] = len(reviewed)
+    write_csv(reviewed, str(csv_path))
+    write_json(reviewed, str(json_path), meta)
+    write_site(reviewed, str(site_path), meta)
+    with meta_path.open("w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=2)
+    return {**result, "review_summary": summary, "total_papers": len(reviewed)}
 
 
 def _run_research_job(job_id: str, username: str = ""):
@@ -275,6 +478,8 @@ def _run_research_job_inner(job_id: str):
             set_step("planned", "已生成搜索方案，开始执行搜索。")
 
         result = _run_search_in_openclaw_analytics(job_id, plan)
+        set_step("reviewing_results", "正在根据标题和摘要复核相关性，并自动打标签。")
+        result = _apply_research_result_review(job_id, prompt, plan, result)
 
         update_research_job(
             job_id,
@@ -291,6 +496,7 @@ def _run_research_job_inner(job_id: str):
                     "search_url": result.get("search_url") or "",
                     "total_papers": result["total_papers"],
                     "hit_counts": result["hit_counts"],
+                    "review_summary": result.get("review_summary") or {},
                 }
             ),
         )

@@ -37,11 +37,13 @@ from app.openclaw.ingest import (
     extract_metadata_from_text,
     extract_pdf_bundle,
     refine_research_plan,
+    review_research_results,
+    suggest_research_queries,
     generate_analysis_from_text,
     plan_research_request,
     validate_research_plan,
 )
-from app.pipeline.search import build_json_records, build_site_url, run_topic_search, write_csv, write_json, write_site
+from app.pipeline.search import build_json_records, build_search_summary_name, build_site_url, run_topic_search, write_csv, write_json, write_site
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
 load_dotenv(ROOT_DIR / ".env.local")
@@ -61,6 +63,7 @@ PASSWORD_SALT = (os.getenv("SITE_PASSWORD_SALT") or "").strip()
 PASSWORD_HASH = (os.getenv("SITE_PASSWORD_HASH") or "").strip()
 SESSION_SECRET = (os.getenv("SITE_SESSION_SECRET") or "").strip() or secrets.token_hex(32)
 SESSION_COOKIE = "ccf_site_session"
+SESSION_TTL_SECONDS = int((os.getenv("SITE_SESSION_TTL_SECONDS") or str(24 * 60 * 60)).strip() or str(24 * 60 * 60))
 PBKDF2_ITERATIONS = 200_000
 REFERENCE_LIMIT = int((os.getenv("REFERENCE_EXPAND_LIMIT") or "20").strip() or "20")
 AI4SCHOLAR_API_KEY = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
@@ -71,6 +74,7 @@ OPENCLAW_ANALYTICS_PYTHON = (
 ).strip()
 
 SESSIONS: dict[str, dict] = {}
+SESSION_LOCK = threading.Lock()
 BATCH_READING_JOB: dict[str, object] = {"status": "idle", "running": False}
 BATCH_READING_JOB_LOCK = threading.Lock()
 OPENCLAW_JOB_LOCK = threading.Lock()
@@ -209,3 +213,53 @@ READING_DIR = DynamicPath(current_reading_dir)
 DB_PATH = DynamicPath(current_db_path)
 OPENCLAW_JOBS_DIR = DynamicPath(current_openclaw_jobs_dir)
 RESEARCH_JOBS_DIR = DynamicPath(current_research_jobs_dir)
+
+
+def _session_expiry_cutoff(now: float | None = None) -> float:
+    return float(now if now is not None else time.time()) - max(SESSION_TTL_SECONDS, 60)
+
+
+def prune_expired_sessions(now: float | None = None) -> int:
+    cutoff = _session_expiry_cutoff(now)
+    removed = 0
+    with SESSION_LOCK:
+        expired_tokens = [
+            token
+            for token, payload in SESSIONS.items()
+            if float((payload or {}).get("created_at") or 0.0) < cutoff
+        ]
+        for token in expired_tokens:
+            SESSIONS.pop(token, None)
+            removed += 1
+    return removed
+
+
+def create_session(username: str) -> tuple[str, dict]:
+    now = time.time()
+    prune_expired_sessions(now)
+    token = secrets.token_urlsafe(32)
+    session = {"created_at": now, "username": sanitize_username(username)}
+    with SESSION_LOCK:
+        SESSIONS[token] = session
+    return token, session
+
+
+def get_session(token: str) -> dict | None:
+    if not token:
+        return None
+    now = time.time()
+    with SESSION_LOCK:
+        session = SESSIONS.get(token)
+        if not session:
+            return None
+        if float((session or {}).get("created_at") or 0.0) < _session_expiry_cutoff(now):
+            SESSIONS.pop(token, None)
+            return None
+        return dict(session)
+
+
+def delete_session(token: str) -> None:
+    if not token:
+        return
+    with SESSION_LOCK:
+        SESSIONS.pop(token, None)

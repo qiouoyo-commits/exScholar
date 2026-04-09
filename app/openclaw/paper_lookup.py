@@ -1,13 +1,13 @@
 #!/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
-"""Paper lookup helpers for image-driven OpenClaw workflows."""
+"""Paper lookup helpers for lightweight OpenClaw paper discovery workflows."""
 
 import re
-from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
+from app.common import normalize_title, title_similarity
 from app.pipeline.search import dblp_search
 
 from .ingest import (
@@ -44,20 +44,10 @@ LOW_TRUST_DOMAINS = {
     "www.semanticscholar.org": -3.0,
 }
 
-
-def normalize_title(value: str) -> str:
-    text = " ".join(str(value or "").strip().lower().split())
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
-
-
-def title_similarity(left: str, right: str) -> float:
-    a = normalize_title(left)
-    b = normalize_title(right)
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
+GOOGLE_SCHOLAR_PROFILE_HOSTS = {
+    "scholar.google.com",
+    "scholar.googleusercontent.com",
+}
 
 def normalize_doi(value: str) -> str:
     text = " ".join(str(value or "").strip().split()).lower()
@@ -65,6 +55,106 @@ def normalize_doi(value: str) -> str:
         if text.startswith(prefix):
             text = text[len(prefix) :]
     return text.strip().strip("/")
+
+
+def is_google_scholar_profile_url(value: str) -> bool:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    host = (parsed.netloc or "").strip().lower()
+    if host not in GOOGLE_SCHOLAR_PROFILE_HOSTS:
+        return False
+    path = (parsed.path or "").strip().lower()
+    return path.startswith("/citations") and "user=" in parsed.query
+
+
+def extract_titles_from_google_scholar_profile(url: str, *, limit: int = 100) -> list[str]:
+    normalized = " ".join(str(url or "").split()).strip()
+    if not is_google_scholar_profile_url(normalized):
+        return []
+    parsed = urlparse(normalized)
+    query = parse_qs(parsed.query)
+    user_id = (query.get("user") or [""])[0].strip()
+    if not user_id:
+        return []
+
+    hl = (query.get("hl") or ["en"])[0].strip() or "en"
+    base_url = f"{parsed.scheme or 'https'}://{parsed.netloc or 'scholar.google.com'}{parsed.path or '/citations'}"
+    titles: list[str] = []
+    seen: set[str] = set()
+    page_size = 100
+    user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    pattern = re.compile(r'<a[^>]+class="gsc_a_at"[^>]*>(.*?)</a>', re.I | re.S)
+
+    for start in range(0, max(limit, 1), page_size):
+        try:
+            resp = requests.get(
+                base_url,
+                params={
+                    "user": user_id,
+                    "hl": hl,
+                    "cstart": start,
+                    "pagesize": min(page_size, max(limit, 1)),
+                    "view_op": "list_works",
+                },
+                timeout=20,
+                headers={"User-Agent": user_agent},
+            )
+            resp.raise_for_status()
+        except Exception:
+            break
+
+        page_titles: list[str] = []
+        for raw in pattern.findall(resp.text):
+            title = re.sub(r"<.*?>", "", raw or "").strip()
+            title = " ".join(title.split())
+            key = normalize_title(title)
+            if not title or not key or key in seen:
+                continue
+            seen.add(key)
+            page_titles.append(title)
+            titles.append(title)
+            if len(titles) >= limit:
+                return titles
+        if not page_titles or len(page_titles) < page_size:
+            break
+    return titles
+
+
+def split_textsearch_inputs(chunks: list[str]) -> list[str]:
+    merged = "\n".join(str(chunk or "") for chunk in chunks)
+    titles: list[str] = []
+    for raw_line in merged.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if line:
+            titles.append(line)
+    if titles:
+        return titles
+    fallback = " ".join(merged.split()).strip()
+    return [fallback] if fallback else []
+
+
+def expand_textsearch_inputs(chunks: list[str], *, scholar_limit: int = 100) -> list[str]:
+    items = split_textsearch_inputs(chunks)
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        candidates = (
+            extract_titles_from_google_scholar_profile(item, limit=scholar_limit)
+            if is_google_scholar_profile_url(item)
+            else [item]
+        )
+        for title in candidates:
+            key = normalize_title(title)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            expanded.append(title)
+    return expanded
 
 
 def search_paper_candidates_via_web(query: str, limit: int = 20) -> list[dict]:
@@ -177,13 +267,10 @@ def build_lookup_record(candidate: dict, url: str, title_text: str = "", *, matc
 
 
 def resolve_paper_lookup_from_candidate(candidate: dict, *, matched_kw: str = "picsearch") -> dict:
-    if not candidate.get("is_paper_screenshot"):
-        raise ValueError("这张图片里没有识别到可定位的论文信息。")
-
     title = (candidate.get("title") or "").strip()
     query = (title or candidate.get("query") or "").strip()
     if not query:
-        raise ValueError("图片里没有识别到足够清晰的论文标题。")
+        raise ValueError("没有提供足够清晰的论文标题。")
 
     dblp_record = find_best_dblp_match(title or query, candidate.get("year") or "")
     if dblp_record:
@@ -211,6 +298,26 @@ def resolve_paper_lookup_from_candidate(candidate: dict, *, matched_kw: str = "p
     raise ValueError("没有找到可用的论文链接。")
 
 
+def resolve_paper_lookup_from_title(
+    title: str,
+    *,
+    year: str = "",
+    doi: str = "",
+    matched_kw: str = "textsearch",
+) -> dict:
+    candidate = {
+        "title": " ".join(str(title or "").split()),
+        "query": " ".join(str(title or "").split()),
+        "year": str(year or "").strip(),
+        "doi": normalize_doi(doi or ""),
+        "authors": [],
+        "venue": "",
+    }
+    if not candidate["title"]:
+        raise ValueError("没有提供论文标题。")
+    return resolve_paper_lookup_from_candidate(candidate, matched_kw=matched_kw)
+
+
 def resolve_paper_lookup_from_image(
     image_path: str | Path,
     *,
@@ -230,15 +337,56 @@ def resolve_paper_lookup_from_image(
     return resolve_paper_lookup_from_candidate(candidate, matched_kw=matched_kw)
 
 
+def resolve_paper_lookups_from_image(
+    image_path: str | Path,
+    *,
+    model_id: str = DEFAULT_OPENCLAW_IMAGE_MODEL,
+    fallback_model_id: str | None = DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL,
+    config_path: str | Path = DEFAULT_OPENCLAW_CONFIG_PATH,
+    timeout: int = 180,
+    matched_kw: str = "picsearch",
+) -> dict:
+    candidate = extract_paper_candidate_from_image(
+        image_path,
+        model_id=model_id,
+        fallback_model_id=fallback_model_id,
+        config_path=config_path,
+        timeout=timeout,
+    )
+    kind = str(candidate.get("screenshot_kind") or "").strip().lower()
+    titles = [
+        " ".join(str(item or "").split()).strip()
+        for item in (candidate.get("titles") or [])
+        if " ".join(str(item or "").split()).strip()
+    ]
+    if kind == "scholar_list" and titles:
+        results = []
+        for title in titles:
+            resolved = resolve_paper_lookup_from_title(title, matched_kw=matched_kw)
+            results.append(resolved)
+        return {"candidate": candidate, "results": results, "mode": "scholar_list"}
+    return {
+        "candidate": candidate,
+        "results": [resolve_paper_lookup_from_candidate(candidate, matched_kw=matched_kw)],
+        "mode": "single_paper",
+    }
+
+
 __all__ = [
     "OpenClawIngestError",
     "build_lookup_record",
+    "expand_textsearch_inputs",
+    "extract_titles_from_google_scholar_profile",
     "find_best_dblp_match",
     "find_best_web_match",
+    "is_google_scholar_profile_url",
     "normalize_title",
     "normalize_doi",
     "resolve_paper_lookup_from_candidate",
     "resolve_paper_lookup_from_image",
+    "resolve_paper_lookups_from_image",
+    "resolve_paper_lookup_from_title",
+    "split_textsearch_inputs",
     "search_paper_candidates_via_web",
     "title_similarity",
     "web_result_domain_score",

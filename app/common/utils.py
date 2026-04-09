@@ -1,9 +1,13 @@
-import os
 import json
+import os
+import re
+import time
+from difflib import SequenceMatcher
+
+from contextlib import contextmanager
+from pathlib import Path
 
 from prettytable import PrettyTable
-from pathlib import Path
-from contextlib import contextmanager
 
 
 @contextmanager
@@ -162,3 +166,35 @@ def info_by_dir(dir_path: str):
 
 if __name__ == "__main__":
     pass
+
+
+def normalize_title(value: str) -> str:
+    text = " ".join(str(value or "").strip().lower().split())
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def title_similarity(left: str, right: str) -> float:
+    a = normalize_title(left)
+    b = normalize_title(right)
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def wait_for_job(load_job, job_id: str, *, poll_interval: float = 2.0, timeout: float = 1800.0) -> dict:
+    deadline = time.time() + timeout
+    missing_streak = 0
+    while time.time() < deadline:
+        job = load_job(job_id)
+        if not job:
+            missing_streak += 1
+            if missing_streak >= 5:
+                raise RuntimeError(f"任务不存在: {job_id}")
+            time.sleep(min(poll_interval, 0.5))
+            continue
+        missing_streak = 0
+        if not job.get("running"):
+            return job
+        time.sleep(poll_interval)
+    raise TimeoutError(f"等待任务超时: {job_id}")

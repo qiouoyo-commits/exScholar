@@ -13,7 +13,7 @@ metadata:
 
 # exScholar Research Skill
 
-当用户描述一个研究兴趣时：先通过简短问答确认搜索方案，再执行搜索（默认含摘要），最后生成 CSV、JSON 和静态网页，并把网页网址发给用户。
+当用户描述一个研究兴趣时：先通过智能体生成更贴合学术表达的检索建议，再通过简短问答确认搜索方案，执行搜索（默认含摘要），最后让智能体结合标题和摘要复核相关性、自动打标签，并生成 CSV、JSON 和静态网页，把网页网址发给用户。
 
 ---
 
@@ -22,7 +22,10 @@ metadata:
 - 这条 skill 负责普通的“找论文 / 查论文 / 搜论文 / 读文献”
 - 不负责基于图片或截图识别论文
 - 如果用户明确要根据图片找论文，应改走 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
-- `picsearch` 当前会按“图片识别 -> DBLP -> 官方 web 候选筛选 -> DOI fallback”定位论文
+- 如果用户明确要根据一串论文标题批量补链接，应改走 [textsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/textsearch/SKILL.md)
+- 如果用户明确要根据 Google Scholar 页面截图批量补链接，应改走 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
+- `picsearch` 当前既支持单篇论文截图，也支持 Google Scholar 页面截图批量补链接；补链接后还会尽量继续抓取摘要
+- `textsearch` 当前只处理纯文本标题输入；旧的 `titlesearch` 名称已经废弃，当前统一使用 `textsearch`
 
 ---
 
@@ -37,13 +40,33 @@ metadata:
 /home/ubuntu/tools/exScholar/data/users/<username>/expansions/
 └── YYYY-MM-DD_<slug>/          ← 日期 + 话题简称，每次搜索独立一个目录
     ├── search.json             ← 搜索参数记录（关键词/venues/日期/是否含摘要）
-    ├── papers.csv              ← 论文列表（matched_kw/title/venue/year/authors/doi/url/abstract）
+    ├── papers.csv              ← 论文列表（matched_kw/title/venue/year/authors/doi/url/abstract/...）
     ├── papers.json             ← 面向展示站点的 JSON（csv_index/title/content/...）
     └── site/index.html         ← 可直接打开的静态网页
 ```
 
 `<slug>` 是话题的英文简称，由 Phase 1 确认时确定，仅含英文小写字母、数字、连字符。
 示例：`physio-ui`、`posture-hci`、`llm-agent`
+
+---
+
+## 当前搜索链路
+
+当前 `ccf-research` 和网页端 natural-language research 共用同一条搜索链路：
+
+1. 用户输入自然语言研究需求
+2. 智能体先生成一版更贴合学术表达的检索词建议
+3. 基于建议词生成正式搜索方案
+4. 用户确认后执行搜索
+5. 搜索结果出来后，再由智能体结合标题和摘要复核相关性
+6. 为每篇论文补充 `relevance_label`、`relevance_score`、`autotags`、`review_reason`
+7. 最终导出网页、CSV、JSON
+
+这意味着：
+
+- 前置阶段不会直接拿口语化描述去搜
+- 结果阶段不会只按原始召回顺序展示
+- 高相关结果会优先排在前面，并带自动标签
 
 ---
 
@@ -57,6 +80,11 @@ metadata:
 
 ```
 好的，我理解你的方向是：[用一句话概括话题]
+
+智能建议检索词：
+  核心概念：[concept1], [concept2]
+  建议关键词：[kw1], [kw2], [kw3]
+  建议避免：[avoid1], [avoid2]
 
 搜索方案：
 
@@ -76,6 +104,7 @@ metadata:
 
 ### 询问要点
 
+- 智能建议检索词是否贴合这个研究问题？有没有更像论文标题或摘要会出现的术语？
 - 关键词是否准确？有无遗漏的同义词或具体术语（如传感器类型、技术名称）？
 - Venues 是否覆盖到位？话题是否跨领域？
 - 是否需要限制年份？
@@ -177,6 +206,13 @@ metadata:
 2. CSV 路径
 3. JSON 路径
 
+当前结果里如果出现以下字段，属于正常输出：
+
+- `relevance_label`
+- `relevance_score`
+- `autotags`
+- `review_reason`
+
 默认网址形态：
 
 `http://<PUBLIC_SITE_HOST>:38128/searches/YYYY-MM-DD_<slug>/site/`
@@ -204,6 +240,8 @@ AI / NLP:          aaai, nips, acl, cvpr, iccv, icml, ijcai, iclr, emnlp, naacl,
 ## 注意事项
 
 - DBLP 搜索只匹配**标题**，不匹配摘要。关键词选名词短语，避免动词。
+- 当前链路会先生成一版“学术化检索建议”，再产出正式 plan；如果建议词不贴切，应优先调整建议词。
+- 搜索结束后会基于标题和摘要做二次复核，所以页面中的排序和标签可能与原始召回顺序不同。
 - 某关键词组命中 0 篇时，提示用户换同义词或放宽措辞。
 - `papers.csv` 的 `matched_kw` 列记录每篇由哪组关键词命中，网页中也可据此展示。
 - 无摘要的论文（`abstract` 为空）在网页中标注"暂无内容"，不影响标题级别的浏览。

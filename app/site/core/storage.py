@@ -1,5 +1,8 @@
 """Search discovery, filesystem, JSON, and utility helpers for exScholar."""
 
+from app.common import normalize_title as common_normalize_title
+from app.common import title_similarity as common_title_similarity
+
 from .base import *
 
 
@@ -249,24 +252,11 @@ def split_authors(authors_text: str) -> list[str]:
 
 
 def normalize_title_for_match(title: str) -> str:
-    chars = []
-    prev_space = False
-    for ch in (title or "").lower():
-        if ch.isalnum():
-            chars.append(ch)
-            prev_space = False
-        elif not prev_space:
-            chars.append(" ")
-            prev_space = True
-    return " ".join("".join(chars).split())
+    return common_normalize_title(title)
 
 
 def title_similarity(a: str, b: str) -> float:
-    left = normalize_title_for_match(a)
-    right = normalize_title_for_match(b)
-    if not left or not right:
-        return 0.0
-    return SequenceMatcher(None, left, right).ratio()
+    return common_title_similarity(a, b)
 
 
 def read_json_file(path: Path, default):

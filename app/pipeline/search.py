@@ -27,6 +27,7 @@ import os
 import sys
 import csv
 import json
+import re
 import time
 import random
 import asyncio
@@ -76,9 +77,97 @@ OPENALEX_VENUE_IDS = {
     "chi":      "S4363607743",   # CHI Conference on Human Factors in Computing Systems
     "uist":     "S4306421131",   # User Interface Software and Technology
     "cscw":     "S177586587",    # Computer Supported Cooperative Work
-    "ubicomp":  "S2764455111",   # UbiComp
     "imwut":    "S4210219751",   # IMWUT
+    "dis":      "S4363608268",   # Designing Interactive Systems Conference
+    "iui":      "S4306418948",   # Intelligent User Interfaces
+    "nime":     "S4306420611",   # New Interfaces for Musical Expression
+    "its":      "S4306418954",   # Interactive Tabletops and Surfaces
+    "gi":       "S4306418501",   # Graphics Interface
+    "muc":      "S4363608440",   # International Conference on Multimodal Interaction
+    "mm":       "S4306417570",   # ACM Multimedia
+    "vis":      "S4306418840",   # IEEE VGTC Conference on Visualization
 }
+
+OPENALEX_VENUE_ALIASES = {
+    "chi": ["chi conference on human factors in computing systems", "human factors in computing systems"],
+    "uist": ["user interface software and technology", "uist"],
+    "cscw": ["computer supported cooperative work", "cscw"],
+    "ubicomp": ["ubicomp", "international joint conference on pervasive and ubiquitous computing", "ubiquitous computing"],
+    "imwut": ["imwut", "interactive mobile wearable and ubiquitous technologies"],
+    "dis": ["designing interactive systems", "dis conference"],
+    "iui": ["intelligent user interfaces", "acm intelligent user interfaces", "iui"],
+    "tei": ["tangible, embedded and embodied interaction", "tangible embedded and embodied interaction"],
+    "mobilehci": ["human-computer interaction with mobile devices and services"],
+    "assets": ["sigaccess conference on computers and accessibility"],
+    "nime": ["new interfaces for musical expression", "nime"],
+    "hri": ["human-robot interaction"],
+    "its": ["interactive tabletops and surfaces", "its"],
+    "gi": ["graphics interface"],
+    "muc": ["multimodal interaction", "icmi"],
+    "mm": ["acm multimedia", "international conference on multimedia"],
+    "vis": ["ieee vgtc conference on visualization", "ieee visualization", "visualization conference"],
+}
+
+SUMMARY_STOPWORDS = {
+    "a", "an", "and", "for", "from", "in", "of", "on", "the", "to", "with",
+    "about", "after", "before", "between", "paper", "papers", "research", "results",
+    "search", "topic", "using", "based",
+}
+SUMMARY_ACRONYMS = {
+    "acm", "ai", "ar", "chi", "cscw", "cv", "cvpr", "dis", "gi", "hci", "hri",
+    "iui", "its", "llm", "ml", "mm", "muc", "nime", "nlp", "tei", "uist", "ui",
+    "ux", "vis", "vr",
+}
+
+
+def _render_summary_word(token: str) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if lowered in SUMMARY_ACRONYMS:
+        return lowered.upper()
+    if value.isdigit():
+        return value
+    return value.capitalize()
+
+
+def build_search_summary_name(*sources: str) -> str:
+    selected: list[str] = []
+    seen: set[str] = set()
+    fallback: list[str] = []
+    for source in sources:
+        for raw in re.findall(r"[A-Za-z0-9]+", str(source or "")):
+            lowered = raw.lower()
+            if lowered not in seen:
+                seen.add(lowered)
+                fallback.append(raw)
+            if lowered in SUMMARY_STOPWORDS:
+                continue
+            if lowered.isdigit() and len(lowered) == 4:
+                continue
+            if len(lowered) <= 1 and lowered not in SUMMARY_ACRONYMS:
+                continue
+            if lowered not in {item.lower() for item in selected}:
+                selected.append(raw)
+            if len(selected) >= 3:
+                break
+        if len(selected) >= 3:
+            break
+    if len(selected) < 2:
+        for raw in fallback:
+            lowered = raw.lower()
+            if lowered.isdigit() and len(lowered) == 4:
+                continue
+            if lowered not in {item.lower() for item in selected}:
+                selected.append(raw)
+            if len(selected) >= 2:
+                break
+    if not selected:
+        return "Research Topic"
+    return " ".join(
+        rendered for rendered in (_render_summary_word(item) for item in selected[:3]) if rendered
+    ) or "Research Topic"
 
 NO_PROXY_SESSION = None
 
@@ -176,10 +265,17 @@ def openalex_search(keywords: str, venue: str | None, top: int, year_from: int) 
     base = "https://api.openalex.org/works"
 
     filters = []
+    has_source_filter = False
+    venue_aliases = []
     if venue:
+        venue_aliases = OPENALEX_VENUE_ALIASES.get(venue.lower(), [])
         vid = OPENALEX_VENUE_IDS.get(venue.lower())
         if vid:
             filters.append(f"primary_location.source.id:{vid}")
+            has_source_filter = True
+        elif not venue_aliases:
+            print(f"[search] OpenAlex fallback 跳过未映射 venue: {venue}")
+            return []
     if year_from:
         filters.append(f"publication_year:{year_from}-2030")
 
@@ -202,13 +298,17 @@ def openalex_search(keywords: str, venue: str | None, top: int, year_from: int) 
         return []
 
     for item in data.get("results", []):
+        venue_name = (item.get("primary_location") or {}).get("source") or {}
+        venue_name = venue_name.get("display_name", "") if isinstance(venue_name, dict) else ""
+        venue_name_lower = venue_name.lower()
+        if venue and not has_source_filter and venue_aliases:
+            if not any(alias in venue_name_lower for alias in venue_aliases):
+                continue
         authors_raw = item.get("authorships", [])
         authors = [a.get("author", {}).get("display_name", "") for a in authors_raw]
         doi = item.get("doi") or ""
         if doi.startswith("https://doi.org/"):
             doi = doi[len("https://doi.org/"):]
-        venue_name = (item.get("primary_location") or {}).get("source") or {}
-        venue_name = venue_name.get("display_name", "") if isinstance(venue_name, dict) else ""
         abstract = _reconstruct_abstract(item.get("abstract_inverted_index"))
         openalex_id = item.get("ids", {}).get("openalex", "")
         ee = [f"https://doi.org/{doi}"] if doi else []
@@ -222,6 +322,7 @@ def openalex_search(keywords: str, venue: str | None, top: int, year_from: int) 
             "ee": ee,
             "abstract": abstract,
             "key": openalex_id,
+            "_source_engine": "openalex",
         })
 
     return papers
@@ -291,6 +392,7 @@ def dblp_search(keywords: str, venue: str | None, top: int, year_from: int) -> l
             "ee": ee,
             "abstract": "",
             "key": hit.get("@id", ""),
+            "_source_engine": "dblp",
         })
 
     return papers
@@ -332,21 +434,27 @@ def fetch_abstracts_for_papers(papers: list[dict], tmp_dir: str, max_concurrent:
 def write_csv(papers: list[dict], output_path: str):
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "matched_kw", "title", "venue", "year", "authors", "doi", "url", "abstract"
+            "matched_kw", "matched_venue", "source_engine", "relevance_label", "relevance_score", "autotags", "review_reason", "title", "venue", "year", "authors", "doi", "url", "abstract"
         ])
         writer.writeheader()
         for p in papers:
             ee = p.get("ee") or []
             authors = p.get("authors", [])
             writer.writerow({
-                "matched_kw": p.get("_matched_kw", ""),
+                "matched_kw": p.get("_matched_kw", "") or p.get("matched_kw", ""),
+                "matched_venue": p.get("_matched_venue", "") or p.get("matched_venue", ""),
+                "source_engine": p.get("_source_engine", "") or p.get("source_engine", ""),
+                "relevance_label": p.get("relevance_label", ""),
+                "relevance_score": p.get("relevance_score", ""),
+                "autotags": ", ".join(p.get("autotags") or []),
+                "review_reason": p.get("review_reason", ""),
                 "title": p.get("title", ""),
                 "venue": p.get("venue", ""),
                 "year": p.get("year", ""),
                 "authors": ", ".join(authors) if isinstance(authors, list) else str(authors),
                 "doi": p.get("doi", ""),
-                "url": ee[0] if ee else "",
-                "abstract": (p.get("abstract") or "").replace("\n", " ").strip(),
+                "url": (ee[0] if ee else "") or p.get("url", ""),
+                "abstract": (p.get("abstract") or p.get("content") or "").replace("\n", " ").strip(),
             })
 
 
@@ -361,6 +469,12 @@ def build_json_records(papers: list[dict]) -> list[dict]:
             "title": p.get("title", ""),
             "content": content,
             "matched_kw": p.get("_matched_kw", ""),
+            "matched_venue": p.get("_matched_venue", ""),
+            "source_engine": p.get("_source_engine", ""),
+            "relevance_label": p.get("relevance_label", ""),
+            "relevance_score": p.get("relevance_score", 0),
+            "autotags": p.get("autotags") or [],
+            "review_reason": p.get("review_reason", ""),
             "venue": p.get("venue", ""),
             "year": p.get("year", ""),
             "authors": ", ".join(authors) if isinstance(authors, list) else str(authors),
@@ -406,12 +520,34 @@ def write_site(records: list[dict], output_path: str, meta: dict):
                 paper.get("authors") or "",
             ] if item
         )
+        review_meta = " · ".join(
+            item for item in [
+                f"相关性：{paper.get('relevance_label')}" if paper.get("relevance_label") else "",
+                f"分数：{paper.get('relevance_score')}" if paper.get("relevance_score") not in ("", None) else "",
+                "标签：" + ", ".join(paper.get("autotags") or []) if paper.get("autotags") else "",
+            ] if item
+        )
         doi_text = f"DOI: {escape(str(paper.get('doi') or ''))}" if paper.get("doi") else ""
         link_html = (
             f'<a href="{escape(str(paper.get("url") or ""))}" target="_blank" rel="noreferrer">原文链接</a>'
             if paper.get("url") else ""
         )
         meta_line = " · ".join(item for item in [doi_text, link_html] if item)
+        relevance_label = str(paper.get("relevance_label") or "").strip().lower()
+        review_pills = []
+        if relevance_label:
+            score = paper.get("relevance_score")
+            suffix = f" · {score}" if score not in ("", None) else ""
+            review_pills.append(
+                f'<span class="review-pill {escape(relevance_label)}">相关性：{escape(relevance_label)}{escape(str(suffix))}</span>'
+            )
+        for tag in paper.get("autotags") or []:
+            value = str(tag or "").strip()
+            if not value:
+                continue
+            review_pills.append(
+                f'<button class="review-pill" type="button" data-autotag-filter="{escape(value.lower())}">{escape(value)}</button>'
+            )
         return f"""
         <article class="card">
           <div class="card-head">
@@ -419,7 +555,10 @@ def write_site(records: list[dict], output_path: str, meta: dict):
             <h2 class="paper-title">{escape(str(paper.get("title") or ""))}</h2>
           </div>
           <div class="paper-meta">{escape(line_meta)}</div>
+          {'<div class="review-row">' + ''.join(review_pills) + '</div>' if review_pills else ''}
+          <div class="paper-meta">{escape(review_meta)}</div>
           <div class="paper-meta">{meta_line}</div>
+          {f'<div class="paper-meta">复核说明：{escape(str(paper.get("review_reason") or ""))}</div>' if paper.get("review_reason") else ''}
           <div class="content">{escape(preview_text(paper.get("content") or "暂无内容"))}</div>
           <div class="actions">
             <button class="action" type="button" onclick="addCitation({json.dumps(paper.get('csv_index'))})">加入深度阅读</button>
@@ -569,6 +708,26 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       margin-bottom: 12px;
       line-height: 1.7;
     }}
+    .review-row {{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-bottom: 12px;
+    }}
+    .review-pill {{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      line-height: 1;
+      background: #efe2d4;
+      color: #6f6455;
+    }}
+    .review-pill.high {{ background:#dceee4; color:#215f43; }}
+    .review-pill.medium {{ background:#efe7d2; color:#7a5d18; }}
+    .review-pill.low {{ background:#f2dddd; color:#8a3d32; }}
     .content {{
       white-space: pre-wrap;
       line-height: 1.8;
@@ -671,6 +830,8 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     </section>
 
     <section class="filters" id="kw-filters"></section>
+    <section class="filters" id="relevance-filters"></section>
+    <section class="filters" id="autotag-filters"></section>
 
     <section id="list" class="list">{initial_cards_html}</section>
     <template id="empty">
@@ -690,9 +851,13 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     const input = document.getElementById('q');
     const count = document.getElementById('count');
     const kwFilters = document.getElementById('kw-filters');
+    const relevanceFilters = document.getElementById('relevance-filters');
+    const autotagFilters = document.getElementById('autotag-filters');
     const emptyTemplate = document.getElementById('empty');
     let expansionIndex = {{}};
     let activeMatchedKw = 'all';
+    let activeRelevance = 'all';
+    let activeAutotag = 'all';
     let readingGroups = [];
     const toast = document.createElement('div');
     toast.className = 'toast';
@@ -796,7 +961,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       }});
     }}
 
-    async function submitCitation(searchSlug, paper) {{
+    async function submitCitation(searchSlug, paper, preferredGroupName = '') {{
       const dialog = ensureCitationDialog();
       document.getElementById('citation-dialog-title').textContent = paper.title || '';
       const select = document.getElementById('citation-group-select');
@@ -812,6 +977,11 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       select.innerHTML = '<option value="">暂不加入 Group</option>' + readingGroups.map(
         (group) => `<option value="${{group.id}}">${{esc(group.name)}}</option>`
       ).join('');
+      const preferred = text(preferredGroupName).trim().toLowerCase();
+      if (preferred) {{
+        const matchedGroup = readingGroups.find((group) => text(group.name).trim().toLowerCase() === preferred);
+        if (matchedGroup) select.value = String(matchedGroup.id);
+      }}
       fileInput.value = '';
       progressBox.style.display = 'none';
       progressBar.style.width = '0%';
@@ -905,6 +1075,28 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       return values;
     }}
 
+    function uniqueRelevanceLabels() {{
+      const order = ['high', 'medium', 'low'];
+      return order.filter((label) => papers.some((paper) => text(paper.relevance_label).trim().toLowerCase() === label));
+    }}
+
+    function uniqueAutotags() {{
+      const values = [];
+      const seen = new Set();
+      for (const paper of papers) {{
+        if (text(paper.relevance_label).trim().toLowerCase() !== 'high') continue;
+        for (const tag of (paper.autotags || [])) {{
+          const value = text(tag).trim();
+          if (!value) continue;
+          const key = value.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          values.push(value);
+        }}
+      }}
+      return values.sort((a, b) => a.localeCompare(b));
+    }}
+
     async function apiPost(path, body) {{
       const resp = await fetch(path, {{
         method: 'POST',
@@ -926,7 +1118,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
         if (!readingGroups.length) {{
           await loadReadingGroups();
         }}
-        const data = await submitCitation(meta.slug || '', paper);
+        const data = await submitCitation(meta.output_slug || meta.slug || '', paper, meta.group_name || meta.summary_name || '');
         if (!data) return;
         if (data.error) throw new Error(data.error);
         if (data.reading_url) {{
@@ -983,6 +1175,20 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       const expanded = Boolean(expansion && expansion.site_url);
       const expandLabel = expanded ? '查看相关论文' : '延展搜索';
       const expandClass = expanded ? 'action secondary related' : 'action secondary';
+      const relevanceLabel = text(paper.relevance_label).trim().toLowerCase();
+      const reviewPills = [];
+      if (relevanceLabel) {{
+        const score = paper.relevance_score !== '' && paper.relevance_score !== null && paper.relevance_score !== undefined
+          ? ` · ${{paper.relevance_score}}`
+          : '';
+        reviewPills.push(`<span class="review-pill ${{esc(relevanceLabel)}}">相关性：${{esc(relevanceLabel)}}${{esc(score)}}</span>`);
+      }}
+      for (const tag of (paper.autotags || [])) {{
+        const value = text(tag).trim();
+        if (!value) continue;
+        reviewPills.push(`<button class="review-pill" type="button" data-autotag-filter="${{esc(value.toLowerCase())}}">${{esc(value)}}</button>`);
+      }}
+      const reviewReason = text(paper.review_reason).trim();
       return `
         <article class="card${{expanded ? ' expanded' : ''}}">
           <div class="card-head">
@@ -990,7 +1196,9 @@ def write_site(records: list[dict], output_path: str, meta: dict):
             <h2 class="paper-title">${{esc(paper.title)}}</h2>
           </div>
           <div class="paper-meta">${{esc(lineMeta)}}</div>
+          ${{reviewPills.length ? `<div class="review-row">${{reviewPills.join('')}}</div>` : ''}}
           <div class="paper-meta">${{[doi, link].filter(Boolean).join(' · ')}}</div>
+          ${{reviewReason ? `<div class="paper-meta">复核说明：${{esc(reviewReason)}}</div>` : ''}}
           <div class="content">${{esc(previewText || '暂无内容')}}</div>
           <div class="actions">
             <button class="action" type="button" onclick="addCitation(${{paper.csv_index}})">加入深度阅读</button>
@@ -1020,6 +1228,46 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       }});
     }}
 
+    function renderRelevanceFilters() {{
+      const values = uniqueRelevanceLabels();
+      if (!relevanceFilters) return;
+      if (!values.length) {{
+        relevanceFilters.innerHTML = '';
+        return;
+      }}
+      relevanceFilters.innerHTML = [
+        `<button class="tag${{activeRelevance === 'all' ? ' active' : ''}}" type="button" data-relevance-filter="all">全部相关性</button>`,
+        ...values.map((label) => `<button class="tag${{activeRelevance === label ? ' active' : ''}}" type="button" data-relevance-filter="${{esc(label)}}">${{esc(label)}}</button>`)
+      ].join('');
+      relevanceFilters.querySelectorAll('[data-relevance-filter]').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          activeRelevance = button.dataset.relevanceFilter || 'all';
+          renderRelevanceFilters();
+          render(input.value);
+        }});
+      }});
+    }}
+
+    function renderAutotagFilters() {{
+      const values = uniqueAutotags();
+      if (!autotagFilters) return;
+      if (!values.length) {{
+        autotagFilters.innerHTML = '';
+        return;
+      }}
+      autotagFilters.innerHTML = [
+        `<button class="tag${{activeAutotag === 'all' ? ' active' : ''}}" type="button" data-autotag-group-filter="all">全部标签</button>`,
+        ...values.map((tag) => `<button class="tag${{activeAutotag === tag.toLowerCase() ? ' active' : ''}}" type="button" data-autotag-group-filter="${{esc(tag.toLowerCase())}}">${{esc(tag)}}</button>`)
+      ].join('');
+      autotagFilters.querySelectorAll('[data-autotag-group-filter]').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          activeAutotag = button.dataset.autotagGroupFilter || 'all';
+          renderAutotagFilters();
+          render(input.value);
+        }});
+      }});
+    }}
+
     function render(query = '') {{
       const q = query.trim().toLowerCase();
       const byText = !q ? papers : papers.filter((paper) => {{
@@ -1028,11 +1276,19 @@ def write_site(records: list[dict], output_path: str, meta: dict):
           paper.content,
           paper.matched_kw,
           paper.venue,
-          paper.authors
+          paper.authors,
+          paper.relevance_label,
+          (paper.autotags || []).join(' '),
+          paper.review_reason
         ].join('\\n').toLowerCase();
         return haystack.includes(q);
       }});
-      const filtered = byText.filter((paper) => activeMatchedKw === 'all' || text(paper.matched_kw).trim().toLowerCase() === activeMatchedKw);
+      const filtered = byText.filter((paper) => {{
+        const matchedOk = activeMatchedKw === 'all' || text(paper.matched_kw).trim().toLowerCase() === activeMatchedKw;
+        const relevanceOk = activeRelevance === 'all' || text(paper.relevance_label).trim().toLowerCase() === activeRelevance;
+        const autotagOk = activeAutotag === 'all' || (paper.autotags || []).some((tag) => text(tag).trim().toLowerCase() === activeAutotag);
+        return matchedOk && relevanceOk && autotagOk;
+      }});
 
       count.textContent = filtered.length;
       if (!filtered.length) {{
@@ -1060,6 +1316,15 @@ def write_site(records: list[dict], output_path: str, meta: dict):
 
     input.addEventListener('input', (event) => render(event.target.value));
     renderKeywordFilters();
+    renderRelevanceFilters();
+    renderAutotagFilters();
+    list.addEventListener('click', (event) => {{
+      const button = event.target.closest('[data-autotag-filter]');
+      if (!button) return;
+      activeAutotag = button.dataset.autotagFilter || 'all';
+      renderAutotagFilters();
+      render(input.value);
+    }});
     loadExpansions().finally(() => {{
       if (Object.keys(expansionIndex || {{}}).length) {{
         render(input.value);
@@ -1099,6 +1364,7 @@ def run_topic_search(
     top: int = 100,
     year_from: int = 0,
     fetch_abstract: bool = True,
+    summary_name: str = "",
     progress_callback=None,
 ) -> dict:
     keyword_groups = [k.strip() for k in (keywords or []) if str(k).strip()]
@@ -1110,6 +1376,11 @@ def run_topic_search(
     slug = (slug or "").strip()
     if not slug:
         raise ValueError("slug 不能为空。")
+    summary_name = " ".join(str(summary_name or "").split()) or build_search_summary_name(
+        slug.replace("-", " "),
+        " ".join(keyword_groups),
+        " ".join(venue_list),
+    )
 
     dated_slug, out_dir = _build_search_output_dir(slug)
     os.makedirs(out_dir, exist_ok=True)
@@ -1141,6 +1412,8 @@ def run_topic_search(
             json.dump(
                 {
                     "slug": slug,
+                    "summary_name": summary_name,
+                    "group_name": summary_name,
                     "keywords": keyword_groups,
                     "venues": [v for v in search_venues if v],
                     "top_per_group": top,
@@ -1177,6 +1450,7 @@ def run_topic_search(
                     if key not in seen_keys:
                         seen_keys.add(key)
                         p["_matched_kw"] = kw
+                        p["_matched_venue"] = venue or ""
                         all_papers.append(p)
                         new += 1
                 kw_hits += new
@@ -1234,6 +1508,8 @@ def run_topic_search(
 
         output_meta = {
             "slug": slug,
+            "summary_name": summary_name,
+            "group_name": summary_name,
             "keywords": keyword_groups,
             "venues": [v for v in search_venues if v],
             "top_per_group": top,
@@ -1290,6 +1566,8 @@ def main():
                         help="逗号分隔的会议缩写，空则全 DBLP 范围搜索")
     parser.add_argument("--slug", required=True,
                         help="话题简称，用于命名输出目录，仅限英文/数字/连字符。示例: physio-ui")
+    parser.add_argument("--summary-name", default="",
+                        help="2-3 words 的概括名，用于搜索分组和后续深度阅读 group")
     parser.add_argument("--top", type=int, default=100,
                         help="每组关键词 × 每个 venue 各取最多 N 篇，合并去重（默认 100）")
     parser.add_argument("--year-from", type=int, default=0,
@@ -1302,6 +1580,7 @@ def main():
         keywords=[k.strip() for k in args.keywords.split(";") if k.strip()],
         venues=[v.strip() for v in args.venues.split(",") if v.strip()],
         slug=args.slug,
+        summary_name=args.summary_name,
         top=args.top,
         year_from=args.year_from,
         fetch_abstract=not args.no_abstract,

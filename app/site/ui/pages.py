@@ -134,6 +134,13 @@ def build_timeline_html():
       color:white; background:var(--accent); text-decoration:none; padding:10px 14px;
       border:none; border-radius:999px; font:inherit; cursor:pointer;
     }}
+    .research-actions button:disabled {{
+      background: #cfc7bb;
+      color: #8c8375;
+      cursor: not-allowed;
+      box-shadow: none;
+      opacity: 1;
+    }}
     .research-actions button.busy {{
       background: #c8733f;
       box-shadow: 0 0 0 4px rgba(200, 115, 63, 0.14);
@@ -145,6 +152,31 @@ def build_timeline_html():
     .research-status, .research-job {{
       margin-top: 14px; border: 1px solid var(--line); border-radius: 18px; padding: 14px;
       background: rgba(255,255,255,0.55);
+    }}
+    .research-progress {{
+      margin-top: 10px;
+    }}
+    .research-progress-row {{
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      align-items:center;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .research-progress-track {{
+      margin-top: 8px;
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      background: #ead8ca;
+      overflow: hidden;
+    }}
+    .research-progress-bar {{
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #c8733f, #9c4f2f);
+      transition: width .25s ease;
     }}
     .guide {{
       margin-top: 12px;
@@ -323,6 +355,11 @@ def build_timeline_html():
     let previewResearchPlan = null;
     let previewResearchPrompt = '';
 
+    function syncResearchSubmitState() {{
+      if (!researchSubmit) return;
+      researchSubmit.disabled = !previewResearchPlan;
+    }}
+
     function esc(value) {{
       return (value || '').toString()
         .replaceAll('&', '&amp;')
@@ -352,6 +389,56 @@ def build_timeline_html():
       if (phase === 'success') button.classList.add('success');
     }}
 
+    function researchProgressState(job) {{
+      const status = (job && job.status || '').toString();
+      const step = (job && job.current_step || '').toString();
+      const stepMessage = (job && job.step_message || '').toString();
+      const reviewSummary = (job && job.review_summary) || {{}};
+      if (status === 'completed') {{
+        return {{
+          percent: 100,
+          label: '已完成',
+          detail: `high ${{Number(reviewSummary.high || 0)}} / medium ${{Number(reviewSummary.medium || 0)}} / low ${{Number(reviewSummary.low || 0)}}`
+        }};
+      }}
+      if (status === 'failed') {{
+        return {{ percent: 100, label: '失败', detail: '任务已停止' }};
+      }}
+      if (status === 'preview') {{
+        return {{ percent: 20, label: '方案预览', detail: '等待确认并启动搜索' }};
+      }}
+      const mapping = {{
+        queued: [5, '排队中', '等待 research 并发槽位'],
+        planning: [15, '规划中', '正在生成 research 搜索方案'],
+        planned: [25, '方案完成', '准备启动搜索'],
+        searching: [45, '搜索中', '正在召回与去重'],
+        search_completed: [60, '搜索完成', '准备摘要或导出'],
+        fetching_abstracts: [75, '抓取摘要', '正在补摘要内容'],
+        abstracts_completed: [85, '摘要完成', '准备整理输出'],
+        abstracts_skipped: [82, '跳过摘要', '准备整理输出'],
+        writing_outputs: [92, '整理输出', '正在写入 CSV / JSON / site'],
+        reviewing_results: [97, '复核结果', '正在做相关性判断和 autotag'],
+      }};
+      if (step === 'reviewing_results') {{
+        const matchedReviewBatch = stepMessage.match(/第\\s*(\\d+)\\s*\\/\\s*(\\d+)\\s*批/);
+        if (matchedReviewBatch) {{
+          const currentBatch = Number(matchedReviewBatch[1] || 0);
+          const totalBatches = Number(matchedReviewBatch[2] || 0);
+          if (currentBatch > 0 && totalBatches > 0) {{
+            const ratio = Math.min(1, currentBatch / totalBatches);
+            const percent = Math.max(93, Math.min(99, Math.round(92 + ratio * 7)));
+            return {{
+              percent,
+              label: '复核结果',
+              detail: `正在做相关性判断和 autotag（第 ${{currentBatch}}/${{totalBatches}} 批）`
+            }};
+          }}
+        }}
+      }}
+      const matched = mapping[step] || mapping[status] || [12, '处理中', '任务正在运行'];
+      return {{ percent: matched[0], label: matched[1], detail: matched[2] }};
+    }}
+
     function renderResearchStatus(job) {{
       if (!researchStatus) return;
       if (!job) {{
@@ -360,6 +447,8 @@ def build_timeline_html():
         return;
       }}
       const plan = job.plan || {{}};
+      const suggestion = plan.query_suggestion || {{}};
+      const progress = researchProgressState(job);
       const hasKeywords = Array.isArray(plan.keywords) && plan.keywords.length > 0;
       const hasSlug = Boolean((plan.slug || '').toString().trim());
       const hasPlan = hasKeywords || hasSlug;
@@ -372,6 +461,18 @@ def build_timeline_html():
       researchStatus.innerHTML = `
         <div><strong>状态：</strong>${{esc(job.status || '')}}</div>
         <div style="margin-top:6px;"><strong>当前步骤：</strong>${{esc(job.step_message || '')}}</div>
+        <div class="research-progress">
+          <div class="research-progress-row">
+            <span>${{esc(progress.label)}}</span>
+            <span>${{progress.percent}}%</span>
+          </div>
+          <div class="research-progress-track">
+            <div class="research-progress-bar" style="width:${{progress.percent}}%;"></div>
+          </div>
+          <div class="meta" style="margin-top:8px;">${{esc(progress.detail)}}</div>
+        </div>
+        ${{suggestion.candidate_keywords && suggestion.candidate_keywords.length ? `<div style="margin-top:6px;"><strong>智能建议检索词：</strong>${{esc((suggestion.candidate_keywords || []).join(' ; '))}}</div>` : ''}}
+        ${{suggestion.avoid_keywords && suggestion.avoid_keywords.length ? `<div style="margin-top:6px;"><strong>建议避免：</strong>${{esc((suggestion.avoid_keywords || []).join(' ; '))}}</div>` : ''}}
         ${{hasPlan ? `<div style="margin-top:6px;"><strong>方案：</strong>${{esc((plan.keywords || []).join(' ; '))}}${{plan.venues && plan.venues.length ? ` | venues: ${{esc(plan.venues.join(', '))}}` : ''}}</div>` : ''}}
         ${{hasPlan ? `<div style="margin-top:6px;"><strong>slug：</strong>${{esc(plan.slug || '')}}${{plan.year_from ? ` | year_from: ${{esc(plan.year_from)}}` : ''}}</div>` : ''}}
         ${{links.length ? `<div class="research-job-links">${{links.join('')}}</div>` : ''}}
@@ -382,6 +483,7 @@ def build_timeline_html():
       previewResearchPlan = plan || null;
       previewResearchPrompt = prompt || '';
       if (researchEditor) researchEditor.style.display = previewResearchPlan ? 'block' : 'none';
+      syncResearchSubmitState();
       if (previewResearchPlan) {{
         if (researchEditSlug) researchEditSlug.value = previewResearchPlan.slug || '';
         if (researchEditYearFrom) researchEditYearFrom.value = previewResearchPlan.year_from || 0;
@@ -403,6 +505,7 @@ def build_timeline_html():
       previewResearchPlan = null;
       previewResearchPrompt = '';
       if (researchEditor) researchEditor.style.display = 'none';
+      syncResearchSubmitState();
       if (researchEditSlug) researchEditSlug.value = '';
       if (researchEditYearFrom) researchEditYearFrom.value = '';
       if (researchEditTop) researchEditTop.value = '';
@@ -427,11 +530,22 @@ def build_timeline_html():
 
     function renderResearchJobs(items) {{
       if (!researchJobs) return;
-      if (!items || !items.length) {{
+      const allJobs = Array.isArray(items) ? items : [];
+      const pendingStatuses = new Set(['queued', 'running', 'planning', 'planned', 'searching', 'search_completed', 'fetching_abstracts', 'abstracts_completed', 'abstracts_skipped', 'writing_outputs', 'reviewing_results']);
+      const activeJobs = allJobs.filter((job) => pendingStatuses.has((job.status || '').toString()));
+      const completedJobs = allJobs
+        .filter((job) => (job.status || '') === 'completed')
+        .sort((a, b) => {{
+          const aTime = Date.parse(a.updated_at || a.created_at || '') || 0;
+          const bTime = Date.parse(b.updated_at || b.created_at || '') || 0;
+          return bTime - aTime;
+        }});
+      const visibleJobs = activeJobs.concat(completedJobs.slice(0, 1));
+      if (!visibleJobs.length) {{
         researchJobs.innerHTML = '';
         return;
       }}
-      researchJobs.innerHTML = items.map((job) => {{
+      researchJobs.innerHTML = visibleJobs.map((job) => {{
         const plan = job.plan || {{}};
         const links = [];
         if (job.site_relative_url) links.push(`<a href="${{job.site_relative_url}}" target="_blank" rel="noreferrer">结果网页</a>`);
@@ -448,12 +562,42 @@ def build_timeline_html():
       }}).join('');
     }}
 
+    function pickPrimaryResearchJob(items) {{
+      const allJobs = Array.isArray(items) ? items : [];
+      if (!allJobs.length) return null;
+      const pendingSteps = new Set(['queued', 'planning', 'planned', 'searching', 'search_completed', 'fetching_abstracts', 'abstracts_completed', 'abstracts_skipped', 'writing_outputs', 'reviewing_results']);
+      const pendingJobs = allJobs
+        .filter((job) => {{
+          const status = (job.status || '').toString();
+          const step = (job.current_step || '').toString();
+          return status === 'queued' || status === 'running' || pendingSteps.has(step);
+        }})
+        .sort((a, b) => {{
+          const aTime = Date.parse(a.updated_at || a.created_at || '') || 0;
+          const bTime = Date.parse(b.updated_at || b.created_at || '') || 0;
+          return bTime - aTime;
+        }});
+      if (pendingJobs.length) return pendingJobs[0];
+      const completedJobs = allJobs
+        .filter((job) => (job.status || '') === 'completed')
+        .sort((a, b) => {{
+          const aTime = Date.parse(a.updated_at || a.created_at || '') || 0;
+          const bTime = Date.parse(b.updated_at || b.created_at || '') || 0;
+          return bTime - aTime;
+        }});
+      return completedJobs[0] || allJobs[0] || null;
+    }}
+
     async function fetchResearchJobs() {{
       const resp = await fetch('/api/research/jobs', {{ credentials: 'same-origin' }});
       const data = await resp.json().catch(() => ({{ ok: false, jobs: [] }}));
       if (!resp.ok || data.ok === false) return [];
-      renderResearchJobs(data.jobs || []);
-      return data.jobs || [];
+      const jobs = data.jobs || [];
+      renderResearchJobs(jobs);
+      if (!activeResearchJobId) {{
+        renderResearchStatus(pickPrimaryResearchJob(jobs));
+      }}
+      return jobs;
     }}
 
     async function pollResearchJob(jobId) {{
@@ -508,7 +652,7 @@ def build_timeline_html():
         }} finally {{
           researchCompose.disabled = false;
           window.setTimeout(() => setActionButtonState(researchCompose, ''), 1800);
-          if (researchSubmit) researchSubmit.disabled = false;
+          syncResearchSubmitState();
         }}
       }});
     }}
@@ -564,11 +708,12 @@ def build_timeline_html():
         }} catch (error) {{
           renderResearchStatus({{ status: 'failed', step_message: error.message, plan: previewResearchPlan || {{}} }});
         }} finally {{
-          researchSubmit.disabled = false;
+          syncResearchSubmitState();
           window.setTimeout(() => setActionButtonState(researchSubmit, ''), 2400);
           if (researchCompose) researchCompose.disabled = false;
         }}
       }});
+      syncResearchSubmitState();
       fetchResearchJobs().catch(() => {{}});
     }}
     expansionFilterButtons.forEach((button) => {{
@@ -878,7 +1023,7 @@ def build_keyword_detail_html(keyword: str):
       readingGroups = data.ok ? (data.groups || []) : [];
     }}
 
-    async function submitCitation(searchSlug, paper) {{
+    async function submitCitation(searchSlug, paper, preferredGroupName = '') {{
       const dialog = ensureCitationDialog();
       document.getElementById('citation-dialog-title').textContent = paper.title || '';
       const select = document.getElementById('citation-group-select');
@@ -894,6 +1039,11 @@ def build_keyword_detail_html(keyword: str):
       select.innerHTML = '<option value="">暂不加入 Group</option>' + readingGroups.map(
         (group) => `<option value="${{group.id}}">${{escapeHtml(group.name)}}</option>`
       ).join('');
+      const preferred = (preferredGroupName || '').toString().trim().toLowerCase();
+      if (preferred) {{
+        const matchedGroup = readingGroups.find((group) => (group.name || '').toString().trim().toLowerCase() === preferred);
+        if (matchedGroup) select.value = String(matchedGroup.id);
+      }}
       fileInput.value = '';
       progressBox.style.display = 'none';
       progressBar.style.width = '0%';
@@ -985,7 +1135,7 @@ def build_keyword_detail_html(keyword: str):
         if (!readingGroups.length) {{
           await loadReadingGroups();
         }}
-        const data = await submitCitation(paper.source_slug || '', paper);
+        const data = await submitCitation(paper.source_output_slug || paper.source_slug || '', paper, paper.source_group_name || '');
         if (!data) return;
         if (data.error) throw new Error(data.error);
         if (data.reading_url) {{

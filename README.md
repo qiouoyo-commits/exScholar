@@ -2,13 +2,19 @@
 
 `exScholar` 是一套面向本地部署的论文搜索、PDF intake、深度阅读与阅读库管理工具。项目当前统一运行在 `openclaw-analytics` conda 环境中，并通过 OpenClaw 处理 PDF 元数据抽取、结构化分析和问答链路。
 
+为避免文档和本机路径强耦合，下面统一使用两个占位写法：
+
+- `<repo-root>`：仓库根目录
+- `<openclaw-python>`：`openclaw-analytics` 环境中的 Python，可通过 `OPENCLAW_ANALYTICS_PYTHON` 指向
+
 ## 主要功能
 
 - 按关键词搜索 DBLP 论文并导出网页、CSV、JSON
-- 在网页中发起自然语言 research 搜索
+- 在网页中发起自然语言 research 搜索，自动生成更贴合学术表达的检索词建议，并在结果阶段做相关性复核与自动标签
 - 上传一个或多个 PDF，自动去重、建库、生成阅读工作区
 - 从搜索结果页加入深度阅读时，先打开原文链接手动下载 PDF，再上传 PDF
-- 在 OpenClaw 对话侧通过 `picsearch` 标准动作提交论文截图图片，按“图片识别 -> DBLP -> 官方 web 结果筛选 -> DOI fallback”定位论文并加入当天 `webreading` timeline，关键词统一为 `picsearch`
+- 在 OpenClaw 对话侧通过 `picsearch` 标准动作提交论文截图图片；除单篇论文截图外，也支持 Google Scholar 页面截图，并会把识别出的多篇论文统一加入当天 `Picsearch` timeline，同时尽量补抓摘要
+- 在 OpenClaw 对话侧通过 `textsearch` 标准动作提交一个或多个论文标题，把补链接结果加入当天 `Textsearch` timeline，并尽量补抓摘要
 - 基于论文做引用扩展搜索
 - 在阅读页中查看结构化分析、继续提问、保存笔记
 - 支持多用户数据隔离，每个用户拥有独立的 `searches/`、`reading/`、`library/` 和 SQLite 数据库
@@ -22,6 +28,7 @@
 - 微信 PDF intake 说明：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
 - Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
 - OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
+- OpenClaw 文本补链接 skill：[textsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/textsearch/SKILL.md)
 
 ## 快速开始
 
@@ -52,7 +59,7 @@ cp .env.local.example .env.local
 3. 创建登录账号
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python set_site_password.py \
+<openclaw-python> <repo-root>/set_site_password.py \
   --username admin \
   --password 'your-password'
 ```
@@ -87,19 +94,40 @@ systemctl --user restart exscholar-site.service
   --slug "example"
 ```
 
+自然语言 research 链路：
+
+- 先生成学术化检索词建议
+- 再生成正式搜索方案
+- 搜索完成后结合标题和摘要做相关性复核
+- 为结果补充 `relevance_label`、`relevance_score`、`autotags`
+
 本地导入 PDF：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /absolute/path/to/paper.pdf
 ```
 
 图片找论文：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+<openclaw-python> -m app.openclaw.picsearch_cli \
   --wait --json /absolute/path/to/paper-screenshot.png
 ```
+
+文本补链接：
+
+```bash
+<openclaw-python> -m app.openclaw.textsearch_cli \
+  --wait --json "Paper Title A\nPaper Title B"
+```
+
+说明：
+
+- `textsearch` 是当前有效口令；旧的 `titlesearch` 名称已经废弃，不再作为对外入口保留
+- `picsearch` 支持单篇论文截图和 Google Scholar 页面截图
+- `picsearch`、`textsearch` 都会在补链接后尽量继续抓取摘要，因此比纯补链接稍慢
+- 从 `Picsearch` / `Textsearch` 结果加入深度阅读时，系统会优先按论文主题自动生成或复用 Reading Group，而不是直接使用 timeline 名称
 
 同步并重载 OpenClaw skills：
 
@@ -113,7 +141,7 @@ systemctl --user restart openclaw-gateway.service
 当前项目中的主要入口都已统一到：
 
 ```text
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+<openclaw-python>
 ```
 
 包括：

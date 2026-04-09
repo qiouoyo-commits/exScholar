@@ -1,6 +1,6 @@
 # OpenClaw 链路说明
 
-这份文档说明 exScholar 当前使用的 OpenClaw PDF 处理链路，以及它和网页、CLI、阅读页之间的关系。
+这份文档只说明 OpenClaw 侧的专项链路和边界。安装、账号、站点使用方式以 [README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md) 为准，避免重复维护两份用户手册。
 
 ## 1. 相关代码位置
 
@@ -8,6 +8,7 @@
 - [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
 - [paper_lookup.py](/home/ubuntu/tools/exScholar/app/openclaw/paper_lookup.py)
 - [picsearch_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/picsearch_cli.py)
+- [textsearch_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/textsearch_cli.py)
 - [jobs.py](/home/ubuntu/tools/exScholar/app/site/core/jobs.py)
 - [handler.py](/home/ubuntu/tools/exScholar/app/site/http/handler.py)
 - [reading.py](/home/ubuntu/tools/exScholar/app/site/core/reading.py)
@@ -78,12 +79,27 @@ OpenClaw intake 链路会自动完成：
 
 - 先让 OpenClaw 用 `joybuilder-plan/Kimi-K2.5` 识别图片里的论文标题 / DOI / 作者等线索
 - 支持一次提交一张或多张图片，进入同一个后台队列
+- 支持 Google Scholar 页面截图；如果识别到页面中列了多篇论文，会自动逐条补链接
 - 优先尝试 DBLP 匹配
 - DBLP 失败时，在前 20 条 web 结果中优先筛选 ACM、ACL Anthology、arXiv、CVF、PMLR、IEEE、Springer、ScienceDirect、Nature 等官方链接
 - 当 DBLP 和可信 web 候选都不足时，再退回 DOI fallback
-- 将结果统一写入当天 `webreading` timeline
-- 统一使用关键词 `picsearch`
+- 将结果统一写入当天 `Picsearch` timeline，并尽量继续抓取摘要
+- timeline 名仅表示来源；后续加入深度阅读时会按论文主题自动生成或复用更合适的 Reading Group
 - OpenClaw 对话侧可通过 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md) 作为标准动作调用
+
+文本补链接：
+
+```bash
+/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.textsearch_cli \
+  --wait --json "Paper Title A\nPaper Title B"
+```
+
+这条链路会：
+
+- 接收一个或多个论文标题
+- 逐条执行 `DBLP -> 官方 web 候选筛选 -> DOI fallback`
+- 将结果写入当天 `Textsearch` timeline
+- 尽量继续抓取摘要
 
 ## 5. 多用户模式下的数据写入
 
