@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from email.parser import BytesParser
 from email.policy import default
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from ..core import *
 from ..ui.pages import *
@@ -65,6 +65,17 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
     _ALLOWED_STATIC_BINARY_EXTS = {".pdf"}
 
     # Request parsing and response helpers
+    def _normalize_request_target_inplace(self) -> None:
+        raw = str(getattr(self, "path", "") or "")
+        if not raw:
+            return
+        if raw.startswith(("http://", "https://")):
+            parsed = urlsplit(raw)
+            normalized = parsed.path or "/"
+            if parsed.query:
+                normalized = f"{normalized}?{parsed.query}"
+            self.path = normalized
+
     def is_openclaw_public_api(self) -> bool:
         path = self.path.split("?", 1)[0].split("#", 1)[0]
         return (
@@ -907,6 +918,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
     # HTTP verb handlers
     def do_GET(self):
         try:
+            self._normalize_request_target_inplace()
             with user_context(self.current_username()):
                 self._do_GET_impl()
         except Exception as exc:
@@ -1080,6 +1092,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            self._normalize_request_target_inplace()
             with user_context(self.current_username()):
                 self._do_POST_impl()
         except Exception as exc:
@@ -1108,6 +1121,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         try:
+            self._normalize_request_target_inplace()
             with user_context(self.current_username()):
                 self._do_DELETE_impl()
         except Exception as exc:
