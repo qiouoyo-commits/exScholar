@@ -161,10 +161,10 @@ def ensure_reading_workspace_for_citation(citation_id: int):
         "created_at": citation.get("created_at") or now,
         "updated_at": now,
     }
-    paper_json_path.write_text(json.dumps(paper_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_file(paper_json_path, paper_payload)
 
     if not analysis_json_path.exists():
-        analysis_json_path.write_text(json.dumps(default_analysis_payload(paper_id), ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_file(analysis_json_path, default_analysis_payload(paper_id))
     if not qa_history_path.exists():
         qa_history_path.write_text("[]", encoding="utf-8")
     if not notes_path.exists():

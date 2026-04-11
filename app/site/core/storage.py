@@ -266,13 +266,32 @@ def read_json_file(path: Path, default):
         return default
 
 
-def write_json_file(path: Path, payload: dict):
+def sanitize_utf8_surrogates(value):
+    if isinstance(value, str):
+        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            return "".join("\uFFFD" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in value)
+        return value
+    if isinstance(value, list):
+        return [sanitize_utf8_surrogates(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_utf8_surrogates(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            sanitize_utf8_surrogates(key) if isinstance(key, str) else key: sanitize_utf8_surrogates(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def write_json_file(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    cleaned = sanitize_utf8_surrogates(payload)
+    path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_json_file_atomic(path: Path, payload: dict):
+def write_json_file_atomic(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    cleaned = sanitize_utf8_surrogates(payload)
+    temp_path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(path)

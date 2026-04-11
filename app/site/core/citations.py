@@ -29,78 +29,58 @@ AUTO_TAG_PREFIXES = (
 
 def list_keyword_entries() -> list[dict]:
     grouped: dict[str, dict] = {}
-    for out_dir in iter_search_dirs():
-        search_json = out_dir / "search.json"
-        papers_json = out_dir / "papers.json"
-        site_index = out_dir / "site" / "index.html"
-        if not papers_json.exists():
+    for item in _collect_keyword_sets():
+        paper_key = str(item.get("paper_key") or "").strip()
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        doi = str(item.get("doi") or "").strip()
+        paper_id = str(item.get("paper_id") or "").strip()
+        # Drop orphan tag carriers that have no usable paper identity at all.
+        if not any((paper_key, title, url, doi, paper_id)):
             continue
-        try:
-            meta = json.loads(search_json.read_text(encoding="utf-8")) if search_json.exists() else {}
-            payload = json.loads(papers_json.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        date_str = meta.get("date") or out_dir.name.split("_", 1)[0]
-        search_title = meta.get("slug") or out_dir.name.split("_", 1)[-1]
-        site_url = build_site_url(str(out_dir), str(site_index)) if site_index.exists() else f"/{out_dir.relative_to(DATA_DIR).as_posix()}/"
-        for paper in payload.get("papers", []):
-            keyword = (paper.get("matched_kw") or "").strip()
-            if not keyword:
-                continue
+        for keyword in normalize_generated_tags(item.get("keywords") or []):
             key = keyword.lower()
-            entry = grouped.setdefault(key, {"keyword": keyword, "count": 0, "papers": [], "latest_date": ""})
-            entry["count"] += 1
-            if date_str and date_str > (entry.get("latest_date") or ""):
-                entry["latest_date"] = date_str
-            entry["papers"].append(
+            entry = grouped.setdefault(
+                key,
                 {
-                    "title": paper.get("title") or "",
-                    "content": paper.get("content") or "",
-                    "matched_kw": paper.get("matched_kw") or "",
-                    "venue": paper.get("venue") or "",
-                    "year": paper.get("year") or "",
-                    "authors": paper.get("authors") or "",
-                    "doi": paper.get("doi") or "",
-                    "url": paper.get("url") or "",
-                    "paper_id": paper.get("paper_id") or "",
-                    "csv_index": paper.get("csv_index"),
-                    "source_date": date_str,
-                    "source_slug": search_title,
-                    "source_site_url": site_url,
-                    "source_relative_dir": out_dir.relative_to(DATA_DIR).as_posix(),
-                    "source_kind": "search",
-                }
+                    "keyword": keyword,
+                    "count": 0,
+                    "papers": [],
+                    "latest_date": "",
+                    "_paper_keys": set(),
+                },
             )
-    for citation in list_citations():
-        tags = [part.strip() for part in (citation.get("tags") or "").split(",") if part.strip()]
-        for keyword in tags:
-            key = keyword.lower()
-            entry = grouped.setdefault(key, {"keyword": keyword, "count": 0, "papers": [], "latest_date": ""})
-            created_at = (citation.get("created_at") or "")[:10]
+            if paper_key and paper_key in entry["_paper_keys"]:
+                continue
+            if paper_key:
+                entry["_paper_keys"].add(paper_key)
             entry["count"] += 1
-            if created_at and created_at > (entry.get("latest_date") or ""):
-                entry["latest_date"] = created_at
+            item_date = str(item.get("date") or "").strip()
+            if item_date and item_date > (entry.get("latest_date") or ""):
+                entry["latest_date"] = item_date
             entry["papers"].append(
                 {
-                    "title": citation.get("title") or "",
-                    "content": citation.get("abstract") or "",
+                    "title": item.get("title") or "",
+                    "content": item.get("content") or "",
                     "matched_kw": keyword,
-                    "venue": citation.get("venue") or "",
-                    "year": citation.get("year") or "",
-                    "authors": citation.get("authors") or "",
-                    "doi": citation.get("doi") or "",
-                    "url": citation.get("url") or "",
-                    "paper_id": citation.get("reading_paper_id") or "",
+                    "keywords": list(item.get("keywords") or []),
+                    "venue": item.get("venue") or "",
+                    "year": item.get("year") or "",
+                    "authors": item.get("authors") or "",
+                    "doi": item.get("doi") or "",
+                    "url": item.get("url") or "",
+                    "paper_id": item.get("paper_id") or "",
                     "csv_index": None,
-                    "source_date": created_at,
-                    "source_slug": "deep-reading",
-                    "source_site_url": f"/reading/{citation.get('reading_paper_id')}" if citation.get("reading_paper_id") else "/reading",
-                    "source_relative_dir": "",
-                    "source_kind": "deep_reading",
+                    "source_date": item.get("date") or "",
+                    "source_slug": item.get("source_slug") or "",
+                    "source_site_url": item.get("source_site_url") or "",
+                    "source_relative_dir": item.get("source_relative_dir") or "",
+                    "source_kind": item.get("source_kind") or "search",
                 }
             )
     entries = sorted(grouped.values(), key=lambda item: ((item.get("latest_date") or ""), item["keyword"].lower()), reverse=True)
     for entry in entries:
+        entry.pop("_paper_keys", None)
         entry["slug"] = quote(entry["keyword"], safe="")
     return entries
 

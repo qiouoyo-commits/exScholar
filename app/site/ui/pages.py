@@ -885,8 +885,8 @@ def build_keywords_html():
       box-shadow:0 18px 40px rgba(76,50,28,0.08);
     }}
     .graph-layout {{
-      display:grid;
-      grid-template-columns:minmax(0, 1.8fr) minmax(260px, 0.9fr);
+      display:flex;
+      flex-direction:column;
       gap:16px;
       align-items:stretch;
     }}
@@ -988,7 +988,7 @@ def build_keywords_html():
       border-radius:20px;
       background:rgba(255,248,240,0.94);
       padding:16px;
-      min-height:560px;
+      min-height:240px;
       box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);
     }}
     .graph-side h3 {{
@@ -1024,24 +1024,40 @@ def build_keywords_html():
     }}
     .graph-related-list {{
       display:grid;
-      gap:10px;
+      grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+      gap:8px;
+      align-items:start;
+    }}
+    .graph-related-list.collapsed .graph-related-item.hidden-related {{
+      display:none;
     }}
     .graph-related-item {{
       display:grid;
       grid-template-columns:minmax(0, 1fr) auto;
-      gap:12px;
-      align-items:flex-start;
+      gap:8px 10px;
+      align-items:start;
       padding:10px 12px;
       border:1px solid #e2d4c4;
-      border-radius:14px;
+      border-radius:16px;
       background:rgba(255,255,255,0.72);
+      min-width:0;
+      max-width:100%;
     }}
     .graph-related-actions {{
       display:flex;
-      gap:8px;
+      gap:6px;
       flex-wrap:wrap;
       align-items:center;
-      margin-top:8px;
+      margin-top:4px;
+    }}
+    .graph-related-main {{
+      min-width:0;
+    }}
+    .graph-related-head {{
+      display:flex;
+      gap:8px;
+      align-items:baseline;
+      flex-wrap:wrap;
     }}
     .graph-related-item a {{
       color:#9c4f2f;
@@ -1050,24 +1066,46 @@ def build_keywords_html():
       padding:0;
       border-radius:0;
       font-weight:700;
+      line-height:1.35;
+      font-size:15px;
     }}
     .graph-related-weight {{
       color:#6f685c;
-      font-size:13px;
+      font-size:12px;
       white-space:nowrap;
+      background:rgba(240,223,207,0.9);
+      border-radius:999px;
+      padding:4px 8px;
     }}
-    .graph-related-toggle, .graph-filter-clear {{
+    .graph-related-toggle, .graph-filter-clear, .graph-related-more {{
       border:none;
       border-radius:999px;
-      padding:7px 11px;
+      padding:5px 10px;
       font:inherit;
+      font-size:13px;
       cursor:pointer;
       background:#ead8ca;
       color:#6f685c;
     }}
+    .graph-related-toggle {{
+      width:28px;
+      height:28px;
+      padding:0;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      font-size:16px;
+      font-weight:700;
+      line-height:1;
+    }}
     .graph-related-toggle.active {{
       background:#9c4f2f;
       color:white;
+    }}
+    .graph-related-more {{
+      margin-top:8px;
+      background:#f0dfcf;
+      color:#7a4a2a;
     }}
     .graph-filter-summary {{
       margin:14px 0 10px;
@@ -1117,7 +1155,6 @@ def build_keywords_html():
       .hero {{ padding:22px 18px; }}
       .actions {{ width:100%; }}
       .actions a {{ width:100%; text-align:center; }}
-      .graph-layout {{ grid-template-columns:1fr; }}
       .graph-board {{ min-height:420px; }}
       .graph-board svg {{ height:420px; }}
       .graph-shell {{ padding:16px; }}
@@ -1162,10 +1199,10 @@ def build_keywords_html():
           <div class="graph-empty">正在绘制关键词关联图…</div>
         </div>
         <aside class="graph-side" id="keyword-graph-side">
-          <div class="graph-side-empty">点击左侧任意球体，我们会在这里展示这个 tag 最相关的几个 tag，方便你先判断主题结构，再决定是否进入详情页。</div>
+          <div class="graph-side-empty">点击上方任意球体，我们会在这里展示这个 tag 最相关的几个 tag，方便你先判断主题结构，再决定是否进入详情页。</div>
         </aside>
       </div>
-      <div class="graph-hint">页面每次打开时都会基于最新论文和 tags 实时重算，所以有新论文加入后，这里会自动反映。单击球体可在右侧预览，右侧再进入详情页。</div>
+      <div class="graph-hint">页面每次打开时都会基于最新论文和 tags 实时重算，所以有新论文加入后，这里会自动反映。单击球体可在下方预览，再进入详情页。</div>
     </section>
     <section class="grid">{body}</section>
   </main>
@@ -1253,7 +1290,7 @@ def build_keywords_html():
       const side = document.getElementById('keyword-graph-side');
       if (!side) return;
       if (!node) {{
-        side.innerHTML = '<div class="graph-side-empty">点击左侧任意球体，我们会在这里展示这个 tag 最相关的几个 tag，方便你先判断主题结构，再决定是否进入详情页。</div>';
+        side.innerHTML = '<div class="graph-side-empty">点击上方任意球体，我们会在这里展示这个 tag 最相关的几个 tag，方便你先判断主题结构，再决定是否进入详情页。</div>';
         return;
       }}
       const related = visibleEdges
@@ -1266,20 +1303,23 @@ def build_keywords_html():
         .filter(Boolean)
         .sort((a, b) => b.weight - a.weight || (Number(b.node.count) || 0) - (Number(a.node.count) || 0))
         .slice(0, 8);
+      const relatedVisibleLimit = 5;
 
       const relatedHtml = related.length
-        ? related.map((item) => `
-            <div class="graph-related-item">
-              <div>
-                <a href="/keywords/${{item.node.slug}}">${{esc(item.node.label)}}</a>
-                <div class="muted">出现 ${{item.node.count}} 次</div>
+        ? related.map((item, index) => `
+            <div class="graph-related-item${{index >= relatedVisibleLimit ? ' hidden-related' : ''}}">
+              <div class="graph-related-main">
+                <div class="graph-related-head">
+                  <a href="/keywords/${{item.node.slug}}">${{esc(item.node.label)}}</a>
+                  <div class="muted" style="font-size:13px;">${{item.node.count}} 篇</div>
+                </div>
                 <div class="graph-related-actions">
-                  <button class="graph-related-toggle ${{keywordGraphActiveFilterIds.has(item.node.id) ? 'active' : ''}}" type="button" data-related-node-id="${{esc(item.node.id)}}">
-                    ${{keywordGraphActiveFilterIds.has(item.node.id) ? '已加入筛选' : '加入筛选'}}
+                  <button class="graph-related-toggle ${{keywordGraphActiveFilterIds.has(item.node.id) ? 'active' : ''}}" type="button" title="${{keywordGraphActiveFilterIds.has(item.node.id) ? '移出筛选' : '加入筛选'}}" aria-label="${{keywordGraphActiveFilterIds.has(item.node.id) ? '移出筛选' : '加入筛选'}}" data-related-node-id="${{esc(item.node.id)}}">
+                    ${{keywordGraphActiveFilterIds.has(item.node.id) ? '✓' : '+'}}
                   </button>
                 </div>
               </div>
-              <div class="graph-related-weight">关联强度 ${{item.weight}}</div>
+              <div class="graph-related-weight">强度 ${{item.weight}}</div>
             </div>
           `).join('')
         : '<div class="graph-side-empty">这个 tag 目前还没有足够强的共现关系，可能更适合作为独立入口查看。</div>';
@@ -1319,7 +1359,8 @@ def build_keywords_html():
         <a class="open-link" href="/keywords/${{node.slug}}">打开这个关键词详情</a>
         ${{filterSummaryHtml}}
         <div class="graph-related-title">最相关的几个 tag</div>
-        <div class="graph-related-list">${{relatedHtml}}</div>
+        <div class="graph-related-list${{related.length > relatedVisibleLimit ? ' collapsed' : ''}}" id="keyword-graph-related-list">${{relatedHtml}}</div>
+        ${{related.length > relatedVisibleLimit ? `<button class="graph-related-more" type="button" id="keyword-graph-related-more">展开更多（+${{related.length - relatedVisibleLimit}}）</button>` : ''}}
       `;
 
       side.querySelectorAll('[data-related-node-id]').forEach((button) => {{
@@ -1344,6 +1385,17 @@ def build_keywords_html():
           renderKeywordPreview(node, visibleEdges);
           applyKeywordGraphSelectionState();
           applyKeywordCardFilter();
+        }});
+      }}
+
+      const moreButton = document.getElementById('keyword-graph-related-more');
+      const relatedList = document.getElementById('keyword-graph-related-list');
+      if (moreButton && relatedList) {{
+        moreButton.addEventListener('click', () => {{
+          const collapsed = relatedList.classList.toggle('collapsed');
+          moreButton.textContent = collapsed
+            ? `展开更多（+${{Math.max(0, related.length - relatedVisibleLimit)}}）`
+            : '收起';
         }});
       }}
     }}
