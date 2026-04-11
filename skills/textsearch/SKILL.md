@@ -29,7 +29,7 @@ metadata:
 4. 用户发送 `开始` 后，批量运行：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.textsearch_cli \
+<openclaw-python> -m app.openclaw.textsearch_cli \
   --wait --json "Paper Title A\nPaper Title B"
 ```
 

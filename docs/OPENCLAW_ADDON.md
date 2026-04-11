@@ -1,17 +1,17 @@
 # OpenClaw 链路说明
 
-这份文档只说明 OpenClaw 侧的专项链路和边界。当前默认部署方式是云服务器常驻运行：`openclaw-gateway.service` 与 `exscholar-site.service` 一起提供对话网关和网页服务。安装、账号、站点使用方式以 [README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md) 为准，避免重复维护两份用户手册。
+这份文档只说明 OpenClaw 侧的专项链路和边界。当前默认部署方式是云服务器常驻运行：`openclaw-gateway.service` 与 `exscholar-site.service` 一起提供对话网关和网页服务。安装、账号、站点使用方式以 [README_USER.md](../README_USER.md) 为准，避免重复维护两份用户手册。
 
 ## 1. 相关代码位置
 
-- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
-- [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
-- [paper_lookup.py](/home/ubuntu/tools/exScholar/app/openclaw/paper_lookup.py)
-- [picsearch_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/picsearch_cli.py)
-- [textsearch_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/textsearch_cli.py)
-- [jobs.py](/home/ubuntu/tools/exScholar/app/site/core/jobs.py)
-- [handler.py](/home/ubuntu/tools/exScholar/app/site/http/handler.py)
-- [reading.py](/home/ubuntu/tools/exScholar/app/site/core/reading.py)
+- [ingest.py](../app/openclaw/ingest.py)
+- [intake_cli.py](../app/openclaw/intake_cli.py)
+- [paper_lookup.py](../app/openclaw/paper_lookup.py)
+- [picsearch_cli.py](../app/openclaw/picsearch_cli.py)
+- [textsearch_cli.py](../app/openclaw/textsearch_cli.py)
+- [jobs.py](../app/site/core/jobs.py)
+- [handler.py](../app/site/http/handler.py)
+- [reading.py](../app/site/core/reading.py)
 
 ## 2. 当前链路覆盖范围
 
@@ -57,21 +57,21 @@ OpenClaw intake 链路会自动完成：
 单个 PDF：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /absolute/path/to/paper.pdf
 ```
 
 多个 PDF：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /path/a.pdf /path/b.pdf
 ```
 
 图片论文识别：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+<openclaw-python> -m app.openclaw.picsearch_cli \
   --wait --json /absolute/path/to/paper-screenshot.png
 ```
 
@@ -85,13 +85,13 @@ OpenClaw intake 链路会自动完成：
 - 当 DBLP 和可信 web 候选都不足时，再退回 DOI fallback
 - 将结果统一写入当天 `Picsearch` timeline，并尽量继续抓取摘要
 - timeline 名仅表示来源；后续加入深度阅读时会按论文主题自动生成或复用更合适的 Reading Group
-- OpenClaw 对话侧可通过 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md) 作为标准动作调用
+- OpenClaw 对话侧可通过 [picsearch/SKILL.md](../skills/picsearch/SKILL.md) 作为标准动作调用
 - 后台模型调用会经过统一节流，因此 Scholar 截图批量补链或摘要补抓时会更稳，但速度会比最早版本更保守
 
 文本补链接：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.textsearch_cli \
+<openclaw-python> -m app.openclaw.textsearch_cli \
   --wait --json "Paper Title A\nPaper Title B"
 ```
 
@@ -114,7 +114,7 @@ exScholar 当前是多用户模式。
 非网页登录触发的 OpenClaw 默认入口当前会写入：
 
 ```text
-data/users/qioyo/
+data/users/<default-openclaw-user>/
 ```
 
 常见输出位置：
@@ -129,7 +129,7 @@ data/users/qioyo/
 OpenClaw 相关入口当前统一运行在：
 
 ```text
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python
+<openclaw-python>
 ```
 
 常见配置来源：
@@ -142,13 +142,13 @@ OpenClaw 相关入口当前统一运行在：
 
 ## 7. Research 链路与模型节流
 
-虽然自然语言 research 的检索执行最终由 [search.py](/home/ubuntu/tools/exScholar/app/pipeline/search.py) 完成，但其前后两端仍属于 OpenClaw 模型链路：
+虽然自然语言 research 的检索执行最终由 [search.py](../app/pipeline/search.py) 完成，但其前后两端仍属于 OpenClaw 模型链路：
 
 - 前置阶段会先生成更贴合学术表达的检索词建议
 - 再基于建议词生成正式 research plan
 - 搜索完成后，会结合标题和摘要做相关性复核与 autotag
 
-这些模型调用当前统一由 [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py) 管理，并共享同一套后台节流策略：
+这些模型调用当前统一由 [ingest.py](../app/openclaw/ingest.py) 管理，并共享同一套后台节流策略：
 
 - 全局模型请求并发闸门
 - provider 级最小请求间隔
@@ -163,7 +163,7 @@ OpenClaw 相关入口当前统一运行在：
 此外，当前项目里与模型推理直接相关的链路默认不走系统 HTTP 代理：
 
 - `openclaw-gateway.service` 和 `exscholar-site.service` 的 systemd 环境会显式清空 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
-- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py) 内部的模型 HTTP 客户端使用 `requests.Session(trust_env=False)`
+- [ingest.py](../app/openclaw/ingest.py) 内部的模型 HTTP 客户端使用 `requests.Session(trust_env=False)`
 
 因此，research 规划、结果复核、PDF metadata/analysis、`picsearch` 图片识别这几条模型链，在服务内和直接调用 `app.openclaw.ingest` 时都会优先直连上游 provider，不会自动继承 shell 里的代理变量。
 
@@ -183,7 +183,7 @@ no_proxy
 
 在自然语言 research 中，如果某次搜索第一次召回结果过少，后台还会自动补充一轮建议检索词再重试。这条补扩逻辑位于：
 
-- [research_jobs.py](/home/ubuntu/tools/exScholar/app/site/core/research_jobs.py)
+- [research_jobs.py](../app/site/core/research_jobs.py)
 
 对于底层论文召回，当前策略是：
 
@@ -194,9 +194,9 @@ no_proxy
 
 ## 8. 相关文档
 
-- 项目总览：[README.md](/home/ubuntu/tools/exScholar/README.md)
-- 用户说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
-- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
-- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
-- Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
-- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
+- 项目总览：[README.md](../README.md)
+- 用户说明：[README_USER.md](../README_USER.md)
+- 开发说明：[README_DEV.md](../README_DEV.md)
+- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](WECHAT_PDF_INTAKE.md)
+- Skills 总览：[README.md](../skills/README.md)
+- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](../skills/picsearch/SKILL.md)

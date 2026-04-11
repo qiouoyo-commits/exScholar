@@ -23,14 +23,14 @@
 
 ## 文档结构
 
-- 用户使用说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
-- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
-- 架构说明：[ARCHITECTURE.md](/home/ubuntu/tools/exScholar/docs/ARCHITECTURE.md)
-- OpenClaw PDF 链路补充：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
-- 微信 PDF intake 说明：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
-- Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
-- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
-- OpenClaw 文本补链接 skill：[textsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/textsearch/SKILL.md)
+- 用户使用说明：[README_USER.md](README_USER.md)
+- 开发说明：[README_DEV.md](README_DEV.md)
+- 架构说明：[ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- OpenClaw PDF 链路补充：[OPENCLAW_ADDON.md](docs/OPENCLAW_ADDON.md)
+- 微信 PDF intake 说明：[WECHAT_PDF_INTAKE.md](docs/WECHAT_PDF_INTAKE.md)
+- Skills 总览：[README.md](skills/README.md)
+- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](skills/picsearch/SKILL.md)
+- OpenClaw 文本补链接 skill：[textsearch/SKILL.md](skills/textsearch/SKILL.md)
 
 ## 快速开始
 
@@ -44,7 +44,7 @@ python -m playwright install chromium
 
 2. 配置 `.env.local`
 
-建议从 [.env.local.example](/home/ubuntu/tools/exScholar/.env.local.example) 复制：
+建议从 [.env.local.example](.env.local.example) 复制：
 
 ```bash
 cp .env.local.example .env.local
@@ -138,7 +138,7 @@ systemctl --user restart exscholar-site.service
 同步并重载 OpenClaw skills：
 
 ```bash
-/home/ubuntu/tools/exScholar/sync_openclaw_skills.sh
+<repo-root>/sync_openclaw_skills.sh
 systemctl --user restart openclaw-gateway.service
 ```
 
@@ -194,5 +194,5 @@ journalctl --user -u openclaw-gateway.service -n 100 --no-pager
 
 ## 建议阅读顺序
 
-- 想直接使用：先看 [README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
-- 想修改代码或继续开发：看 [README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
+- 想直接使用：先看 [README_USER.md](README_USER.md)
+- 想修改代码或继续开发：看 [README_DEV.md](README_DEV.md)

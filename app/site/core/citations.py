@@ -1,5 +1,7 @@
 """Citation, keyword, grouping, and library helpers for exScholar."""
 
+from itertools import combinations
+
 from .base import *
 from .storage import *
 
@@ -101,6 +103,227 @@ def list_keyword_entries() -> list[dict]:
     for entry in entries:
         entry["slug"] = quote(entry["keyword"], safe="")
     return entries
+
+
+def _collect_keyword_sets() -> list[dict]:
+    papers: list[dict] = []
+    for out_dir in iter_search_dirs():
+        search_json = out_dir / "search.json"
+        papers_json = out_dir / "papers.json"
+        site_index = out_dir / "site" / "index.html"
+        if not papers_json.exists():
+            continue
+        try:
+            meta = json.loads(search_json.read_text(encoding="utf-8")) if search_json.exists() else {}
+            payload = json.loads(papers_json.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        date_str = meta.get("date") or out_dir.name.split("_", 1)[0]
+        search_title = meta.get("slug") or out_dir.name.split("_", 1)[-1]
+        for index, paper in enumerate(payload.get("papers", []), start=1):
+            raw_keywords = [paper.get("matched_kw") or ""]
+            raw_keywords.extend(normalize_generated_tags(paper.get("autotags") or []))
+            normalized = normalize_generated_tags(raw_keywords)
+            if len(normalized) < 1:
+                continue
+            papers.append(
+                {
+                    "paper_key": f"search::{out_dir.relative_to(DATA_DIR).as_posix()}::{paper.get('paper_id') or paper.get('csv_index') or index}",
+                    "title": paper.get("title") or "",
+                    "keywords": normalized,
+                    "group_ids": [],
+                    "content": paper.get("content") or "",
+                    "venue": paper.get("venue") or "",
+                    "year": paper.get("year") or "",
+                    "authors": paper.get("authors") or "",
+                    "doi": paper.get("doi") or "",
+                    "url": paper.get("url") or "",
+                    "paper_id": paper.get("paper_id") or "",
+                    "source_site_url": build_site_url(str(out_dir), str(site_index)) if site_index.exists() else f"/{out_dir.relative_to(DATA_DIR).as_posix()}/",
+                    "source_relative_dir": out_dir.relative_to(DATA_DIR).as_posix(),
+                    "source_kind": "search",
+                    "source_slug": search_title,
+                    "date": date_str,
+                }
+            )
+    for citation in list_citations_with_groups():
+        tags = normalize_generated_tags((citation.get("tags") or "").split(","))
+        if len(tags) < 1:
+            continue
+        papers.append(
+            {
+                "paper_key": f"reading::{citation.get('id')}",
+                "title": citation.get("title") or "",
+                "keywords": tags,
+                "group_ids": [int(group["id"]) for group in (citation.get("groups") or []) if group.get("id") is not None],
+                "content": citation.get("abstract") or "",
+                "venue": citation.get("venue") or "",
+                "year": citation.get("year") or "",
+                "authors": citation.get("authors") or "",
+                "doi": citation.get("doi") or "",
+                "url": citation.get("url") or "",
+                "paper_id": citation.get("reading_paper_id") or "",
+                "source_site_url": f"/reading/{citation.get('reading_paper_id')}" if citation.get("reading_paper_id") else "/reading",
+                "source_relative_dir": "",
+                "source_kind": "deep_reading",
+                "source_slug": "deep-reading",
+                "date": (citation.get("created_at") or "")[:10],
+            }
+        )
+    return papers
+
+
+def _build_keyword_graph_from_sets(keyword_sets: list[dict], limit: int = 36, max_edges: int = 120) -> dict:
+    node_meta: dict[str, dict] = {}
+    edge_counts: dict[tuple[str, str], int] = {}
+
+    for item in keyword_sets:
+        unique_keywords = []
+        seen = set()
+        for keyword in item.get("keywords") or []:
+            value = " ".join(str(keyword or "").split()).strip()
+            low = value.lower()
+            if not value or low in seen:
+                continue
+            seen.add(low)
+            unique_keywords.append(value)
+            meta = node_meta.setdefault(
+                low,
+                {
+                    "id": low,
+                    "label": value,
+                    "slug": quote(value, safe=""),
+                    "count": 0,
+                    "latest_date": "",
+                },
+            )
+            meta["count"] += 1
+            item_date = item.get("date") or ""
+            if item_date and item_date > (meta.get("latest_date") or ""):
+                meta["latest_date"] = item_date
+
+        for left, right in combinations(sorted({kw.lower(): kw for kw in unique_keywords}.keys()), 2):
+            edge_counts[(left, right)] = edge_counts.get((left, right), 0) + 1
+
+    nodes = sorted(
+        node_meta.values(),
+        key=lambda item: (item.get("count") or 0, item.get("latest_date") or "", item.get("label") or ""),
+        reverse=True,
+    )[: max(1, int(limit))]
+    allowed = {node["id"] for node in nodes}
+    edges = [
+        {"source": left, "target": right, "weight": weight}
+        for (left, right), weight in edge_counts.items()
+        if left in allowed and right in allowed and weight > 0
+    ]
+    edges.sort(key=lambda item: (item["weight"], item["source"], item["target"]), reverse=True)
+    if max_edges > 0:
+        edges = edges[: int(max_edges)]
+
+    linked = set()
+    for edge in edges:
+        linked.add(edge["source"])
+        linked.add(edge["target"])
+    for node in nodes:
+        node["degree"] = sum(1 for edge in edges if edge["source"] == node["id"] or edge["target"] == node["id"])
+        node["is_isolated"] = node["id"] not in linked
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "total_keywords": len(node_meta),
+        "total_papers": len(keyword_sets),
+        "graph_keywords": len(nodes),
+    }
+
+
+def build_keyword_graph(limit: int = 36, max_edges: int = 120) -> dict:
+    keyword_sets = _collect_keyword_sets()
+    base_graph = _build_keyword_graph_from_sets(keyword_sets, limit=limit, max_edges=max_edges)
+
+    groups_payload = []
+    graphs_by_group: dict[str, dict] = {}
+    for group in list_reading_groups():
+        group_id = int(group["id"])
+        grouped_sets = [item for item in keyword_sets if group_id in (item.get("group_ids") or [])]
+        group_graph = _build_keyword_graph_from_sets(grouped_sets, limit=limit, max_edges=max_edges)
+        if not group_graph["nodes"]:
+            continue
+        groups_payload.append(
+            {
+                "id": str(group_id),
+                "name": group.get("name") or f"Group {group_id}",
+                "description": group.get("description") or "",
+                "paper_count": group_graph["total_papers"],
+                "keyword_count": group_graph["graph_keywords"],
+            }
+        )
+        graphs_by_group[str(group_id)] = group_graph
+
+    base_graph["groups"] = groups_payload
+    base_graph["graphs_by_group"] = graphs_by_group
+    return base_graph
+
+
+def refresh_keyword_graph_cache(limit: int = 36, max_edges: int = 120) -> dict:
+    payload = build_keyword_graph(limit=limit, max_edges=max_edges)
+    cache_path = Path(KEYWORD_GRAPH_CACHE_PATH)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_file(cache_path, payload)
+    return payload
+
+
+def load_keyword_graph_cache(limit: int = 36, max_edges: int = 120) -> dict:
+    cache_path = Path(KEYWORD_GRAPH_CACHE_PATH)
+    if cache_path.exists():
+        payload = read_json_file(cache_path, None)
+        if isinstance(payload, dict) and "nodes" in payload and "edges" in payload:
+            return payload
+    return refresh_keyword_graph_cache(limit=limit, max_edges=max_edges)
+
+
+def build_keyword_intersection_entry(keywords: list[str]) -> dict:
+    normalized_keywords = normalize_generated_tags(keywords)
+    lowered = {item.lower() for item in normalized_keywords}
+    papers = []
+    for item in _collect_keyword_sets():
+        available = {kw.lower() for kw in (item.get("keywords") or [])}
+        if lowered and lowered.issubset(available):
+            papers.append(
+                {
+                    "title": item.get("title") or "",
+                    "content": item.get("content") or "",
+                    "venue": item.get("venue") or "",
+                    "year": item.get("year") or "",
+                    "authors": item.get("authors") or "",
+                    "doi": item.get("doi") or "",
+                    "url": item.get("url") or "",
+                    "paper_id": item.get("paper_id") or "",
+                    "source_kind": item.get("source_kind") or "search",
+                    "source_slug": item.get("source_slug") or "",
+                    "source_site_url": item.get("source_site_url") or "",
+                    "source_relative_dir": item.get("source_relative_dir") or "",
+                    "source_date": item.get("date") or "",
+                    "matched_kw": " + ".join(normalized_keywords),
+                    "keywords": list(item.get("keywords") or []),
+                }
+            )
+
+    papers.sort(
+        key=lambda item: (
+            item.get("source_date") or "",
+            str(item.get("year") or ""),
+            item.get("title") or "",
+        ),
+        reverse=True,
+    )
+    return {
+        "keyword": " + ".join(normalized_keywords),
+        "selected_keywords": normalized_keywords,
+        "count": len(papers),
+        "papers": papers,
+        "slug": quote(" + ".join(normalized_keywords), safe=""),
+    }
 
 
 def get_keyword_entry(keyword: str) -> dict | None:
@@ -238,6 +461,7 @@ def upsert_citation(paper: dict, search_slug: str, pdf_path: str = None, pdf_sha
                 (merge_tag_values(existing_tags, normalized_tags), citation_id),
             )
         conn.commit()
+        refresh_keyword_graph_cache()
         return citation_id
 
 
@@ -381,6 +605,7 @@ def update_citation_tags(citation_id: int, tags: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE citations SET tags = ? WHERE id = ?", (normalize_tags(tags), citation_id))
         conn.commit()
+    refresh_keyword_graph_cache()
 
 
 def merge_metadata_keywords_into_citation(citation_id: int, metadata: dict):
@@ -495,6 +720,7 @@ def delete_citation(citation_id: int):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM citations WHERE id = ?", (citation_id,))
         conn.commit()
+    refresh_keyword_graph_cache()
 
 
 def merge_citation_into_existing(source_citation_id: int, target_citation_id: int, metadata: dict | None = None):
@@ -571,6 +797,37 @@ def find_reading_group_by_name(name: str):
     return dict(row) if row else None
 
 
+def find_compatible_reading_group(name: str, *, similarity_threshold: float = 0.72):
+    normalized = " ".join(str(name or "").split())
+    if not normalized:
+        return None
+    existing = find_reading_group_by_name(normalized)
+    if existing:
+        return existing
+
+    normalized_target = normalize_title_for_match(normalized)
+    if not normalized_target:
+        return None
+
+    best_group = None
+    best_score = 0.0
+    for group in list_reading_groups():
+        group_name = " ".join(str(group.get("name") or "").split())
+        normalized_group = normalize_title_for_match(group_name)
+        if not normalized_group:
+            continue
+        score = title_similarity(normalized, group_name)
+        # Treat containment as a stronger signal than raw sequence similarity.
+        if normalized_target in normalized_group or normalized_group in normalized_target:
+            score = max(score, 0.9)
+        if score > best_score:
+            best_score = score
+            best_group = group
+    if best_group and best_score >= similarity_threshold:
+        return best_group
+    return None
+
+
 def get_or_create_reading_group(name: str, description: str = ""):
     normalized = " ".join(str(name or "").split())
     if not normalized:
@@ -592,12 +849,23 @@ def get_or_create_reading_group(name: str, description: str = ""):
     }
 
 
+def get_or_create_compatible_reading_group(name: str, description: str = ""):
+    normalized = " ".join(str(name or "").split())
+    if not normalized:
+        raise ValueError("Group 名称不能为空")
+    existing = find_compatible_reading_group(normalized)
+    if existing:
+        return existing
+    return get_or_create_reading_group(normalized, description)
+
+
 def delete_reading_group(group_id: int):
     ensure_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM citation_group_links WHERE group_id = ?", (group_id,))
         conn.execute("DELETE FROM reading_groups WHERE id = ?", (group_id,))
         conn.commit()
+    refresh_keyword_graph_cache()
 
 
 def reading_group_exists(group_id: int) -> bool:
@@ -643,6 +911,7 @@ def add_citation_to_group(citation_id: int, group_id: int):
             (citation_id, group_id, now),
         )
         conn.commit()
+    refresh_keyword_graph_cache()
 
 
 def remove_citation_from_group(citation_id: int, group_id: int):
@@ -650,6 +919,7 @@ def remove_citation_from_group(citation_id: int, group_id: int):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM citation_group_links WHERE citation_id = ? AND group_id = ?", (citation_id, group_id))
         conn.commit()
+    refresh_keyword_graph_cache()
 
 
 def list_citations_with_groups():

@@ -358,7 +358,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             elif citation_id and search_slug:
                 group_name = _resolve_search_group_name(search_slug, paper)
                 if group_name:
-                    assigned_group = get_or_create_reading_group(
+                    assigned_group = get_or_create_compatible_reading_group(
                         group_name,
                         f"自动为搜索「{group_name}」创建的深度阅读分组。",
                     )
@@ -944,6 +944,16 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
 
         if self.path == "/keywords":
             self.send_html(build_keywords_html())
+            return
+
+        if self.path.startswith("/keywords/intersection"):
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = parse_qs(query, keep_blank_values=False)
+            raw_keywords = params.get("tags") or []
+            selected_keywords = []
+            for item in raw_keywords:
+                selected_keywords.extend(part.strip() for part in str(item).split(",") if part.strip())
+            self.send_html(build_keyword_intersection_html(selected_keywords))
             return
 
         if self.path.startswith("/keywords/"):

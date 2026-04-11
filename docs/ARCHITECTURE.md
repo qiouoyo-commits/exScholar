@@ -97,7 +97,7 @@ data/users/<username>/
 
 ### 4.2 用户上下文机制
 
-用户上下文由 [base.py](/home/ubuntu/tools/exScholar/app/site/core/base.py) 管理，核心机制包括：
+用户上下文由 [base.py](../app/site/core/base.py) 管理，核心机制包括：
 
 - `sanitize_username(...)`
 - `user_context(...)`
@@ -116,8 +116,8 @@ data/users/<username>/
 
 认证逻辑位于：
 
-- [auth.py](/home/ubuntu/tools/exScholar/app/site/core/auth.py)
-- [handler.py](/home/ubuntu/tools/exScholar/app/site/http/handler.py)
+- [auth.py](../app/site/core/auth.py)
+- [handler.py](../app/site/http/handler.py)
 
 当前特征：
 
@@ -133,8 +133,8 @@ data/users/<username>/
 
 关键词搜索主入口位于：
 
-- [search.py](/home/ubuntu/tools/exScholar/app/pipeline/search.py)
-- [run_search.sh](/home/ubuntu/tools/exScholar/run_search.sh)
+- [search.py](../app/pipeline/search.py)
+- [run_search.sh](../run_search.sh)
 
 输出产物包括：
 
@@ -147,7 +147,7 @@ data/users/<username>/
 
 自然语言 research 任务位于：
 
-- [research_jobs.py](/home/ubuntu/tools/exScholar/app/site/core/research_jobs.py)
+- [research_jobs.py](../app/site/core/research_jobs.py)
 
 其流程大致为：
 
@@ -177,11 +177,11 @@ data/users/<username>/
 - OpenClaw `ccf-research` skill
 - 直接搜索入口
 
-限流逻辑在 [search.py](/home/ubuntu/tools/exScholar/app/pipeline/search.py) 中完成。
+限流逻辑在 [search.py](../app/pipeline/search.py) 中完成。
 
 后台模型调用的节流逻辑位于：
 
-- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
+- [ingest.py](../app/openclaw/ingest.py)
 
 当前做法包括：
 
@@ -205,18 +205,18 @@ data/users/<username>/
 当前这条链和 research job 一样，具备：
 
 - 后台状态持久化
-- 前端步骤提示
+- 搜索结果静态页中的步骤提示，以及 Keywords 页中的等待状态反馈
 - 单次请求超时保护
-- 整体等待超时保护
+- 后台 stale 检测与失败回收
 - 结果页相对 URL 输出，避免不同访问入口下的绝对 URL 失效
 
 ## 7. OpenClaw PDF 链路
 
 OpenClaw 相关主逻辑位于：
 
-- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
-- [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
-- [jobs.py](/home/ubuntu/tools/exScholar/app/site/core/jobs.py)
+- [ingest.py](../app/openclaw/ingest.py)
+- [intake_cli.py](../app/openclaw/intake_cli.py)
+- [jobs.py](../app/site/core/jobs.py)
 
 当前统一接管：
 
@@ -242,28 +242,28 @@ OpenClaw 相关主逻辑位于：
 非网页登录触发的 OpenClaw 入口默认使用：
 
 ```text
-qioyo
+<default-openclaw-user>
 ```
 
 也就是默认写入：
 
 ```text
-data/users/qioyo/
+data/users/<default-openclaw-user>/
 ```
 
 这一行为主要由以下位置控制：
 
-- [base.py](/home/ubuntu/tools/exScholar/app/site/core/base.py)
-- [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
-- [handler.py](/home/ubuntu/tools/exScholar/app/site/http/handler.py)
-- [run_search.sh](/home/ubuntu/tools/exScholar/run_search.sh)
+- [base.py](../app/site/core/base.py)
+- [intake_cli.py](../app/openclaw/intake_cli.py)
+- [handler.py](../app/site/http/handler.py)
+- [run_search.sh](../run_search.sh)
 
 ## 9. 阅读库与阅读工作区
 
 阅读库相关逻辑主要在：
 
-- [citations.py](/home/ubuntu/tools/exScholar/app/site/core/citations.py)
-- [reading.py](/home/ubuntu/tools/exScholar/app/site/core/reading.py)
+- [citations.py](../app/site/core/citations.py)
+- [reading.py](../app/site/core/reading.py)
 
 当前模型：
 
@@ -278,9 +278,9 @@ data/users/qioyo/
 站点分成两层：
 
 - HTTP 层：
-  [handler.py](/home/ubuntu/tools/exScholar/app/site/http/handler.py)
+  [handler.py](../app/site/http/handler.py)
 - 页面层：
-  [pages.py](/home/ubuntu/tools/exScholar/app/site/ui/pages.py)
+  [pages.py](../app/site/ui/pages.py)
 
 职责分工：
 
@@ -309,8 +309,8 @@ data/users/qioyo/
 ### 11.3 CLI / 微信上传 PDF
 
 1. 调用 `app.openclaw.intake_cli`
-2. 进入默认 OpenClaw 用户 `qioyo` 上下文
-3. 在 `data/users/qioyo/` 下写入 library、reading、job 和 SQLite
+2. 进入默认 OpenClaw 自动化用户上下文
+3. 在 `data/users/<default-openclaw-user>/` 下写入 library、reading、job 和 SQLite
 
 ## 12. 服务与排障入口
 
@@ -337,15 +337,15 @@ journalctl --user -u exscholar-site.service -n 100 --no-pager
 编译检查：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m py_compile \
+<openclaw-python> -m py_compile \
   $(find app -name '*.py' | sort) set_site_password.py
 ```
 
 ## 13. 相关文档
 
-- 项目总览：[README.md](/home/ubuntu/tools/exScholar/README.md)
-- 用户说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
-- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
-- OpenClaw 链路说明：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
-- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
-- 搜索 skill：[SKILL.md](/home/ubuntu/tools/exScholar/skills/ccf-research/SKILL.md)
+- 项目总览：[README.md](../README.md)
+- 用户说明：[README_USER.md](../README_USER.md)
+- 开发说明：[README_DEV.md](../README_DEV.md)
+- OpenClaw 链路说明：[OPENCLAW_ADDON.md](OPENCLAW_ADDON.md)
+- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](WECHAT_PDF_INTAKE.md)
+- 搜索 skill：[SKILL.md](../skills/ccf-research/SKILL.md)

@@ -4,23 +4,23 @@
 
 ## 1. 相关代码位置
 
-- [ingest.py](/home/ubuntu/tools/exScholar/app/openclaw/ingest.py)
-- [intake_cli.py](/home/ubuntu/tools/exScholar/app/openclaw/intake_cli.py)
-- [jobs.py](/home/ubuntu/tools/exScholar/app/site/core/jobs.py)
+- [ingest.py](../app/openclaw/ingest.py)
+- [intake_cli.py](../app/openclaw/intake_cli.py)
+- [jobs.py](../app/site/core/jobs.py)
 
 ## 2. 当前推荐调用方式
 
 如果外部系统可以直接在仓库目录执行命令，推荐直接调用：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /absolute/path/to/file.pdf
 ```
 
 多个 PDF：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.intake_cli \
+<openclaw-python> -m app.openclaw.intake_cli \
   --wait --json /path/a.pdf /path/b.pdf
 ```
 
@@ -45,15 +45,15 @@
 当前微信 / 外部自动化这类非网页登录触发的默认写入位置是：
 
 ```text
-data/users/qioyo/
+data/users/<default-openclaw-user>/
 ```
 
 常见目标包括：
 
-- `data/users/qioyo/library/`
-- `data/users/qioyo/reading/`
-- `data/users/qioyo/openclaw_jobs/`
-- `data/users/qioyo/citation_library.sqlite3`
+- `data/users/<default-openclaw-user>/library/`
+- `data/users/<default-openclaw-user>/reading/`
+- `data/users/<default-openclaw-user>/openclaw_jobs/`
+- `data/users/<default-openclaw-user>/citation_library.sqlite3`
 
 如果后续要支持按来源切换用户，需要在调用前显式设置用户上下文。
 
@@ -66,7 +66,7 @@ data/users/qioyo/
 
 ## 6. 相关文档
 
-- 项目总览：[README.md](/home/ubuntu/tools/exScholar/README.md)
-- 用户说明：[README_USER.md](/home/ubuntu/tools/exScholar/README_USER.md)
-- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
-- OpenClaw 链路说明：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
+- 项目总览：[README.md](../README.md)
+- 用户说明：[README_USER.md](../README_USER.md)
+- 开发说明：[README_DEV.md](../README_DEV.md)
+- OpenClaw 链路说明：[OPENCLAW_ADDON.md](OPENCLAW_ADDON.md)

@@ -383,6 +383,7 @@ def create_reference_search_with_progress(source_slug: str, paper: dict, progres
     write_json(json_records, str(json_path), meta)
     write_site(json_records, str(site_path), meta)
     search_json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    refresh_keyword_graph_cache()
     return f"/{out_dir.relative_to(DATA_DIR).as_posix()}/site/"
 
 

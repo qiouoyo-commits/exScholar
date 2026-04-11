@@ -40,7 +40,7 @@ import fcntl
 from collections import OrderedDict
 from datetime import date
 from pathlib import Path
-from html import escape
+from html import escape, unescape
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -172,6 +172,10 @@ def build_search_summary_name(*sources: str) -> str:
     ) or "Research Topic"
 
 NO_PROXY_SESSION = None
+
+
+def _clean_output_text(value) -> str:
+    return " ".join(unescape(str(value or "")).split())
 
 def _get_no_proxy_session():
     """Return a requests.Session that bypasses ALL_PROXY env var."""
@@ -521,15 +525,15 @@ def write_csv(papers: list[dict], output_path: str):
                 "source_engine": p.get("_source_engine", "") or p.get("source_engine", ""),
                 "relevance_label": p.get("relevance_label", ""),
                 "relevance_score": p.get("relevance_score", ""),
-                "autotags": ", ".join(p.get("autotags") or []),
-                "review_reason": p.get("review_reason", ""),
-                "title": p.get("title", ""),
-                "venue": p.get("venue", ""),
+                "autotags": ", ".join(_clean_output_text(item) for item in (p.get("autotags") or []) if str(item or "").strip()),
+                "review_reason": _clean_output_text(p.get("review_reason", "")),
+                "title": _clean_output_text(p.get("title", "")),
+                "venue": _clean_output_text(p.get("venue", "")),
                 "year": p.get("year", ""),
-                "authors": ", ".join(authors) if isinstance(authors, list) else str(authors),
-                "doi": p.get("doi", ""),
+                "authors": _clean_output_text(", ".join(authors) if isinstance(authors, list) else str(authors)),
+                "doi": _clean_output_text(p.get("doi", "")),
                 "url": (ee[0] if ee else "") or p.get("url", ""),
-                "abstract": (p.get("abstract") or p.get("content") or "").replace("\n", " ").strip(),
+                "abstract": _clean_output_text((p.get("abstract") or p.get("content") or "").replace("\n", " ").strip()),
             })
 
 
@@ -538,22 +542,22 @@ def build_json_records(papers: list[dict]) -> list[dict]:
     for idx, p in enumerate(papers, start=1):
         ee = p.get("ee") or []
         authors = p.get("authors", [])
-        content = (p.get("abstract") or "").replace("\n", " ").strip()
+        content = _clean_output_text((p.get("abstract") or "").replace("\n", " ").strip())
         records.append({
             "csv_index": idx,
-            "title": p.get("title", ""),
+            "title": _clean_output_text(p.get("title", "")),
             "content": content,
             "matched_kw": p.get("_matched_kw", ""),
             "matched_venue": p.get("_matched_venue", ""),
             "source_engine": p.get("_source_engine", ""),
             "relevance_label": p.get("relevance_label", ""),
             "relevance_score": p.get("relevance_score", 0),
-            "autotags": p.get("autotags") or [],
-            "review_reason": p.get("review_reason", ""),
-            "venue": p.get("venue", ""),
+            "autotags": [_clean_output_text(item) for item in (p.get("autotags") or []) if str(item or "").strip()],
+            "review_reason": _clean_output_text(p.get("review_reason", "")),
+            "venue": _clean_output_text(p.get("venue", "")),
             "year": p.get("year", ""),
-            "authors": ", ".join(authors) if isinstance(authors, list) else str(authors),
-            "doi": p.get("doi", ""),
+            "authors": _clean_output_text(", ".join(authors) if isinstance(authors, list) else str(authors)),
+            "doi": _clean_output_text(p.get("doi", "")),
             "url": ee[0] if ee else "",
             "paper_id": p.get("paper_id", "") or p.get("paperId", ""),
         })

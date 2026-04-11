@@ -436,6 +436,8 @@ def _apply_research_result_review(job_id: str, prompt: str, plan: dict, result: 
         write_site(snapshot, str(site_path), interim_meta)
         with meta_path.open("w", encoding="utf-8") as fh:
             json.dump(interim_meta, fh, ensure_ascii=False, indent=2)
+
+        review_progress = dict(latest_review_progress)
         update_research_job(
             job_id,
             lambda payload: payload.update(
@@ -445,11 +447,31 @@ def _apply_research_result_review(job_id: str, prompt: str, plan: dict, result: 
                     "step_message": message,
                     "review_summary": summary,
                     "total_papers": len(snapshot),
+                    "progress": {
+                        **(payload.get("progress") or {}),
+                        **review_progress,
+                    },
                 }
             ),
         )
 
+    latest_review_progress: dict = {}
+
     def on_review_progress(event: dict):
+        latest_review_progress.clear()
+        latest_review_progress.update(
+            {
+                "review_current_batch": int(event.get("current_batch") or 0),
+                "review_total_batches": int(event.get("total_batches") or event.get("total_chunks") or 0),
+                "review_completed_chunks": int(event.get("completed_chunks") or 0),
+                "review_reviewed_papers": int(event.get("reviewed_papers") or 0),
+                "review_total_papers": int(event.get("total_papers") or len(records) or 0),
+                "review_model_reviewed_total": int(event.get("model_reviewed_total") or 0),
+                "review_heuristic_reviewed_total": int(event.get("heuristic_reviewed_total") or 0),
+                "review_current_batch_model_reviewed": int(event.get("current_batch_model_reviewed") or 0),
+                "review_current_batch_heuristic_reviewed": int(event.get("current_batch_heuristic_reviewed") or 0),
+            }
+        )
         papers_snapshot = [dict(item or {}) for item in (event.get("papers") or [])]
         if not papers_snapshot:
             return
@@ -584,6 +606,7 @@ def _run_research_job_inner(job_id: str):
                 }
             ),
         )
+        refresh_keyword_graph_cache()
     except Exception as exc:
         update_research_job(
             job_id,

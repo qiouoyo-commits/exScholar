@@ -21,9 +21,9 @@ metadata:
 
 - 这条 skill 负责普通的“找论文 / 查论文 / 搜论文 / 读文献”
 - 不负责基于图片或截图识别论文
-- 如果用户明确要根据图片找论文，应改走 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
-- 如果用户明确要根据一串论文标题批量补链接，应改走 [textsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/textsearch/SKILL.md)
-- 如果用户明确要根据 Google Scholar 页面截图批量补链接，应改走 [picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
+- 如果用户明确要根据图片找论文，应改走 [picsearch/SKILL.md](../picsearch/SKILL.md)
+- 如果用户明确要根据一串论文标题批量补链接，应改走 [textsearch/SKILL.md](../textsearch/SKILL.md)
+- 如果用户明确要根据 Google Scholar 页面截图批量补链接，应改走 [picsearch/SKILL.md](../picsearch/SKILL.md)
 - `picsearch` 当前既支持单篇论文截图，也支持 Google Scholar 页面截图批量补链接；补链接后还会尽量继续抓取摘要
 - `textsearch` 当前只处理纯文本标题输入；旧的 `titlesearch` 名称已经废弃，当前统一使用 `textsearch`
 
@@ -31,13 +31,13 @@ metadata:
 
 ## 数据存储结构
 
-当前项目是多用户模式。网页登录触发的搜索会写入当前登录用户自己的目录；非网页登录触发的默认 OpenClaw 搜索会写入 `data/users/qioyo/`。
+当前项目是多用户模式。网页登录触发的搜索会写入当前登录用户自己的目录；非网页登录触发的默认 OpenClaw 搜索会写入 `data/users/<default-openclaw-user>/`。
 
 每次搜索结果保存在独立目录下，不互相覆盖。典型目录形态如下：
 
 ```
-/home/ubuntu/tools/exScholar/data/users/<username>/searches/
-/home/ubuntu/tools/exScholar/data/users/<username>/expansions/
+<repo-root>/data/users/<username>/searches/
+<repo-root>/data/users/<username>/expansions/
 └── YYYY-MM-DD_<slug>/          ← 日期 + 话题简称，每次搜索独立一个目录
     ├── search.json             ← 搜索参数记录（关键词/venues/日期/是否含摘要）
     ├── papers.csv              ← 论文列表（matched_kw/title/venue/year/authors/doi/url/abstract/...）
@@ -130,21 +130,21 @@ metadata:
 ### 运行环境要求
 
 - 必须在 `openclaw-analytics` conda 环境中执行
-- Python 解释器统一使用 `/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python`
-- 仓库固定入口为 `/home/ubuntu/tools/exScholar/run_search.sh`，关键词搜索优先走这个脚本
+- Python 解释器统一使用 `<openclaw-python>`
+- 仓库固定入口为 `<repo-root>/run_search.sh`，关键词搜索优先走这个脚本
 - 静态站点固定服务端口为 `38128`，公开基址由 `.env.local` 中的 `PUBLIC_SITE_BASE_URL` 控制
 - 不要直接使用系统默认 `python` 或 base 环境的 Python 3.13；该环境下摘要依赖 `aiohttp` 可能不可用
 - 关键词搜索现在会自动进入 exScholar 的共享 research 并发槽位；如果网页端已有任务在跑，这里会先排队再开始
 - 首次使用前确保已安装 Playwright 浏览器：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m playwright install chromium
+<openclaw-python> -m playwright install chromium
 ```
 
 ### 命令格式
 
 ```bash
-/home/ubuntu/tools/exScholar/run_search.sh \
+<repo-root>/run_search.sh \
   --keywords "physiological notification;biosignal alert;EEG stress" \
   --venues "chi,uist,cscw,ubicomp" \
   --slug "physio-ui" \
@@ -155,7 +155,7 @@ metadata:
 如需排查问题或直接执行 Python 命令，再退回到：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.pipeline.search ...
+<openclaw-python> -m app.pipeline.search ...
 ```
 
 参数说明：
@@ -172,7 +172,7 @@ metadata:
 如果用户要求跑主爬虫而不是关键词搜索，也同样使用 `openclaw-analytics` 的 Python：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.pipeline.main -ccf a -c conf -m 20 -p 10
+<openclaw-python> -m app.pipeline.main -ccf a -c conf -m 20 -p 10
 ```
 
 ### 分步反馈规则

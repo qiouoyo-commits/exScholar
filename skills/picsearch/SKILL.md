@@ -24,7 +24,7 @@ metadata:
 4. 用户发送 `开始` 后，批量运行：
 
 ```bash
-/home/ubuntu/miniconda3/envs/openclaw-analytics/bin/python -m app.openclaw.picsearch_cli \
+<openclaw-python> -m app.openclaw.picsearch_cli \
   --wait --json /absolute/path/to/paper-a.png /absolute/path/to/paper-b.png
 ```
 

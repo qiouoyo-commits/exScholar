@@ -16,6 +16,7 @@ from app.pipeline.search import (
 )
 
 from .base import *
+from .citations import refresh_keyword_graph_cache
 from .storage import read_json_file
 
 PICSEARCH_KEYWORD = "picsearch"
@@ -177,6 +178,7 @@ def append_lookup_timeline(records: list[dict] | dict, *, keyword: str, notes: s
     write_json(json_records, str(json_path), meta)
     write_site(json_records, str(site_path), meta)
     search_json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    refresh_keyword_graph_cache()
     return {
         "site_url": build_site_url(str(out_dir), str(site_path)),
         "relative_site_url": f"/{out_dir.relative_to(DATA_DIR).as_posix()}/site/",

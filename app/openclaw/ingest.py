@@ -22,7 +22,7 @@ DEFAULT_OPENCLAW_IMAGE_MODEL = "joybuilder-plan/Kimi-K2.5"
 DEFAULT_OPENCLAW_IMAGE_FALLBACK_MODEL = "joybuilder-plan/DeepSeek-V3.2"
 DEFAULT_RESEARCH_TOP = 100
 DEFAULT_OPENCLAW_MODEL_CONCURRENCY = 1
-DEFAULT_REVIEW_CHUNK_SIZE = 12
+DEFAULT_REVIEW_CHUNK_SIZE = 4
 DEFAULT_REVIEW_BATCH_THROTTLE_SECONDS = 0.8
 DEFAULT_JOYBUILDER_MIN_INTERVAL_SECONDS = 0.8
 DEFAULT_KIMI_MIN_INTERVAL_SECONDS = 1.2
@@ -1514,6 +1514,28 @@ def _heuristic_review_tags(requirement_text: str, plan: dict, paper: dict) -> di
         low = value.lower()
         if low and low in haystack:
             tags.append(value)
+    common_hci_phrases = (
+        "human-computer interaction",
+        "human computer interaction",
+        "human-ai interaction",
+        "human robot interaction",
+        "human-robot interaction",
+        "user experience",
+        "user engagement",
+        "usability",
+        "interaction effects",
+        "interaction outcomes",
+        "interaction design",
+        "social interaction",
+        "mobile interaction",
+        "collaborative interaction",
+        "pedestrian behavior",
+        "crossing behavior",
+        "pressure-based interaction",
+    )
+    for token in common_hci_phrases:
+        if token in haystack:
+            tags.append(token.title() if " " in token else token)
     for token in ("timbre", "sonification", "auditory", "sound design", "musical interface", "voice interaction"):
         if token in haystack:
             tags.append(token.title() if " " in token else token)
@@ -1582,13 +1604,10 @@ def review_research_results(
         items = payload.get("items") or []
         return [_normalize_research_result_review_item(item) for item in items]
 
-    total_chunks = max(1, (len(reviewed_records) + max(1, chunk_size) - 1) // max(1, chunk_size))
-    completed_chunks = 0
-    for start in range(0, len(reviewed_records), max(1, chunk_size)):
-        chunk_records = reviewed_records[start : start + max(1, chunk_size)]
-        chunk_payload = []
-        for local_index, paper in enumerate(chunk_records):
-            chunk_payload.append(
+    def _build_chunk_payload(chunk: list[dict]) -> list[dict]:
+        payload_items = []
+        for local_index, paper in enumerate(chunk):
+            payload_items.append(
                 {
                     "index": local_index,
                     "title": paper.get("title") or "",
@@ -1598,6 +1617,30 @@ def review_research_results(
                     "abstract": (paper.get("content") or paper.get("abstract") or "")[:800],
                 }
             )
+        return payload_items
+
+    def _run_single(target_model_id: str, paper: dict) -> dict | None:
+        single_payload = _build_chunk_payload([paper])
+        items = _run(target_model_id, single_payload)
+        if not items:
+            return None
+        return items[0]
+
+    def _apply_review(paper: dict, review: dict, *, mode: str):
+        paper["relevance_label"] = review.get("relevance_label") or "medium"
+        paper["relevance_score"] = review.get("relevance_score") or 0
+        paper["autotags"] = review.get("autotags") or []
+        paper["review_reason"] = review.get("reason") or ""
+        paper["review_mode"] = mode
+
+    total_papers = len(reviewed_records)
+    total_chunks = max(1, (total_papers + max(1, chunk_size) - 1) // max(1, chunk_size))
+    completed_chunks = 0
+    total_model_reviewed = 0
+    total_heuristic_reviewed = 0
+    for start in range(0, len(reviewed_records), max(1, chunk_size)):
+        chunk_records = reviewed_records[start : start + max(1, chunk_size)]
+        chunk_payload = _build_chunk_payload(chunk_records)
         chunk_number = completed_chunks + 1
         if callable(progress_callback):
             progress_callback(
@@ -1605,12 +1648,20 @@ def review_research_results(
                     "stage": "reviewing_results",
                     "completed_chunks": completed_chunks,
                     "total_chunks": total_chunks,
+                    "current_batch": chunk_number,
+                    "total_batches": total_chunks,
+                    "reviewed_papers": start,
+                    "total_papers": total_papers,
+                    "model_reviewed_total": total_model_reviewed,
+                    "heuristic_reviewed_total": total_heuristic_reviewed,
                     "message": f"正在复核第 {chunk_number}/{total_chunks} 批结果，并生成相关性标签。",
                     "papers": reviewed_records,
                 }
             )
         review_items = []
         used_fallback = False
+        model_reviewed = 0
+        heuristic_reviewed = 0
         try:
             review_items = _run(model_id, chunk_payload)
         except Exception:
@@ -1624,22 +1675,55 @@ def review_research_results(
                 used_fallback = True
         review_by_index = {item["index"]: item for item in review_items if isinstance(item, dict)}
         for local_index, paper in enumerate(chunk_records):
-            review = review_by_index.get(local_index) or _heuristic_review_tags(text, plan, paper)
-            paper["relevance_label"] = review.get("relevance_label") or "medium"
-            paper["relevance_score"] = review.get("relevance_score") or 0
-            paper["autotags"] = review.get("autotags") or []
-            paper["review_reason"] = review.get("reason") or ""
+            review = review_by_index.get(local_index)
+            if review:
+                _apply_review(paper, review, mode="model")
+                model_reviewed += 1
+                continue
+
+            single_review = None
+            try:
+                single_review = _run_single(model_id, paper)
+            except Exception:
+                single_review = None
+
+            if not single_review and fallback_model_id:
+                try:
+                    single_review = _run_single(fallback_model_id, paper)
+                except Exception:
+                    single_review = None
+
+            if single_review:
+                used_fallback = True
+                _apply_review(paper, single_review, mode="model")
+                model_reviewed += 1
+                continue
+
+            used_fallback = True
+            heuristic_review = _heuristic_review_tags(text, plan, paper)
+            _apply_review(paper, heuristic_review, mode="heuristic")
+            heuristic_reviewed += 1
         completed_chunks += 1
+        total_model_reviewed += model_reviewed
+        total_heuristic_reviewed += heuristic_reviewed
         if callable(progress_callback):
             progress_callback(
                 {
                     "stage": "reviewing_results",
                     "completed_chunks": completed_chunks,
                     "total_chunks": total_chunks,
+                    "current_batch": completed_chunks,
+                    "total_batches": total_chunks,
+                    "reviewed_papers": min(total_papers, start + len(chunk_records)),
+                    "total_papers": total_papers,
+                    "model_reviewed_total": total_model_reviewed,
+                    "heuristic_reviewed_total": total_heuristic_reviewed,
+                    "current_batch_model_reviewed": model_reviewed,
+                    "current_batch_heuristic_reviewed": heuristic_reviewed,
                     "used_fallback": used_fallback,
                     "message": (
                         f"第 {completed_chunks}/{total_chunks} 批结果复核完成。"
-                        + (" 本批已退回启发式标签。" if used_fallback else "")
+                        f" 本批模型复核 {model_reviewed} 篇，启发式兜底 {heuristic_reviewed} 篇。"
                     ),
                     "papers": reviewed_records,
                 }

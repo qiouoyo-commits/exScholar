@@ -1,5 +1,7 @@
 """HTML page builders for the exScholar site."""
 
+from html import unescape as html_unescape
+
 from ..core import *
 
 
@@ -18,7 +20,7 @@ def build_timeline_html():
         abstract_text = "含摘要" if entry["fetch_abstract"] else "未抓摘要"
         source_paper = entry.get("source_paper") or {}
         is_expansion = bool(entry.get("is_expansion"))
-        title = source_paper.get("title") or keywords
+        title = html_unescape(source_paper.get("title") or keywords)
         detail_parts = [papers_text, abstract_text]
         if is_expansion:
             source_slug = source_paper.get("source_slug") or "未知来源"
@@ -433,20 +435,30 @@ def build_timeline_html():
         reviewing_results: [97, '复核结果', '正在做相关性判断和 autotag'],
       }};
       if (step === 'reviewing_results') {{
-        const matchedReviewBatch = stepMessage.match(/第\\s*(\\d+)\\s*\\/\\s*(\\d+)\\s*批/);
-        if (matchedReviewBatch) {{
-          const currentBatch = Number(matchedReviewBatch[1] || 0);
-          const totalBatches = Number(matchedReviewBatch[2] || 0);
-          if (currentBatch > 0 && totalBatches > 0) {{
-            const ratio = Math.min(1, currentBatch / totalBatches);
-            const percent = Math.max(93, Math.min(99, Math.round(92 + ratio * 7)));
-            return {{
-              percent,
-              label: '复核结果',
-              detail: `正在做相关性判断和 autotag（第 ${{currentBatch}}/${{totalBatches}} 批）`
-            }};
-          }}
+        const currentBatch = Number(progressPayload.review_current_batch || 0);
+        const totalBatches = Number(progressPayload.review_total_batches || 0);
+        const reviewedPapers = Number(progressPayload.review_reviewed_papers || 0);
+        const totalReviewPapers = Number(progressPayload.review_total_papers || job.total_papers || 0);
+        const modelReviewedTotal = Number(progressPayload.review_model_reviewed_total || 0);
+        const heuristicReviewedTotal = Number(progressPayload.review_heuristic_reviewed_total || 0);
+        if (currentBatch > 0 && totalBatches > 0) {{
+          const ratio = Math.min(1, currentBatch / totalBatches);
+          const percent = Math.max(93, Math.min(99, Math.round(92 + ratio * 7)));
+          const paperProgress = totalReviewPapers > 0
+            ? `已复核 ${{reviewedPapers}} / ${{totalReviewPapers}} 篇`
+            : `已完成第 ${{currentBatch}} / ${{totalBatches}} 批`;
+          const reviewModes = `模型复核 ${{modelReviewedTotal}} 篇，启发式兜底 ${{heuristicReviewedTotal}} 篇`;
+          return {{
+            percent,
+            label: '复核结果',
+            detail: `${{paperProgress}} · ${{reviewModes}} · 第 ${{currentBatch}}/${{totalBatches}} 批`
+          }};
         }}
+        return {{
+          percent: 93,
+          label: '复核结果',
+          detail: '正在启动逐批复核，并写回相关性与 autotag'
+        }};
       }}
       if (step === 'searching') {{
         const discovered = Number(progressPayload.discovered_papers || 0);
@@ -831,11 +843,12 @@ def build_timeline_html():
 
 def build_keywords_html():
     entries = list_keyword_entries()
+    graph = load_keyword_graph_cache()
     cards = []
     for entry in entries:
         cards.append(
             f"""
-            <a class="kw-card" href="/keywords/{entry['slug']}">
+            <a class="kw-card" data-keyword-id="{escape(entry['keyword'].lower())}" href="/keywords/{entry['slug']}">
               <div class="kw-name">{escape(entry['keyword'])}</div>
               <div class="kw-count">{entry['count']} 篇论文</div>
               <div class="muted">最近新增：{escape(entry.get('latest_date') or '未知')}</div>
@@ -843,6 +856,7 @@ def build_keywords_html():
             """
         )
     body = "\n".join(cards) if cards else '<div class="empty">还没有可用的命中词数据。</div>'
+    graph_json = json.dumps(graph, ensure_ascii=False).replace("</script>", "<\\/script>")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -865,6 +879,233 @@ def build_keywords_html():
     }}
     h1 {{ margin:0 0 8px; font-size:40px; }}
     .muted {{ color:#6f685c; line-height:1.7; font-size:14px; }}
+    .graph-shell {{
+      margin-bottom:20px; padding:20px;
+      border:1px solid #d5cbba; border-radius:24px; background:rgba(255,251,244,0.96);
+      box-shadow:0 18px 40px rgba(76,50,28,0.08);
+    }}
+    .graph-layout {{
+      display:grid;
+      grid-template-columns:minmax(0, 1.8fr) minmax(260px, 0.9fr);
+      gap:16px;
+      align-items:stretch;
+    }}
+    .graph-head {{ display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px; }}
+    .graph-title {{ font-size:24px; margin:0; }}
+    .graph-meta {{ color:#6f685c; font-size:14px; }}
+    .graph-controls {{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin:12px 0 14px;
+      align-items:center;
+    }}
+    .graph-group-select {{
+      padding:8px 12px;
+      border-radius:999px;
+      border:1px solid #d5cbba;
+      background:white;
+      color:#4f4338;
+      font:inherit;
+      min-width:220px;
+    }}
+    .graph-toggle {{
+      border:none;
+      border-radius:999px;
+      padding:8px 12px;
+      background:#ead8ca;
+      color:#6f685c;
+      font:inherit;
+      cursor:pointer;
+    }}
+    .graph-toggle.active {{
+      background:#9c4f2f;
+      color:white;
+    }}
+    .graph-board {{
+      position:relative;
+      min-height:560px;
+      border-radius:20px;
+      border:1px dashed #d5cbba;
+      background:
+        radial-gradient(circle at top, rgba(156,79,47,0.08), transparent 38%),
+        linear-gradient(180deg, rgba(255,255,255,0.68), rgba(244,236,225,0.88));
+      overflow:hidden;
+    }}
+    .graph-board svg {{ width:100%; height:560px; display:block; }}
+    .graph-empty {{
+      padding:28px;
+      color:#6f685c;
+      text-align:center;
+      line-height:1.7;
+    }}
+    .graph-link {{
+      stroke:#d9c7b6;
+      stroke-linecap:round;
+      transition:opacity .2s ease, stroke .2s ease, stroke-width .2s ease;
+    }}
+    .graph-link.active {{
+      stroke:#b34e2f;
+      opacity:0.95 !important;
+    }}
+    .graph-link.context {{
+      stroke:#c47b52;
+    }}
+    .graph-node {{ cursor:pointer; }}
+    .graph-node circle {{
+      stroke:#7b4734;
+      stroke-width:1.6;
+      transition:transform .16s ease, fill .16s ease, stroke-width .16s ease, opacity .16s ease;
+      transform-box:fill-box;
+      transform-origin:center;
+    }}
+    .graph-node text {{
+      fill:#47352d;
+      font-weight:700;
+      text-anchor:middle;
+      dominant-baseline:middle;
+      pointer-events:none;
+      transition:fill .16s ease, opacity .16s ease;
+    }}
+    .graph-node:hover circle, .graph-node.active circle {{
+      stroke-width:2.8;
+      transform:scale(1.04);
+    }}
+    .graph-node.active text {{ fill:#8e3f28; }}
+    .graph-node.context circle {{ stroke:#c16a3f; }}
+    .graph-node.context text {{ fill:#9a5b39; }}
+    .graph-node.faded circle, .graph-node.faded text {{
+      opacity:0.22;
+    }}
+    .graph-hint {{
+      margin-top:10px;
+      color:#6f685c;
+      font-size:14px;
+      line-height:1.7;
+    }}
+    .graph-side {{
+      border:1px solid #d5cbba;
+      border-radius:20px;
+      background:rgba(255,248,240,0.94);
+      padding:16px;
+      min-height:560px;
+      box-shadow:inset 0 1px 0 rgba(255,255,255,0.5);
+    }}
+    .graph-side h3 {{
+      margin:0 0 8px;
+      font-size:24px;
+      line-height:1.2;
+    }}
+    .graph-side .meta-line {{
+      color:#6f685c;
+      font-size:14px;
+      line-height:1.7;
+      margin-bottom:12px;
+    }}
+    .graph-side .summary {{
+      color:#4f4338;
+      line-height:1.75;
+      font-size:15px;
+      margin-bottom:14px;
+    }}
+    .graph-side .open-link {{
+      display:inline-block;
+      background:#9c4f2f;
+      color:white;
+      text-decoration:none;
+      padding:10px 14px;
+      border-radius:999px;
+      margin-bottom:16px;
+    }}
+    .graph-related-title {{
+      margin:18px 0 8px;
+      font-size:16px;
+      color:#4f4338;
+    }}
+    .graph-related-list {{
+      display:grid;
+      gap:10px;
+    }}
+    .graph-related-item {{
+      display:grid;
+      grid-template-columns:minmax(0, 1fr) auto;
+      gap:12px;
+      align-items:flex-start;
+      padding:10px 12px;
+      border:1px solid #e2d4c4;
+      border-radius:14px;
+      background:rgba(255,255,255,0.72);
+    }}
+    .graph-related-actions {{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin-top:8px;
+    }}
+    .graph-related-item a {{
+      color:#9c4f2f;
+      text-decoration:none;
+      background:none;
+      padding:0;
+      border-radius:0;
+      font-weight:700;
+    }}
+    .graph-related-weight {{
+      color:#6f685c;
+      font-size:13px;
+      white-space:nowrap;
+    }}
+    .graph-related-toggle, .graph-filter-clear {{
+      border:none;
+      border-radius:999px;
+      padding:7px 11px;
+      font:inherit;
+      cursor:pointer;
+      background:#ead8ca;
+      color:#6f685c;
+    }}
+    .graph-related-toggle.active {{
+      background:#9c4f2f;
+      color:white;
+    }}
+    .graph-filter-summary {{
+      margin:14px 0 10px;
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+    }}
+    .graph-filter-querybar {{
+      margin:12px 0 10px;
+      padding:10px 12px;
+      border-radius:14px;
+      background:rgba(255,255,255,0.78);
+      border:1px solid #e6d7c8;
+      color:#5b473f;
+      line-height:1.7;
+    }}
+    .graph-filter-pill {{
+      background:#f0dfcf;
+      color:#734532;
+      border-radius:999px;
+      padding:6px 10px;
+      font-size:13px;
+    }}
+    .graph-filter-open {{
+      display:inline-block;
+      background:#9c4f2f;
+      color:white;
+      text-decoration:none;
+      padding:9px 12px;
+      border-radius:999px;
+    }}
+    .graph-side-empty {{
+      color:#6f685c;
+      line-height:1.8;
+      font-size:15px;
+      padding:8px 2px;
+    }}
     .grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:16px; }}
     .kw-card {{ padding:18px; text-decoration:none; color:inherit; }}
     .kw-card:hover {{ transform:translateY(-2px); transition:transform .18s ease; }}
@@ -876,6 +1117,11 @@ def build_keywords_html():
       .hero {{ padding:22px 18px; }}
       .actions {{ width:100%; }}
       .actions a {{ width:100%; text-align:center; }}
+      .graph-layout {{ grid-template-columns:1fr; }}
+      .graph-board {{ min-height:420px; }}
+      .graph-board svg {{ height:420px; }}
+      .graph-shell {{ padding:16px; }}
+      .graph-side {{ min-height:initial; }}
       .grid {{ grid-template-columns:1fr; gap:14px; }}
       .kw-card {{ padding:16px; }}
       .kw-name {{ font-size:20px; }}
@@ -896,8 +1142,511 @@ def build_keywords_html():
         </div>
       </div>
     </section>
+    <section class="graph-shell">
+      <div class="graph-head">
+        <div>
+          <h2 class="graph-title">Keyword Constellation</h2>
+          <div class="graph-meta">基于同一篇论文里的标签共现关系生成。字越大，出现次数越高；距离越近、连线越深，表示关联越强。</div>
+        </div>
+        <div class="graph-meta">当前展示 {graph['graph_keywords']} / {graph['total_keywords']} 个关键词，覆盖 {graph['total_papers']} 篇论文</div>
+      </div>
+      <div class="graph-controls">
+        <button class="graph-toggle active" type="button" data-graph-mode="strong">只看当前最强关联</button>
+        <button class="graph-toggle" type="button" data-graph-mode="popular">只看最常见 tags</button>
+        <select class="graph-group-select" id="keyword-graph-group-filter">
+          <option value="all">全部 Groups / 全局标签</option>
+        </select>
+      </div>
+      <div class="graph-layout">
+        <div class="graph-board" id="keyword-graph-board">
+          <div class="graph-empty">正在绘制关键词关联图…</div>
+        </div>
+        <aside class="graph-side" id="keyword-graph-side">
+          <div class="graph-side-empty">点击左侧任意球体，我们会在这里展示这个 tag 最相关的几个 tag，方便你先判断主题结构，再决定是否进入详情页。</div>
+        </aside>
+      </div>
+      <div class="graph-hint">页面每次打开时都会基于最新论文和 tags 实时重算，所以有新论文加入后，这里会自动反映。单击球体可在右侧预览，右侧再进入详情页。</div>
+    </section>
     <section class="grid">{body}</section>
   </main>
+  <script id="keyword-graph-data" type="application/json">{graph_json}</script>
+  <script>
+    const keywordGraph = JSON.parse(document.getElementById('keyword-graph-data').textContent || '{{}}');
+    let keywordGraphMode = 'strong';
+    let keywordGraphSelectedNodeId = '';
+    let keywordGraphGroupFilter = 'all';
+    let keywordGraphActiveFilterIds = new Set();
+    let keywordGraphVisibleNodes = [];
+    let keywordGraphVisibleEdges = [];
+
+    function esc(value) {{
+      return (value || '').toString()
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }}
+
+    function clamp(value, min, max) {{
+      return Math.max(min, Math.min(max, value));
+    }}
+
+    function scoreNodeDegrees(nodes, edges) {{
+      const degreeMap = new Map(nodes.map((node) => [node.id, 0]));
+      for (const edge of edges) {{
+        const weight = Number(edge.weight) || 0;
+        degreeMap.set(edge.source, (degreeMap.get(edge.source) || 0) + weight);
+        degreeMap.set(edge.target, (degreeMap.get(edge.target) || 0) + weight);
+      }}
+      return degreeMap;
+    }}
+
+    function getVisibleGraphPayload() {{
+      const sourceGraph = keywordGraphGroupFilter === 'all'
+        ? keywordGraph
+        : ((keywordGraph.graphs_by_group || {{}})[keywordGraphGroupFilter] || {{ nodes: [], edges: [] }});
+      const allNodes = Array.isArray(sourceGraph.nodes) ? sourceGraph.nodes.slice() : [];
+      const allEdges = Array.isArray(sourceGraph.edges) ? sourceGraph.edges.slice() : [];
+      if (!allNodes.length) return {{ nodes: [], edges: [] }};
+
+      const degreeMap = scoreNodeDegrees(allNodes, allEdges);
+      let nodes;
+      if (keywordGraphMode === 'popular') {{
+        nodes = allNodes
+          .slice()
+          .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0) || (b.latest_date || '').localeCompare(a.latest_date || '') || (a.label || '').localeCompare(b.label || ''))
+          .slice(0, 28);
+      }} else {{
+        nodes = allNodes
+          .slice()
+          .sort((a, b) => (degreeMap.get(b.id) || 0) - (degreeMap.get(a.id) || 0) || (Number(b.count) || 0) - (Number(a.count) || 0) || (a.label || '').localeCompare(b.label || ''))
+          .slice(0, 24);
+      }}
+      const allowed = new Set(nodes.map((node) => node.id));
+      const edges = allEdges
+        .filter((edge) => allowed.has(edge.source) && allowed.has(edge.target))
+        .sort((a, b) => (Number(b.weight) || 0) - (Number(a.weight) || 0) || a.source.localeCompare(b.source) || a.target.localeCompare(b.target))
+        .slice(0, keywordGraphMode === 'popular' ? 72 : 56);
+      return {{ nodes, edges }};
+    }}
+
+    function updateGraphModeButtons() {{
+      document.querySelectorAll('[data-graph-mode]').forEach((button) => {{
+        button.classList.toggle('active', button.dataset.graphMode === keywordGraphMode);
+      }});
+    }}
+
+    function renderGroupFilterOptions() {{
+      const select = document.getElementById('keyword-graph-group-filter');
+      if (!select) return;
+      const groups = Array.isArray(keywordGraph.groups) ? keywordGraph.groups.slice() : [];
+      select.innerHTML = '<option value="all">全部 Groups / 全局标签</option>' + groups.map((group) => (
+        `<option value="${{esc(group.id)}}">${{esc(group.name)}} (${{group.paper_count}} 篇)</option>`
+      )).join('');
+      if (!groups.some((group) => group.id === keywordGraphGroupFilter)) {{
+        keywordGraphGroupFilter = 'all';
+      }}
+      select.value = keywordGraphGroupFilter;
+    }}
+
+    function renderKeywordPreview(node, visibleEdges) {{
+      const side = document.getElementById('keyword-graph-side');
+      if (!side) return;
+      if (!node) {{
+        side.innerHTML = '<div class="graph-side-empty">点击左侧任意球体，我们会在这里展示这个 tag 最相关的几个 tag，方便你先判断主题结构，再决定是否进入详情页。</div>';
+        return;
+      }}
+      const related = visibleEdges
+        .filter((edge) => edge.source === node.id || edge.target === node.id)
+        .map((edge) => {{
+          const otherId = edge.source === node.id ? edge.target : edge.source;
+          const other = (keywordGraph.nodes || []).find((item) => item.id === otherId);
+          return other ? {{ node: other, weight: Number(edge.weight) || 0 }} : null;
+        }})
+        .filter(Boolean)
+        .sort((a, b) => b.weight - a.weight || (Number(b.node.count) || 0) - (Number(a.node.count) || 0))
+        .slice(0, 8);
+
+      const relatedHtml = related.length
+        ? related.map((item) => `
+            <div class="graph-related-item">
+              <div>
+                <a href="/keywords/${{item.node.slug}}">${{esc(item.node.label)}}</a>
+                <div class="muted">出现 ${{item.node.count}} 次</div>
+                <div class="graph-related-actions">
+                  <button class="graph-related-toggle ${{keywordGraphActiveFilterIds.has(item.node.id) ? 'active' : ''}}" type="button" data-related-node-id="${{esc(item.node.id)}}">
+                    ${{keywordGraphActiveFilterIds.has(item.node.id) ? '已加入筛选' : '加入筛选'}}
+                  </button>
+                </div>
+              </div>
+              <div class="graph-related-weight">关联强度 ${{item.weight}}</div>
+            </div>
+          `).join('')
+        : '<div class="graph-side-empty">这个 tag 目前还没有足够强的共现关系，可能更适合作为独立入口查看。</div>';
+
+      const filterPills = Array.from(keywordGraphActiveFilterIds)
+        .map((id) => keywordGraphVisibleNodes.find((item) => item.id === id) || (keywordGraph.nodes || []).find((item) => item.id === id))
+        .filter(Boolean)
+        .map((item) => `<span class="graph-filter-pill">${{esc(item.label)}}</span>`)
+        .join('');
+      const filterQueryText = Array.from(keywordGraphActiveFilterIds)
+        .map((id) => keywordGraphVisibleNodes.find((item) => item.id === id) || (keywordGraph.nodes || []).find((item) => item.id === id))
+        .filter(Boolean)
+        .map((item) => item.label)
+        .join(' + ');
+      const intersectionHref = `/keywords/intersection?tags=${{encodeURIComponent(Array.from(keywordGraphActiveFilterIds).map((id) => {{
+        const hit = keywordGraphVisibleNodes.find((item) => item.id === id) || (keywordGraph.nodes || []).find((item) => item.id === id);
+        return hit ? hit.label : '';
+      }}).filter(Boolean).join(','))}}`;
+      const filterSummaryHtml = keywordGraphActiveFilterIds.size
+        ? `
+            <div class="graph-filter-querybar">
+              当前查询：${{esc(filterQueryText)}}<br>
+              <span class="muted">这会筛出这些 tags 的交叉区域，并可直接打开共同出现的论文列表。</span>
+            </div>
+            <div class="graph-filter-summary">
+              ${{filterPills}}
+              <a class="graph-filter-open" href="${{intersectionHref}}">只看这些 tag 共同出现的论文</a>
+              <button class="graph-filter-clear" type="button" id="keyword-graph-clear-filter">清空多标签筛选</button>
+            </div>
+          `
+        : '';
+
+      side.innerHTML = `
+        <h3>${{esc(node.label)}}</h3>
+        <div class="meta-line">出现 ${{node.count}} 次 · 最近出现：${{esc(node.latest_date || '未知')}}</div>
+        <div class="summary">${{keywordGraphMode === 'strong' ? '当前视图强调它与其他 tags 的共现强度，适合快速判断主题簇。' : '当前视图强调这个 tag 本身的出现频率，适合先看全局热点。'}}${{keywordGraphGroupFilter !== 'all' ? ' 现在这张图只基于当前选中的 Group。' : ''}}</div>
+        <a class="open-link" href="/keywords/${{node.slug}}">打开这个关键词详情</a>
+        ${{filterSummaryHtml}}
+        <div class="graph-related-title">最相关的几个 tag</div>
+        <div class="graph-related-list">${{relatedHtml}}</div>
+      `;
+
+      side.querySelectorAll('[data-related-node-id]').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          const targetId = button.getAttribute('data-related-node-id');
+          if (!targetId || targetId === keywordGraphSelectedNodeId) return;
+          if (keywordGraphActiveFilterIds.has(targetId)) {{
+            keywordGraphActiveFilterIds.delete(targetId);
+          }} else {{
+            keywordGraphActiveFilterIds.add(targetId);
+          }}
+          renderKeywordPreview(node, visibleEdges);
+          applyKeywordGraphSelectionState();
+          applyKeywordCardFilter();
+        }});
+      }});
+
+      const clearButton = document.getElementById('keyword-graph-clear-filter');
+      if (clearButton) {{
+        clearButton.addEventListener('click', () => {{
+          keywordGraphActiveFilterIds = new Set(keywordGraphSelectedNodeId ? [keywordGraphSelectedNodeId] : []);
+          renderKeywordPreview(node, visibleEdges);
+          applyKeywordGraphSelectionState();
+          applyKeywordCardFilter();
+        }});
+      }}
+    }}
+
+    function colorForNode(node, maxCount) {{
+      const ratio = maxCount <= 1 ? 0.55 : (Number(node.count) || 1) / maxCount;
+      const hue = 22 + ratio * 18;
+      const saturation = 52 + ratio * 18;
+      const lightness = 86 - ratio * 28;
+      return `hsl(${{hue}}, ${{saturation}}%, ${{lightness}}%)`;
+    }}
+
+    function applyKeywordCardFilter() {{
+      const cards = Array.from(document.querySelectorAll('.kw-card[data-keyword-id]'));
+      if (!cards.length) return;
+      const activeIds = Array.from(keywordGraphActiveFilterIds);
+      if (!activeIds.length) {{
+        cards.forEach((card) => {{
+          card.style.display = '';
+          card.style.opacity = '1';
+        }});
+        return;
+      }}
+      cards.forEach((card) => {{
+        const cardId = (card.dataset.keywordId || '').trim().toLowerCase();
+        const visible = keywordGraphActiveFilterIds.has(cardId);
+        card.style.display = visible ? '' : 'none';
+        card.style.opacity = visible ? '1' : '0.25';
+      }});
+    }}
+
+    function applyKeywordGraphSelectionState() {{
+      const board = document.getElementById('keyword-graph-board');
+      if (!board) return;
+      const activeIds = keywordGraphActiveFilterIds.size ? new Set(keywordGraphActiveFilterIds) : new Set(keywordGraphSelectedNodeId ? [keywordGraphSelectedNodeId] : []);
+      const contextIds = new Set(keywordGraphSelectedNodeId ? [keywordGraphSelectedNodeId] : []);
+      keywordGraphVisibleEdges.forEach((edge) => {{
+        if (edge.source === keywordGraphSelectedNodeId) contextIds.add(edge.target);
+        if (edge.target === keywordGraphSelectedNodeId) contextIds.add(edge.source);
+      }});
+
+      board.querySelectorAll('.graph-node').forEach((element) => {{
+        const nodeId = element.getAttribute('data-node-id') || '';
+        const isSelected = activeIds.has(nodeId);
+        const isContext = contextIds.has(nodeId);
+        element.classList.toggle('active', isSelected);
+        element.classList.toggle('context', !isSelected && isContext);
+        element.classList.toggle('faded', !isSelected && !isContext && activeIds.size > 0);
+      }});
+
+      board.querySelectorAll('.graph-link').forEach((element) => {{
+        const source = element.dataset.source || '';
+        const target = element.dataset.target || '';
+        const bothSelected = activeIds.has(source) && activeIds.has(target);
+        const touchesSelected = activeIds.has(source) || activeIds.has(target);
+        const touchesPrimary = source === keywordGraphSelectedNodeId || target === keywordGraphSelectedNodeId;
+        element.classList.toggle('active', bothSelected);
+        element.classList.toggle('context', !bothSelected && touchesPrimary);
+        if (!activeIds.size) {{
+          element.style.opacity = element.getAttribute('opacity') || '0.2';
+        }} else if (bothSelected) {{
+          element.style.opacity = '0.98';
+        }} else if (touchesSelected || touchesPrimary) {{
+          element.style.opacity = '0.42';
+        }} else {{
+          element.style.opacity = '0.05';
+        }}
+      }});
+    }}
+
+    function renderKeywordGraph() {{
+      const board = document.getElementById('keyword-graph-board');
+      if (!board) return;
+      updateGraphModeButtons();
+      const visible = getVisibleGraphPayload();
+      const nodes = visible.nodes.slice();
+      const edges = visible.edges.slice();
+      if (!nodes.length) {{
+        board.innerHTML = '<div class="graph-empty">还没有足够的标签共现数据来绘制关联图。</div>';
+        renderKeywordPreview(null, []);
+        return;
+      }}
+
+      const width = board.clientWidth || 900;
+      const height = width < 720 ? 420 : 560;
+      const maxCount = Math.max(...nodes.map((node) => Number(node.count) || 1), 1);
+      const minCount = Math.min(...nodes.map((node) => Number(node.count) || 1), maxCount);
+      const maxWeight = Math.max(...edges.map((edge) => Number(edge.weight) || 1), 1);
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const baseRadius = Math.max(Math.min(width, height) * 0.24, 120);
+      const outerRadius = Math.max(Math.min(width, height) * 0.43, 180);
+
+      nodes.sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0) || (a.label || '').localeCompare(b.label || ''));
+
+      nodes.forEach((node, index) => {{
+        const count = Number(node.count) || 1;
+        const ratio = maxCount === minCount ? 1 : (count - minCount) / (maxCount - minCount);
+        node.radius = Math.round(22 + ratio * 32);
+        node.fontSize = Math.round(12 + ratio * 12);
+        node.fill = colorForNode(node, maxCount);
+        node.mass = 1 + ratio * 2.2;
+        const angle = index * 2.399963229728653;
+        const spreadRatio = nodes.length <= 1 ? 0 : index / Math.max(nodes.length - 1, 1);
+        const largeNodeBoost = (1 - spreadRatio) * 0.18;
+        const radial = baseRadius + (outerRadius - baseRadius) * Math.sqrt(spreadRatio + largeNodeBoost);
+        node.x = centerX + Math.cos(angle) * radial;
+        node.y = centerY + Math.sin(angle) * radial;
+        node.vx = 0;
+        node.vy = 0;
+      }});
+
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+      const layoutEdges = edges
+        .map((edge) => {{
+          const source = nodeMap.get(edge.source);
+          const target = nodeMap.get(edge.target);
+          if (!source || !target) return null;
+          return {{
+            ...edge,
+            sourceNode: source,
+            targetNode: target,
+            strength: 0.03 + ((Number(edge.weight) || 1) / maxWeight) * 0.12,
+            targetDistance: source.radius + target.radius + (150 - ((Number(edge.weight) || 1) / maxWeight) * 70),
+          }};
+        }})
+        .filter(Boolean);
+
+      for (let iteration = 0; iteration < 320; iteration += 1) {{
+        for (const edge of layoutEdges) {{
+          const a = edge.sourceNode;
+          const b = edge.targetNode;
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const distance = Math.max(Math.hypot(dx, dy), 1);
+          const pull = (distance - edge.targetDistance) * edge.strength;
+          const offsetX = (dx / distance) * pull;
+          const offsetY = (dy / distance) * pull;
+          a.vx += offsetX;
+          a.vy += offsetY;
+          b.vx -= offsetX;
+          b.vy -= offsetY;
+        }}
+
+        for (let i = 0; i < nodes.length; i += 1) {{
+          for (let j = i + 1; j < nodes.length; j += 1) {{
+            const a = nodes[i];
+            const b = nodes[j];
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const distance = Math.max(Math.hypot(dx, dy), 1);
+            const minDistance = a.radius + b.radius + 26 + Math.max(a.radius, b.radius) * 0.28;
+            const overlapPush = distance < minDistance ? (minDistance - distance) * 0.11 : 0;
+            const repulsion = ((a.mass || 1) * (b.mass || 1) * 115) / (distance * distance);
+            const push = overlapPush + repulsion;
+            const offsetX = (dx / distance) * push;
+            const offsetY = (dy / distance) * push;
+            a.vx -= offsetX;
+            a.vy -= offsetY;
+            b.vx += offsetX;
+            b.vy += offsetY;
+          }}
+        }}
+
+        for (const node of nodes) {{
+          const towardCenterX = (centerX - node.x) * 0.0022;
+          const towardCenterY = (centerY - node.y) * 0.0022;
+          node.vx += towardCenterX;
+          node.vy += towardCenterY;
+          node.x += node.vx;
+          node.y += node.vy;
+          node.vx *= 0.82;
+          node.vy *= 0.82;
+          node.x = clamp(node.x, node.radius + 18, width - node.radius - 18);
+          node.y = clamp(node.y, node.radius + 18, height - node.radius - 18);
+        }}
+      }}
+
+      const edgeMarkup = layoutEdges.map((edge) => {{
+        const opacity = (0.14 + ((Number(edge.weight) || 1) / maxWeight) * 0.62).toFixed(3);
+        const strokeWidth = (0.8 + ((Number(edge.weight) || 1) / maxWeight) * 2.2).toFixed(2);
+        return `
+          <line
+            class="graph-link"
+            data-source="${{esc(edge.source)}}"
+            data-target="${{esc(edge.target)}}"
+            x1="${{edge.sourceNode.x.toFixed(1)}}"
+            y1="${{edge.sourceNode.y.toFixed(1)}}"
+            x2="${{edge.targetNode.x.toFixed(1)}}"
+            y2="${{edge.targetNode.y.toFixed(1)}}"
+            opacity="${{opacity}}"
+            stroke-width="${{strokeWidth}}"
+          />
+        `;
+      }}).join('');
+
+      const nodeMarkup = nodes.map((node) => {{
+        const label = esc(node.label || '');
+        const shortLabel = label.length > 26 ? `${{label.slice(0, 24)}}…` : label;
+        return `
+          <g class="graph-node" data-node-id="${{esc(node.id)}}" data-node-slug="${{esc(node.slug)}}" tabindex="0" role="button" aria-label="预览关键词 ${{label}}">
+            <title>${{label}} (${{node.count}})</title>
+            <circle cx="${{node.x.toFixed(1)}}" cy="${{node.y.toFixed(1)}}" r="${{node.radius}}" fill="${{node.fill}}"></circle>
+            <text x="${{node.x.toFixed(1)}}" y="${{node.y.toFixed(1)}}" font-size="${{node.fontSize}}">${{shortLabel}}</text>
+          </g>
+        `;
+      }}).join('');
+
+      board.innerHTML = `
+        <svg viewBox="0 0 ${{width}} ${{height}}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Keyword relation graph">
+          <g>${{edgeMarkup}}</g>
+          <g>${{nodeMarkup}}</g>
+        </svg>
+      `;
+
+      const svg = board.querySelector('svg');
+      const links = Array.from(board.querySelectorAll('.graph-link'));
+      const nodeElements = Array.from(board.querySelectorAll('.graph-node'));
+      const selectedNode = nodes.find((node) => node.id === keywordGraphSelectedNodeId) || nodes[0];
+      keywordGraphSelectedNodeId = selectedNode ? selectedNode.id : '';
+      keywordGraphVisibleNodes = nodes.slice();
+      keywordGraphVisibleEdges = edges.slice();
+      if (!keywordGraphActiveFilterIds.size || !keywordGraphActiveFilterIds.has(keywordGraphSelectedNodeId)) {{
+        keywordGraphActiveFilterIds = new Set(keywordGraphSelectedNodeId ? [keywordGraphSelectedNodeId] : []);
+      }}
+      renderKeywordPreview(selectedNode, edges);
+      applyKeywordGraphSelectionState();
+      applyKeywordCardFilter();
+
+      function activateNode(nodeId) {{
+        const node = nodes.find((item) => item.id === nodeId);
+        if (!node) return;
+        keywordGraphSelectedNodeId = node.id;
+        keywordGraphActiveFilterIds = new Set([node.id]);
+        renderKeywordPreview(node, edges);
+        applyKeywordGraphSelectionState();
+        applyKeywordCardFilter();
+      }}
+
+      for (const node of board.querySelectorAll('.graph-node')) {{
+        node.addEventListener('mouseenter', () => {{
+          const nodeId = node.getAttribute('data-node-id');
+          const hoveredIds = new Set(keywordGraphActiveFilterIds.size ? keywordGraphActiveFilterIds : [keywordGraphSelectedNodeId]);
+          if (nodeId) hoveredIds.add(nodeId);
+          board.querySelectorAll('.graph-node').forEach((element) => {{
+            const elementId = element.getAttribute('data-node-id') || '';
+            element.classList.toggle('active', hoveredIds.has(elementId));
+          }});
+          board.querySelectorAll('.graph-link').forEach((element) => {{
+            const source = element.dataset.source || '';
+            const target = element.dataset.target || '';
+            const related = source === nodeId || target === nodeId || (hoveredIds.has(source) && hoveredIds.has(target));
+            element.style.opacity = related ? '0.92' : '0.05';
+          }});
+        }});
+        node.addEventListener('mouseleave', () => {{
+          applyKeywordGraphSelectionState();
+        }});
+        node.addEventListener('click', () => {{
+          activateNode(node.getAttribute('data-node-id'));
+        }});
+        node.addEventListener('keydown', (event) => {{
+          if (event.key === 'Enter' || event.key === ' ') {{
+            event.preventDefault();
+            activateNode(node.getAttribute('data-node-id'));
+          }}
+        }});
+      }}
+
+      if (svg) {{
+        svg.addEventListener('mouseleave', () => {{
+          applyKeywordGraphSelectionState();
+        }});
+      }}
+    }}
+
+    document.querySelectorAll('[data-graph-mode]').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        const nextMode = button.dataset.graphMode || 'strong';
+        if (nextMode === keywordGraphMode) return;
+        keywordGraphMode = nextMode;
+        renderKeywordGraph();
+      }});
+    }});
+
+    const keywordGraphGroupSelect = document.getElementById('keyword-graph-group-filter');
+    if (keywordGraphGroupSelect) {{
+      keywordGraphGroupSelect.addEventListener('change', () => {{
+        keywordGraphGroupFilter = keywordGraphGroupSelect.value || 'all';
+        keywordGraphSelectedNodeId = '';
+        renderKeywordGraph();
+      }});
+    }}
+
+    window.addEventListener('load', () => {{
+      renderGroupFilterOptions();
+      renderKeywordGraph();
+    }});
+    window.addEventListener('resize', () => {{
+      clearTimeout(window.__keywordGraphResizeTimer);
+      window.__keywordGraphResizeTimer = setTimeout(renderKeywordGraph, 120);
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -927,13 +1676,15 @@ def build_keyword_detail_html(keyword: str):
             if source_kind == "deep_reading" and paper.get("source_site_url")
             else ""
         )
+        title_text = html_unescape(paper['title'])
+        content_text = html_unescape(paper.get('content') or '暂无内容')
         cards.append(
             f"""
             <article class="card">
-              <h2>{escape(paper['title'])}</h2>
+              <h2>{escape(title_text)}</h2>
               <div class="meta">{escape(meta_text)}</div>
               <div class="meta">{doi_text}</div>
-              <p>{escape(paper.get('content') or '暂无内容')}</p>
+              <p>{escape(content_text)}</p>
               <div class="group-select-row" style="margin:12px 0;">
                 <label>选择 Reading Group（可选）:</label>
                 <select id="group-select-{idx}" style="margin-left:8px; padding:6px; border-radius:8px; border:1px solid #d5cbba;">
@@ -1311,6 +2062,98 @@ def build_keyword_detail_html(keyword: str):
     window.expandKeywordPaper = expandKeywordPaper;
     loadReadingGroups().catch(() => {{}});
   </script>
+</body>
+</html>"""
+
+
+def build_keyword_intersection_html(keywords: list[str]):
+    entry = build_keyword_intersection_entry(keywords)
+    selected = entry.get("selected_keywords") or []
+    if not selected:
+        return build_keywords_html()
+    cards = []
+    for paper in entry["papers"]:
+        source_kind = paper.get("source_kind") or "search"
+        meta_parts = [
+            paper.get("venue") or "",
+            str(paper.get("year") or ""),
+            paper.get("authors") or "",
+            f"来源：{'深度阅读' if source_kind == 'deep_reading' else ('搜索 ' + str(paper.get('source_slug') or ''))}",
+        ]
+        meta_text = " · ".join(part for part in meta_parts if part)
+        doi_text = f"DOI: {escape(paper['doi'])}" if paper.get("doi") else ""
+        link_html = f'<a href="{paper["url"]}" target="_blank" rel="noreferrer">原文链接</a>' if paper.get("url") else ""
+        reading_link_html = (
+            f'<a href="{paper["source_site_url"]}" target="_blank" rel="noreferrer">打开结果页</a>'
+            if paper.get("source_site_url")
+            else ""
+        )
+        title_text = html_unescape(paper["title"])
+        content_text = html_unescape((paper.get("content") or "").strip() or "暂无内容")
+        tags_text = " · ".join(paper.get("keywords") or [])
+        cards.append(
+            f"""
+            <article class="card">
+              <h2>{escape(title_text)}</h2>
+              <div class="meta">{escape(meta_text)}</div>
+              <div class="meta">{doi_text}</div>
+              <div class="meta">关键词：{escape(tags_text)}</div>
+              <p>{escape(content_text)}</p>
+              <div class="links">
+                {link_html}
+                {reading_link_html}
+              </div>
+            </article>
+            """
+        )
+    body = "\n".join(cards) if cards else '<div class="empty">当前没有论文同时命中这组 tags。</div>'
+    query_text = " + ".join(selected)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(query_text)}</title>
+  <style>
+    body {{ margin:0; font-family: Georgia, "Noto Serif SC", serif; background:#f2efe8; color:#1e1d1a; }}
+    .wrap {{ max-width:1040px; margin:0 auto; padding:28px 18px 72px; }}
+    .hero, .card, .empty {{
+      border:1px solid #d5cbba; border-radius:24px; background:rgba(255,251,244,0.96);
+      box-shadow:0 18px 40px rgba(76,50,28,0.08);
+    }}
+    .hero {{ padding:28px; margin-bottom:20px; }}
+    .row {{ display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
+    .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+    .actions a, .links a {{
+      display:inline-block; background:#9c4f2f; color:white; text-decoration:none;
+      padding:10px 14px; border-radius:999px;
+    }}
+    h1 {{ margin:0 0 8px; font-size:36px; line-height:1.18; }}
+    h2 {{ margin:0 0 8px; font-size:24px; line-height:1.3; }}
+    .muted, .meta {{ color:#6f685c; line-height:1.7; font-size:14px; }}
+    .list {{ display:grid; gap:16px; }}
+    .card {{ padding:18px; }}
+    p {{ line-height:1.8; }}
+    .links {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+    .empty {{ padding:24px; text-align:center; }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <div class="row">
+        <div>
+          <h1>{escape(query_text)}</h1>
+          <div class="muted">共 {entry['count']} 篇论文同时命中这组 tags。这里适合快速查看多标签交叉区域里的论文集合。</div>
+        </div>
+        <div class="actions">
+          <a href="/keywords">返回 Keywords</a>
+          <a href="/">返回时间线</a>
+        </div>
+      </div>
+    </section>
+    <section class="list">{body}</section>
+  </main>
 </body>
 </html>"""
 
@@ -1839,6 +2682,7 @@ def build_library_html():
     all_groups = list_reading_groups()
     all_tags = []
     seen_tags = set()
+    group_counts = {int(g["id"]): 0 for g in all_groups if g.get("id") is not None}
     for item in items:
         for tag in [part.strip() for part in (item.get("tags") or "").split(",") if part.strip()]:
             low = tag.lower()
@@ -1849,10 +2693,6 @@ def build_library_html():
     filter_html = "".join(
         f'<button class="tag" type="button" data-filter="{tag.lower()}">{tag}</button>'
         for tag in all_tags
-    )
-    group_filter_html = "".join(
-        f'<button class="tag" type="button" data-group-filter="{g["id"]}">{escape(g["name"])}</button>'
-        for g in all_groups
     )
     upload_group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
     cards = []
@@ -1870,14 +2710,22 @@ def build_library_html():
             reading_button = ""
             reading_hint = "上传 PDF 后可进入深度阅读"
         groups = get_citation_groups(item["id"])
+        for group in groups:
+            try:
+                group_counts[int(group["id"])] = group_counts.get(int(group["id"]), 0) + 1
+            except Exception:
+                continue
         group_badges = "".join(f'<span class="group-badge" data-group-id="{g["id"]}">{g["name"]}</span>' for g in groups) or '<span class="muted">未加入任何 Group</span>'
         group_ids = ",".join(str(g["id"]) for g in groups)
         group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
         tags = [part.strip() for part in (item.get("tags") or "").split(",") if part.strip()]
-        tag_badges = "".join(f'<button class="tag" type="button" data-filter-tag="{tag}">{tag}</button>' for tag in tags) or '<span class="muted">无 tags</span>'
+        tag_badges = "".join(
+            f'<button class="tag" type="button" data-filter-tag="{escape(tag.lower())}">{escape(tag)}</button>'
+            for tag in tags
+        ) or '<span class="muted">无 tags</span>'
         cards.append(
             f"""
-            <article class="card" data-tags="{(item.get("tags") or "").lower()}" data-group-ids="{group_ids}" data-citation-id="{item["id"]}">
+            <article class="card" data-tags="{escape(item.get("tags") or "")}" data-group-ids="{group_ids}" data-citation-id="{item["id"]}">
               <div class="checkrow">
                 <label class="checklabel">
                   <input class="cite-check" type="checkbox" value="{item["id"]}">
@@ -1922,6 +2770,11 @@ def build_library_html():
             </article>
             """
         )
+    group_filter_html = "".join(
+        f'<button class="tag" type="button" data-group-filter="{g["id"]}">{escape(g["name"])} ({group_counts.get(int(g["id"]), 0)})</button>'
+        for g in all_groups
+        if group_counts.get(int(g["id"]), 0) > 0
+    )
     body = "\n".join(cards) if cards else '<div class="empty">深度阅读模块还是空的，先去搜索结果页加入几篇，或直接上传 PDF 吧。</div>'
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1951,6 +2804,11 @@ def build_library_html():
       padding:8px 12px; cursor:pointer; font:inherit;
     }}
     .filters .tag.active {{ background:#9c4f2f; color:white; }}
+    .filters .tag.flash {{
+      box-shadow: 0 0 0 4px rgba(156,79,47,0.18);
+      transform: translateY(-1px);
+      transition: box-shadow 0.2s ease, transform 0.2s ease;
+    }}
     .tag-row {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }}
     .tag-editor {{ display:flex; gap:10px; flex-wrap:wrap; margin:12px 0; }}
     .group-row {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; align-items:center; }}
@@ -2081,7 +2939,7 @@ def build_library_html():
               <button id="create-group" type="button" style="padding:8px 14px; border-radius:10px;">创建</button>
             </div>
           </div>
-          <div class="filters">
+          <div class="filters" id="library-tag-filters">
             <button class="tag active" type="button" data-filter="all">全部</button>
             {filter_html}
           </div>
@@ -2100,9 +2958,19 @@ def build_library_html():
     const exportBtn = document.getElementById('export-json');
     const checks = () => Array.from(document.querySelectorAll('.cite-check'));
     const cards = () => Array.from(document.querySelectorAll('.card'));
-    const filterButtons = () => Array.from(document.querySelectorAll('[data-filter]'));
+    const tagFilterContainer = document.getElementById('library-tag-filters');
+    const filterButtons = () => Array.from(document.querySelectorAll('#library-tag-filters [data-filter]'));
     const groupFilterButtons = () => Array.from(document.querySelectorAll('[data-group-filter]'));
     let activeGroupFilter = 'all';
+    let activeTagFilter = 'all';
+
+    function escapeHtml(value) {{
+      return (value || '').toString()
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }}
 
     if (selectAllBtn) {{
       selectAllBtn.addEventListener('click', () => {{
@@ -2144,44 +3012,95 @@ def build_library_html():
       }});
     }}
 
-    filterButtons().forEach((btn) => {{
-      btn.addEventListener('click', () => {{
-        const filter = btn.dataset.filter || 'all';
-        filterButtons().forEach((item) => item.classList.toggle('active', item === btn));
-        cards().forEach((card) => {{
-          const tags = card.dataset.tags || '';
-          const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
-          const tagVisible = filter === 'all' || tags.split(',').map((x) => x.trim()).includes(filter);
-          const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
-          const visible = tagVisible && groupVisible;
-          card.style.display = visible ? '' : 'none';
+    function normalizeCardTags(card) {{
+      return (card.dataset.tags || '').split(',').map((x) => x.trim()).filter(Boolean);
+    }}
+
+    function tagsForActiveGroup() {{
+      const seen = new Set();
+      const ordered = [];
+      cards().forEach((card) => {{
+        const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
+        const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
+        if (!groupVisible) return;
+        normalizeCardTags(card).forEach((tag) => {{
+          const low = tag.toLowerCase();
+          if (seen.has(low)) return;
+          seen.add(low);
+          ordered.push(tag);
         }});
       }});
-    }});
+      return ordered;
+    }}
+
+    function applyLibraryFilters() {{
+      cards().forEach((card) => {{
+        const tags = normalizeCardTags(card).map((tag) => tag.toLowerCase());
+        const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
+        const tagVisible = activeTagFilter === 'all' || tags.includes(activeTagFilter);
+        const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
+        card.style.display = tagVisible && groupVisible ? '' : 'none';
+      }});
+    }}
+
+    function bindTagFilterButtons() {{
+      filterButtons().forEach((btn) => {{
+        btn.addEventListener('click', () => {{
+          activeTagFilter = btn.dataset.filter || 'all';
+          filterButtons().forEach((item) => item.classList.toggle('active', item === btn));
+          applyLibraryFilters();
+        }});
+      }});
+    }}
+
+    function renderLibraryTagFilters() {{
+      if (!tagFilterContainer) return;
+      const availableTags = tagsForActiveGroup();
+      const availableTagSet = new Set(availableTags.map((tag) => tag.toLowerCase()));
+      if (activeTagFilter !== 'all' && !availableTagSet.has(activeTagFilter)) {{
+        activeTagFilter = 'all';
+      }}
+      const buttons = [];
+      buttons.push('<button class="tag' + (activeTagFilter === 'all' ? ' active' : '') + '" type="button" data-filter="all">全部</button>');
+      availableTags.forEach((tag) => {{
+        const low = tag.toLowerCase();
+        buttons.push('<button class="tag' + (activeTagFilter === low ? ' active' : '') + '" type="button" data-filter="' + escapeHtml(low) + '">' + escapeHtml(tag) + '</button>');
+      }});
+      tagFilterContainer.innerHTML = buttons.join('');
+      bindTagFilterButtons();
+    }}
+
+    function emphasizeActiveTopTag() {{
+      const activeBtn = filterButtons().find((item) => item.classList.contains('active'));
+      if (!activeBtn || activeTagFilter === 'all') return;
+      activeBtn.classList.remove('flash');
+      activeBtn.scrollIntoView({{ behavior: 'smooth', block: 'nearest', inline: 'center' }});
+      window.setTimeout(() => activeBtn.classList.add('flash'), 20);
+      window.setTimeout(() => activeBtn.classList.remove('flash'), 1400);
+    }}
 
     groupFilterButtons().forEach((btn) => {{
       btn.addEventListener('click', () => {{
         activeGroupFilter = btn.dataset.groupFilter || 'all';
         groupFilterButtons().forEach((item) => item.classList.toggle('active', item === btn));
-        const activeTag = (filterButtons().find((item) => item.classList.contains('active')) || {{ dataset: {{ filter: 'all' }} }}).dataset.filter || 'all';
-        cards().forEach((card) => {{
-          const tags = card.dataset.tags || '';
-          const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
-          const tagVisible = activeTag === 'all' || tags.split(',').map((x) => x.trim()).includes(activeTag);
-          const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
-          const visible = tagVisible && groupVisible;
-          card.style.display = visible ? '' : 'none';
-        }});
+        renderLibraryTagFilters();
+        applyLibraryFilters();
       }});
     }});
 
     document.querySelectorAll('[data-filter-tag]').forEach((btn) => {{
       btn.addEventListener('click', () => {{
         const target = (btn.dataset.filterTag || '').toLowerCase();
-        const filterBtn = filterButtons().find((item) => item.dataset.filter === target);
-        if (filterBtn) filterBtn.click();
+        if (!target) return;
+        activeTagFilter = target;
+        renderLibraryTagFilters();
+        applyLibraryFilters();
+        emphasizeActiveTopTag();
       }});
     }});
+
+    renderLibraryTagFilters();
+    applyLibraryFilters();
 
     document.querySelectorAll('.save-tag').forEach((btn) => {{
       btn.addEventListener('click', async () => {{

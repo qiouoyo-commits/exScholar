@@ -46,7 +46,7 @@ python -m playwright install chromium
 
 在仓库根目录准备 `.env.local`。
 
-建议直接从 [.env.local.example](/home/ubuntu/tools/exScholar/.env.local.example) 复制：
+建议直接从 [.env.local.example](.env.local.example) 复制：
 
 ```bash
 cp .env.local.example .env.local
@@ -162,7 +162,7 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 - 点击后会立即进入队列
 - 页面会显示当前步骤提示
 - 前端会轮询等待结果
-- 如果单次请求或整体等待超时，会明确提示你稍后重试或回到时间线查看结果
+- 如果等待过久，会明确提示你稍后重试或回到时间线查看结果
 
 ### 6.2 PDF 上传
 
@@ -247,8 +247,8 @@ Research 搜索结果会进入当前用户自己的 `searches/` 目录。
 
 说明：
 
-- OpenClaw 默认用户现在是 `qioyo`
-- 非网页登录触发的 OpenClaw intake 和默认 CCF research 搜索会默认写入 `data/users/qioyo/`
+- OpenClaw 默认用户会写入一个部署侧配置的自动化用户目录
+- 非网页登录触发的 OpenClaw intake 和默认 CCF research 搜索会默认写入 `data/users/<default-openclaw-user>/`
 - 图片找论文会把结果加入当天 `Picsearch` timeline
 - 文本补链接会把结果加入当天 `Textsearch` timeline
 - `picsearch` 除了单篇论文截图，也支持 Google Scholar 页面截图；如果识别到页面中有多篇论文标题，会自动逐条补链接
@@ -285,13 +285,14 @@ data/users/<username>/
 - `reading/`
 - `openclaw_jobs/`
 - `research_jobs/`
+- `reference_jobs/`
 - `citation_library.sqlite3`
 
 ## 9. 相关文档
 
-- 项目总览：[README.md](/home/ubuntu/tools/exScholar/README.md)
-- 开发说明：[README_DEV.md](/home/ubuntu/tools/exScholar/README_DEV.md)
-- OpenClaw 补充说明：[OPENCLAW_ADDON.md](/home/ubuntu/tools/exScholar/docs/OPENCLAW_ADDON.md)
-- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](/home/ubuntu/tools/exScholar/docs/WECHAT_PDF_INTAKE.md)
-- Skills 总览：[README.md](/home/ubuntu/tools/exScholar/skills/README.md)
-- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](/home/ubuntu/tools/exScholar/skills/picsearch/SKILL.md)
+- 项目总览：[README.md](README.md)
+- 开发说明：[README_DEV.md](README_DEV.md)
+- OpenClaw 补充说明：[OPENCLAW_ADDON.md](docs/OPENCLAW_ADDON.md)
+- 微信 PDF intake：[WECHAT_PDF_INTAKE.md](docs/WECHAT_PDF_INTAKE.md)
+- Skills 总览：[README.md](skills/README.md)
+- OpenClaw 图片找论文 skill：[picsearch/SKILL.md](skills/picsearch/SKILL.md)

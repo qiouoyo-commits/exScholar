@@ -191,6 +191,10 @@ def current_reference_jobs_dir() -> Path:
     return current_data_dir() / "reference_jobs"
 
 
+def current_keyword_graph_cache_path() -> Path:
+    return current_data_dir() / "keyword_graph.json"
+
+
 def ensure_user_data_dirs(username: str) -> Path:
     normalized = sanitize_username(username)
     if not normalized:
@@ -219,6 +223,7 @@ DB_PATH = DynamicPath(current_db_path)
 OPENCLAW_JOBS_DIR = DynamicPath(current_openclaw_jobs_dir)
 RESEARCH_JOBS_DIR = DynamicPath(current_research_jobs_dir)
 REFERENCE_JOBS_DIR = DynamicPath(current_reference_jobs_dir)
+KEYWORD_GRAPH_CACHE_PATH = DynamicPath(current_keyword_graph_cache_path)
 
 
 def _session_expiry_cutoff(now: float | None = None) -> float:
