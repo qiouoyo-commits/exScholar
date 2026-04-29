@@ -320,21 +320,64 @@ def list_expansion_sites() -> dict[str, dict]:
     return expansions
 
 
+def build_search_entry_default_title(meta: dict) -> str:
+    source_paper = meta.get("source_paper") or {}
+    keywords = meta.get("keywords") or []
+    keywords_text = " / ".join(str(item or "").strip() for item in keywords if str(item or "").strip())
+    return " ".join(str(source_paper.get("title") or keywords_text or "未记录关键词").split())
+
+
+def update_search_entry_title(relative_dir: str, title: str) -> dict:
+    normalized_dir = " ".join(str(relative_dir or "").split()).strip().lstrip("/")
+    if not normalized_dir:
+        raise ValueError("搜索目录不合法")
+    target_dir = (DATA_DIR / normalized_dir).resolve()
+    data_root = DATA_DIR.resolve()
+    try:
+        target_dir.relative_to(data_root)
+    except Exception:
+        raise ValueError("搜索目录不合法")
+    search_json = target_dir / "search.json"
+    if not search_json.exists():
+        raise FileNotFoundError("搜索结果不存在")
+    meta = read_json_file(search_json, {}) or {}
+    normalized_title = " ".join(str(title or "").split())
+    if len(normalized_title) > 200:
+        raise ValueError("标题不能超过 200 个字符")
+    if normalized_title:
+        meta["timeline_title"] = normalized_title
+    else:
+        meta.pop("timeline_title", None)
+    write_json_file_atomic(search_json, meta)
+    default_title = build_search_entry_default_title(meta)
+    return {
+        "relative_dir": normalized_dir,
+        "title": normalized_title or default_title,
+        "default_title": default_title,
+        "customized": bool(normalized_title),
+    }
+
+
 def create_reference_search(source_slug: str, paper: dict) -> str:
     return create_reference_search_with_progress(source_slug, paper)
+
+
+def build_reference_search_output_dir(source_slug: str, paper: dict) -> tuple[str, Path]:
+    title = (paper.get("title") or "").strip()
+    slug = slugify(f"{source_slug}-refs-{paper.get('csv_index', 'paper')}-{title}")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_dir = EXPANSIONS_DIR / f"{timestamp}_{slug}"
+    suffix = 2
+    while out_dir.exists():
+        out_dir = EXPANSIONS_DIR / f"{timestamp}_{slug}-{suffix}"
+        suffix += 1
+    return slug, out_dir
 
 
 def create_reference_search_with_progress(source_slug: str, paper: dict, progress_callback=None) -> str:
     title = (paper.get("title") or "").strip()
     doi = (paper.get("doi") or "").strip()
     source_kw = (paper.get("matched_kw") or "").strip()
-    normalized_doi = normalize_doi(doi)
-    if normalized_doi:
-        existing = list_expansion_sites().get(normalized_doi)
-        if existing:
-            if progress_callback:
-                progress_callback("completed", "已找到现有相关论文页。")
-            return existing["site_url"]
     if progress_callback:
         progress_callback("ai4scholar_lookup", "正在查询 AI4Scholar 引用网络。")
     ref_records = fetch_ai4scholar_citation_records(paper, REFERENCE_LIMIT)
@@ -348,8 +391,7 @@ def create_reference_search_with_progress(source_slug: str, paper: dict, progres
         raise ValueError("未找到该论文的延展搜索结果。")
     ref_records = apply_source_matched_kw(ref_records, source_kw)
 
-    slug = slugify(f"{source_slug}-refs-{paper.get('csv_index', 'paper')}-{title}")
-    out_dir = EXPANSIONS_DIR / f"{datetime.now().date().isoformat()}_{slug}"
+    slug, out_dir = build_reference_search_output_dir(source_slug, paper)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = out_dir / "papers.csv"
@@ -391,28 +433,6 @@ def start_reference_expansion_job(search_slug: str, paper: dict) -> dict:
     title = " ".join(str((paper or {}).get("title") or "").split())
     doi = normalize_doi((paper or {}).get("doi") or "")
     normalized_slug = " ".join(str(search_slug or "").split()).strip("/")
-
-    if doi:
-        existing = list_expansion_sites().get(doi)
-        if existing:
-            job = {
-                "id": build_reference_job_id(),
-                "kind": "reference_expansion",
-                "status": "completed",
-                "current_step": "completed",
-                "step_message": "已找到现有相关论文页。",
-                "message": "扩展搜索结果已就绪。",
-                "search_slug": normalized_slug,
-                "paper_title": title,
-                "paper_doi": doi,
-                "site_url": existing.get("site_url") or "",
-                "created_at": utc_now(),
-                "updated_at": utc_now(),
-                "finished_at": utc_now(),
-                "logs": [{"at": utc_now(), "step": "completed", "message": "已找到现有相关论文页。"}],
-            }
-            save_reference_job(job)
-            return job
 
     job = {
         "id": build_reference_job_id(),
@@ -509,6 +529,8 @@ def list_search_entries():
             meta = json.loads(search_json.read_text(encoding="utf-8"))
         except Exception:
             meta = {}
+        default_title = build_search_entry_default_title(meta)
+        timeline_title = " ".join(str(meta.get("timeline_title") or "").split()) or default_title
 
         date_str = meta.get("date") or out_dir.name.split("_", 1)[0]
         slug = meta.get("slug") or out_dir.name.split("_", 1)[-1]
@@ -526,6 +548,8 @@ def list_search_entries():
                 "slug": slug,
                 "keywords": meta.get("keywords") or [],
                 "venues": meta.get("venues") or [],
+                "title": timeline_title,
+                "default_title": default_title,
                 "fetch_abstract": meta.get("fetch_abstract"),
                 "total_papers": meta.get("total_papers"),
                 "source_paper": meta.get("source_paper") or {},

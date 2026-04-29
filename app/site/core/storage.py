@@ -76,8 +76,24 @@ def ensure_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 description TEXT,
+                source_kind TEXT NOT NULL DEFAULT 'manual',
                 created_at TEXT NOT NULL
             )
+            """
+        )
+        group_columns = {row[1] for row in conn.execute("PRAGMA table_info(reading_groups)").fetchall()}
+        if "source_kind" not in group_columns:
+            conn.execute("ALTER TABLE reading_groups ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'manual'")
+        conn.execute(
+            """
+            UPDATE reading_groups
+            SET source_kind = CASE
+                WHEN description LIKE '自动为搜索%' THEN 'auto'
+                ELSE 'manual'
+            END
+            WHERE source_kind IS NULL
+               OR source_kind = ''
+               OR source_kind NOT IN ('manual', 'auto')
             """
         )
         conn.execute(

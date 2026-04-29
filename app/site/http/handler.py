@@ -372,12 +372,15 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     assigned_group = get_or_create_compatible_reading_group(
                         group_name,
                         f"自动为搜索「{group_name}」创建的深度阅读分组。",
+                        source_kind="auto",
                     )
                     add_citation_to_group(citation_id, int(assigned_group["id"]))
             refresh_job = None
+            reading_paper_id = ""
             if pdf_path and citation_id:
                 reading = ensure_reading_workspace_for_citation(citation_id)
                 reading_url = reading["reading_url"]
+                reading_paper_id = reading["paper_id"]
                 try:
                     refresh_job = start_openclaw_refresh_job_for_paper(
                         reading["paper_id"],
@@ -394,6 +397,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
                     "pdf_path": pdf_path or "",
                     "pdf_reused": bool(pdf_record.get("reused")),
                     "reading_url": reading_url,
+                    "paper_id": reading_paper_id,
                     "job_id": (refresh_job or {}).get("id") or "",
                     "job": refresh_job or {},
                     "group": assigned_group or {},
@@ -704,6 +708,35 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
             self.send_json({"ok": False, "error": f"扩展引用失败: {exc}"}, status=500)
             return True
         self.send_json({"ok": True, "job": job})
+        return True
+
+    def _handle_search_entry_post(self) -> bool:
+        if self.path != "/api/search-entries/title":
+            return False
+        data = self.parse_body()
+        relative_dir = " ".join(str(data.get("relative_dir") or "").split()).strip()
+        title = str(data.get("title") or "")
+        if not relative_dir:
+            self.send_json({"ok": False, "error": "搜索目录不合法"}, status=400)
+            return True
+        try:
+            payload = update_search_entry_title(relative_dir, title)
+        except FileNotFoundError:
+            self.send_json({"ok": False, "error": "搜索结果不存在"}, status=404)
+            return True
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return True
+        except Exception as exc:
+            self.send_json({"ok": False, "error": f"更新标题失败: {exc}"}, status=500)
+            return True
+        self.send_json(
+            {
+                "ok": True,
+                "message": "Timeline 标题已更新。" if payload.get("customized") else "已恢复默认标题。",
+                **payload,
+            }
+        )
         return True
 
     def _handle_research_post(self) -> bool:
@@ -1109,6 +1142,7 @@ class SearchSiteHandler(SimpleHTTPRequestHandler):
         for handler in (
             self._handle_citation_post,
             self._handle_group_post,
+            self._handle_search_entry_post,
             self._handle_research_post,
             self._handle_openclaw_post,
             self._handle_reading_post,

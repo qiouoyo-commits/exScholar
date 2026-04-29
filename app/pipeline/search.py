@@ -645,7 +645,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
           {f'<div class="paper-meta">复核说明：{escape(str(paper.get("review_reason") or ""))}</div>' if paper.get("review_reason") else ''}
           <div class="content">{escape(preview_text(paper.get("content") or "暂无内容"))}</div>
           <div class="actions">
-            <button class="action" type="button" onclick="addCitation({json.dumps(paper.get('csv_index'))})">加入深度阅读</button>
+            <button class="action" type="button" onclick="openReading({json.dumps(paper.get('csv_index'))})">加入深度阅读</button>
             <button class="action secondary" type="button" onclick="expandReferences({json.dumps(paper.get('csv_index'))})">延展搜索</button>
           </div>
         </article>
@@ -812,6 +812,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     .review-pill.high {{ background:#dceee4; color:#215f43; }}
     .review-pill.medium {{ background:#efe7d2; color:#7a5d18; }}
     .review-pill.low {{ background:#f2dddd; color:#8a3d32; }}
+    .review-pill.reading {{ background:#dce7f6; color:#27528a; }}
     .content {{
       white-space: pre-wrap;
       line-height: 1.8;
@@ -939,10 +940,14 @@ def write_site(records: list[dict], output_path: str, meta: dict):
     const autotagFilters = document.getElementById('autotag-filters');
     const emptyTemplate = document.getElementById('empty');
     let expansionIndex = {{}};
+    let citationIndexByDoi = {{}};
+    let citationIndexByTitleYear = {{}};
+    let citationIndexByTitle = {{}};
     let activeMatchedKw = 'all';
     let activeRelevance = 'all';
     let activeAutotag = 'all';
     let readingGroups = [];
+    let citationsLoaded = false;
     const toast = document.createElement('div');
     toast.className = 'toast';
     document.body.appendChild(toast);
@@ -1145,6 +1150,68 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       return text.trim();
     }}
 
+    function normalizeTitleKey(value) {{
+      return text(value).trim().toLowerCase().replace(/\\s+/g, ' ');
+    }}
+
+    function buildReadingUrl(citation) {{
+      const direct = text((citation || {{}}).reading_url).trim();
+      if (direct) return direct;
+      const paperId = text((citation || {{}}).reading_paper_id).trim();
+      return paperId ? '/reading/' + encodeURIComponent(paperId) : '';
+    }}
+
+    function ingestCitationItem(citation) {{
+      if (!citation || !citation.id) return;
+      const payload = {{
+        id: Number(citation.id) || 0,
+        doi: text(citation.doi).trim(),
+        title: text(citation.title).trim(),
+        year: text(citation.year).trim(),
+        reading_paper_id: text(citation.reading_paper_id).trim(),
+        reading_url: buildReadingUrl(citation)
+      }};
+      const doiKey = normalizeDoi(payload.doi);
+      const titleKey = normalizeTitleKey(payload.title);
+      const titleYearKey = titleKey && payload.year ? `${{titleKey}}::${{payload.year}}` : '';
+      if (doiKey) citationIndexByDoi[doiKey] = payload;
+      if (titleYearKey) citationIndexByTitleYear[titleYearKey] = payload;
+      if (titleKey) citationIndexByTitle[titleKey] = payload;
+    }}
+
+    function findCitationForPaper(paper) {{
+      const doiKey = normalizeDoi(paper && paper.doi);
+      if (doiKey && citationIndexByDoi[doiKey]) return citationIndexByDoi[doiKey];
+      const titleKey = normalizeTitleKey(paper && paper.title);
+      const year = text(paper && paper.year).trim();
+      const titleYearKey = titleKey && year ? `${{titleKey}}::${{year}}` : '';
+      if (titleYearKey && citationIndexByTitleYear[titleYearKey]) return citationIndexByTitleYear[titleYearKey];
+      if (titleKey && citationIndexByTitle[titleKey]) return citationIndexByTitle[titleKey];
+      return null;
+    }}
+
+    async function loadExistingCitations() {{
+      try {{
+        const resp = await fetch('/api/citations', {{ credentials: 'same-origin' }});
+        const data = await resp.json().catch(() => ({{ ok: false, items: [] }}));
+        if (!resp.ok || data.ok === false) {{
+          return;
+        }}
+        citationIndexByDoi = {{}};
+        citationIndexByTitleYear = {{}};
+        citationIndexByTitle = {{}};
+        (data.items || []).forEach((item) => ingestCitationItem(item));
+      }} catch (error) {{
+        citationIndexByDoi = {{}};
+        citationIndexByTitleYear = {{}};
+        citationIndexByTitle = {{}};
+      }} finally {{
+        citationsLoaded = true;
+      }}
+    }}
+
+    const citationsLoadPromise = loadExistingCitations();
+
     function uniqueMatchedKeywords() {{
       const values = [];
       const seen = new Set();
@@ -1254,6 +1321,15 @@ def write_site(records: list[dict], output_path: str, meta: dict):
         const data = await submitCitation(meta.output_slug || meta.slug || '', paper, meta.group_name || meta.summary_name || '');
         if (!data) return;
         if (data.error) throw new Error(data.error);
+        ingestCitationItem({{
+          id: data.citation_id,
+          doi: paper.doi || '',
+          title: paper.title || '',
+          year: paper.year || '',
+          reading_paper_id: text(data.paper_id).trim(),
+          reading_url: data.reading_url || ''
+        }});
+        render(input.value);
         if (data.reading_url) {{
           window.open(data.reading_url, '_blank', 'noopener');
         }}
@@ -1261,6 +1337,49 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       }} catch (error) {{
         showToast(error.message);
       }}
+    }}
+
+    async function openReading(index) {{
+      const paper = papers.find((item) => item.csv_index === index);
+      if (!paper) return;
+      if (!citationsLoaded) {{
+        await citationsLoadPromise.catch(() => {{}});
+      }}
+      let citation = findCitationForPaper(paper);
+      if (!citation) {{
+        await addCitation(index);
+        return;
+      }}
+      if (!citation.reading_url && citation.id) {{
+        try {{
+          const resp = await fetch('/api/citations/' + encodeURIComponent(citation.id) + '/reading', {{
+            method: 'POST',
+            credentials: 'same-origin'
+          }});
+          const data = await resp.json().catch(() => ({{ ok: false, error: '打开深度阅读失败' }}));
+          if (!resp.ok || data.ok === false) {{
+            throw new Error(data.error || '打开深度阅读失败');
+          }}
+          ingestCitationItem({{
+            id: citation.id,
+            doi: citation.doi,
+            title: citation.title,
+            year: citation.year,
+            reading_paper_id: text(data.paper_id).trim(),
+            reading_url: data.reading_url || ''
+          }});
+          citation = findCitationForPaper(paper);
+          render(input.value);
+        }} catch (error) {{
+          showToast(error.message);
+          return;
+        }}
+      }}
+      if (!citation || !citation.reading_url) {{
+        showToast('当前文献还没有可打开的深度阅读页面。');
+        return;
+      }}
+      window.open(citation.reading_url, '_blank', 'noopener');
     }}
 
     async function expandReferences(index) {{
@@ -1297,7 +1416,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       }}
     }}
 
-    window.addCitation = addCitation;
+    window.openReading = openReading;
     window.expandReferences = expandReferences;
 
     function cardHtml(paper) {{
@@ -1314,10 +1433,15 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       const normalizedDoi = normalizeDoi(paper.doi);
       const expansion = normalizedDoi ? expansionIndex[normalizedDoi] : null;
       const expanded = Boolean(expansion && expansion.site_url);
+      const citation = findCitationForPaper(paper);
+      const inReading = Boolean(citation && citation.id);
       const expandLabel = expanded ? '查看相关论文' : '延展搜索';
       const expandClass = expanded ? 'action secondary related' : 'action secondary';
       const relevanceLabel = text(paper.relevance_label).trim().toLowerCase();
       const reviewPills = [];
+      if (inReading) {{
+        reviewPills.push('<span class="review-pill reading">已加入深度阅读</span>');
+      }}
       if (relevanceLabel) {{
         const score = paper.relevance_score !== '' && paper.relevance_score !== null && paper.relevance_score !== undefined
           ? ` · ${{paper.relevance_score}}`
@@ -1331,7 +1455,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       }}
       const reviewReason = text(paper.review_reason).trim();
       return `
-        <article class="card${{expanded ? ' expanded' : ''}}">
+        <article class="card${{expanded || inReading ? ' expanded' : ''}}">
           <div class="card-head">
             <div class="idx">#${{paper.csv_index}}</div>
             <h2 class="paper-title">${{esc(paper.title)}}</h2>
@@ -1342,7 +1466,7 @@ def write_site(records: list[dict], output_path: str, meta: dict):
           ${{reviewReason ? `<div class="paper-meta">复核说明：${{esc(reviewReason)}}</div>` : ''}}
           <div class="content">${{esc(previewText || '暂无内容')}}</div>
           <div class="actions">
-            <button class="action" type="button" onclick="addCitation(${{paper.csv_index}})">加入深度阅读</button>
+            <button class="action" type="button" onclick="openReading(${{paper.csv_index}})">${{inReading ? '读取深度阅读' : '加入深度阅读'}}</button>
             <button class="${{expandClass}}" type="button" onclick="expandReferences(${{paper.csv_index}})">${{expandLabel}}</button>
           </div>
         </article>
@@ -1453,8 +1577,6 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       }}
     }}
 
-    loadReadingGroups().catch(() => {{}});
-
     input.addEventListener('input', (event) => render(event.target.value));
     renderKeywordFilters();
     renderRelevanceFilters();
@@ -1466,10 +1588,8 @@ def write_site(records: list[dict], output_path: str, meta: dict):
       renderAutotagFilters();
       render(input.value);
     }});
-    loadExpansions().finally(() => {{
-      if (Object.keys(expansionIndex || {{}}).length) {{
-        render(input.value);
-      }}
+    Promise.allSettled([loadReadingGroups(), citationsLoadPromise, loadExpansions()]).finally(() => {{
+      render(input.value);
     }});
   </script>
 </body>

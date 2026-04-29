@@ -20,7 +20,8 @@ def build_timeline_html():
         abstract_text = "含摘要" if entry["fetch_abstract"] else "未抓摘要"
         source_paper = entry.get("source_paper") or {}
         is_expansion = bool(entry.get("is_expansion"))
-        title = html_unescape(source_paper.get("title") or keywords)
+        title = html_unescape(entry.get("title") or source_paper.get("title") or keywords)
+        default_title = html_unescape(entry.get("default_title") or source_paper.get("title") or keywords)
         detail_parts = [papers_text, abstract_text]
         if is_expansion:
             source_slug = source_paper.get("source_slug") or "未知来源"
@@ -35,15 +36,17 @@ def build_timeline_html():
             f'<a href="{entry["site_url"]}">结果网页</a>' if entry["site_url"] else "",
             f'<a href="{entry["csv_url"]}">CSV</a>' if entry["csv_url"] else "",
         ]
-        delete_button = f'<button class="delete-search-entry" type="button" data-relative-dir="{entry["relative_dir"]}">删除这次搜索</button>'
+        edit_button = f'<button class="edit-search-entry" type="button" data-relative-dir="{entry["relative_dir"]}">编辑标题</button>'
+        delete_button = f'<button class="delete-search-entry danger" type="button" data-relative-dir="{entry["relative_dir"]}">删除这次搜索</button>'
         subtitle = f'<div class="meta">{keywords}</div>' if is_expansion and keywords else ""
+        safe_title = escape(title)
         title_html = (
-            f'<a class="title-link" href="{primary_href}">{title}</a>'
+            f'<a class="title-link entry-title-text" href="{primary_href}">{safe_title}</a>'
             if primary_href != "#"
-            else f'<span class="title-link">{title}</span>'
+            else f'<span class="title-link entry-title-text">{safe_title}</span>'
         )
         return f"""
-        <article class="entry" data-matched-kw="{entry.get("source_matched_kw", "").lower()}">
+        <article class="entry" data-matched-kw="{entry.get("source_matched_kw", "").lower()}" data-relative-dir="{entry["relative_dir"]}" data-entry-title="{escape(title)}" data-default-title="{escape(default_title)}">
           <div class="dot"></div>
           <div class="card">
             <div class="row">
@@ -53,7 +56,7 @@ def build_timeline_html():
             <div class="meta">{' · '.join(detail_parts)}</div>
             <h2>{title_html}</h2>
             {subtitle}
-            <div class="links">{' '.join(link for link in links if link)} {delete_button}</div>
+            <div class="links">{' '.join(link for link in links if link)} {edit_button} {delete_button}</div>
           </div>
         </article>
         """
@@ -246,6 +249,16 @@ def build_timeline_html():
     .meta {{ color: var(--muted); font-size: 14px; line-height: 1.7; }}
     .links {{ margin-top: 14px; display: flex; gap: 12px; flex-wrap: wrap; }}
     a {{ color: white; background: var(--accent); text-decoration: none; padding: 10px 14px; border-radius: 999px; }}
+    .links button {{
+      color: white;
+      background: var(--accent);
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: none;
+      font: inherit;
+      cursor: pointer;
+    }}
+    .links button.danger {{ background: #9c3d33; }}
     .empty {{
       border: 1px dashed var(--line); border-radius: 18px; background: rgba(255,255,255,0.55);
       text-align: center; padding: 24px; color: var(--muted);
@@ -380,6 +393,16 @@ def build_timeline_html():
     function text(value) {{
       if (value === null || value === undefined) return '';
       return String(value);
+    }}
+
+    async function updateTimelineTitle(relativeDir, title) {{
+      const resp = await fetch('/api/search-entries/title', {{
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ relative_dir: relativeDir, title }})
+      }});
+      return parseApiJson(resp, '更新标题失败');
     }}
 
     async function parseApiJson(resp, fallbackError) {{
@@ -812,6 +835,39 @@ def build_timeline_html():
           return;
         }}
         window.location.reload();
+      }});
+    }});
+
+    document.querySelectorAll('.edit-search-entry').forEach((button) => {{
+      button.addEventListener('click', async () => {{
+        const entry = button.closest('.entry');
+        const relativeDir = text(button.dataset.relativeDir || entry?.dataset.relativeDir).trim();
+        if (!entry || !relativeDir) return;
+        const currentTitle = text(entry.dataset.entryTitle).trim();
+        const defaultTitle = text(entry.dataset.defaultTitle).trim();
+        const nextTitle = window.prompt('输入新的 timeline 标题。留空后保存可恢复默认标题。', currentTitle);
+        if (nextTitle === null) return;
+        button.disabled = true;
+        const previousText = button.textContent;
+        button.textContent = '保存中...';
+        try {{
+          const data = await updateTimelineTitle(relativeDir, nextTitle);
+          const titleText = text(data.title).trim() || defaultTitle;
+          entry.dataset.entryTitle = titleText;
+          if (data.default_title) {{
+            entry.dataset.defaultTitle = text(data.default_title).trim();
+          }}
+          const titleNode = entry.querySelector('.entry-title-text');
+          if (titleNode) {{
+            titleNode.textContent = titleText;
+          }}
+          alert(data.message || '标题已更新');
+        }} catch (error) {{
+          alert(error.message || '更新标题失败');
+        }} finally {{
+          button.disabled = false;
+          button.textContent = previousText;
+        }}
       }});
     }});
 
@@ -1709,7 +1765,7 @@ def build_keyword_detail_html(keyword: str):
         return build_keywords_html()
     cards = []
     all_groups = list_reading_groups()
-    group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
+    group_options = "".join(f'<option value="{g["id"]}">{escape(g["name"])}</option>' for g in all_groups)
     payload_json = json.dumps(entry["papers"], ensure_ascii=False).replace("</script>", "<\\/script>")
     for idx, paper in enumerate(entry["papers"], start=1):
         source_kind = paper.get("source_kind") or "search"
@@ -2742,15 +2798,27 @@ def build_library_html():
                 continue
             seen_tags.add(low)
             all_tags.append(tag)
-    filter_html = "".join(
-        f'<button class="tag" type="button" data-filter="{tag.lower()}">{tag}</button>'
-        for tag in all_tags
-    )
-    upload_group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
+    upload_group_options = "".join(f'<option value="{g["id"]}">{escape(g["name"])}</option>' for g in all_groups)
     cards = []
     for item in items:
         doi_text = f"DOI: {item['doi']}" if item.get("doi") else "无 DOI"
         url_html = f'<a class="action-link action-link-secondary" href="{item["url"]}" target="_blank" rel="noreferrer">原文链接</a>' if item.get("url") else ""
+        expansion_paper = escape(
+            json.dumps(
+                {
+                    "title": item.get("title") or "",
+                    "doi": item.get("doi") or "",
+                    "url": item.get("url") or "",
+                    "authors": item.get("authors") or "",
+                    "year": item.get("year") or "",
+                    "venue": item.get("venue") or "",
+                    "abstract": item.get("abstract") or "",
+                    "matched_kw": item.get("matched_kw") or "",
+                    "csv_index": item.get("source_csv_index"),
+                },
+                ensure_ascii=False,
+            )
+        )
         has_pdf = citation_has_pdf(item)
         reading_ready = bool(item.get("reading_paper_id")) and reading_json_ready(item.get("reading_paper_id"))
         upload_label = "更新 PDF" if has_pdf else "上传 PDF"
@@ -2767,9 +2835,9 @@ def build_library_html():
                 group_counts[int(group["id"])] = group_counts.get(int(group["id"]), 0) + 1
             except Exception:
                 continue
-        group_badges = "".join(f'<span class="group-badge" data-group-id="{g["id"]}">{g["name"]}</span>' for g in groups) or '<span class="muted">未加入任何 Group</span>'
+        group_badges = "".join(f'<span class="group-badge" data-group-id="{g["id"]}">{escape(g["name"])}</span>' for g in groups) or '<span class="muted">未加入任何 Group</span>'
         group_ids = ",".join(str(g["id"]) for g in groups)
-        group_options = "".join(f'<option value="{g["id"]}">{g["name"]}</option>' for g in all_groups)
+        group_options = "".join(f'<option value="{g["id"]}">{escape(g["name"])}</option>' for g in all_groups)
         tags = [part.strip() for part in (item.get("tags") or "").split(",") if part.strip()]
         tag_badges = "".join(
             f'<button class="tag" type="button" data-filter-tag="{escape(tag.lower())}">{escape(tag)}</button>'
@@ -2777,7 +2845,7 @@ def build_library_html():
         ) or '<span class="muted">无 tags</span>'
         cards.append(
             f"""
-            <article class="card" data-tags="{escape(item.get("tags") or "")}" data-group-ids="{group_ids}" data-citation-id="{item["id"]}">
+            <article class="card" data-tags="{escape(item.get("tags") or "")}" data-group-ids="{group_ids}" data-citation-id="{item["id"]}" data-expansion-paper="{expansion_paper}" data-source-search-slug="{escape(item.get("source_search_slug") or "")}">
               <div class="checkrow">
                 <label class="checklabel">
                   <input class="cite-check" type="checkbox" value="{item["id"]}">
@@ -2808,6 +2876,7 @@ def build_library_html():
                 <button class="upload-pdf-link action-link action-link-upload" type="button" data-id="{item["id"]}">{upload_label}</button>
                 <input class="upload-pdf-input" type="file" accept="application/pdf,.pdf" style="display:none;">
                 {reading_button}
+                <button class="expand-reading-link action-link action-link-secondary" type="button">延展搜索</button>
                 <button class="remove-reading-link action-link action-link-danger" type="button" data-id="{item["id"]}">删除深度阅读</button>
               </div>
               <div class="links-meta">
@@ -2851,6 +2920,29 @@ def build_library_html():
     .checkrow {{ margin-bottom:6px; }}
     .checklabel {{ display:inline-flex; align-items:center; gap:8px; color:#6f685c; font-size:14px; }}
     .filters {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+    .filter-toolbar {{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin-top:14px;
+    }}
+    .filter-search {{
+      flex:1 1 280px;
+      min-width:220px;
+      padding:10px 14px;
+      border-radius:999px;
+      border:1px solid #d5cbba;
+      font:inherit;
+      color:#1e1d1a;
+      background:#fffdf9;
+    }}
+    .filter-search-hint {{
+      margin-top:8px;
+      color:#6f685c;
+      font-size:14px;
+      line-height:1.6;
+    }}
     .filters .tag, .tag-row .tag {{
       border:none; border-radius:999px; background:#ead8ca; color:#6f685c;
       padding:8px 12px; cursor:pointer; font:inherit;
@@ -2924,6 +3016,17 @@ def build_library_html():
       color:#b33a2f;
       border-color:#e2a49a;
     }}
+    .action-link-related {{
+      background:#f2e6d8;
+      color:#7a4a2a;
+      border-color:#d6b89b;
+    }}
+    .action-link:disabled {{
+      cursor:not-allowed;
+      opacity:0.62;
+      transform:none;
+      box-shadow:none;
+    }}
     .empty {{ padding:24px; text-align:center; }}
     @media (max-width: 720px) {{
       .wrap {{ padding:22px 14px 56px; }}
@@ -2991,13 +3094,21 @@ def build_library_html():
               <button id="create-group" type="button" style="padding:8px 14px; border-radius:10px;">创建</button>
             </div>
           </div>
+          <div class="filter-toolbar">
+            <input id="library-tag-search" class="filter-search" type="search" placeholder="搜索 tag，默认只展示相关 tag">
+          </div>
           <div class="filters" id="library-tag-filters">
             <button class="tag active" type="button" data-filter="all">全部</button>
-            {filter_html}
           </div>
+          <div class="filter-search-hint" id="library-tag-search-meta">输入上方搜索词筛选 tag，或点“全部”展开完整 tag 列表。</div>
           <div class="filters" style="margin-top:10px;">
             <button class="tag active" type="button" data-group-filter="all">全部 Group</button>
             {group_filter_html}
+          </div>
+          <div class="filters" id="library-expansion-filters" style="margin-top:10px;">
+            <button class="tag active" type="button" data-expansion-filter="all">全部论文</button>
+            <button class="tag" type="button" data-expansion-filter="expanded">已延展</button>
+            <button class="tag" type="button" data-expansion-filter="unexpanded">未延展</button>
           </div>
         </div>
         <a href="/">返回时间线</a>
@@ -3011,10 +3122,17 @@ def build_library_html():
     const checks = () => Array.from(document.querySelectorAll('.cite-check'));
     const cards = () => Array.from(document.querySelectorAll('.card'));
     const tagFilterContainer = document.getElementById('library-tag-filters');
+    const tagSearchInput = document.getElementById('library-tag-search');
+    const tagSearchMeta = document.getElementById('library-tag-search-meta');
     const filterButtons = () => Array.from(document.querySelectorAll('#library-tag-filters [data-filter]'));
     const groupFilterButtons = () => Array.from(document.querySelectorAll('[data-group-filter]'));
+    const expansionFilterButtons = () => Array.from(document.querySelectorAll('[data-expansion-filter]'));
     let activeGroupFilter = 'all';
     let activeTagFilter = 'all';
+    let activeExpansionFilter = 'all';
+    let tagSearchQuery = '';
+    let showAllTags = false;
+    let expansionIndex = {{}};
 
     function escapeHtml(value) {{
       return (value || '').toString()
@@ -3022,6 +3140,157 @@ def build_library_html():
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;');
+    }}
+
+    function text(value) {{
+      return value === null || value === undefined ? '' : String(value);
+    }}
+
+    function normalizeDoi(value) {{
+      return text(value)
+        .trim()
+        .toLowerCase()
+        .replace(/^https?:\/\/(dx\.)?doi\.org\//, '')
+        .replace(/^doi:\s*/, '');
+    }}
+
+    const readingExpansionStatus = (() => {{
+      const el = document.createElement('div');
+      el.style.position = 'fixed';
+      el.style.right = '20px';
+      el.style.bottom = '20px';
+      el.style.maxWidth = '360px';
+      el.style.padding = '10px 14px';
+      el.style.borderRadius = '12px';
+      el.style.background = 'rgba(61, 50, 39, 0.92)';
+      el.style.color = '#fffaf2';
+      el.style.fontSize = '14px';
+      el.style.lineHeight = '1.5';
+      el.style.boxShadow = '0 10px 30px rgba(43, 35, 25, 0.18)';
+      el.style.zIndex = '9999';
+      el.style.display = 'none';
+      document.body.appendChild(el);
+      return el;
+    }})();
+
+    function showReadingExpansionStatus(message) {{
+      const textValue = text(message).trim();
+      if (!textValue) return;
+      readingExpansionStatus.textContent = textValue;
+      readingExpansionStatus.style.display = 'block';
+    }}
+
+    function hideReadingExpansionStatus() {{
+      readingExpansionStatus.style.display = 'none';
+      readingExpansionStatus.textContent = '';
+    }}
+
+    async function apiPost(path, body) {{
+      const resp = await fetch(path, {{
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(body)
+      }});
+      const data = await resp.json().catch(() => ({{ ok:false, error:'请求失败' }}));
+      if (!resp.ok || data.ok === false) {{
+        throw new Error(data.error || '请求失败');
+      }}
+      return data;
+    }}
+
+    async function apiGet(path) {{
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let resp;
+      try {{
+        resp = await fetch(path, {{
+          credentials: 'same-origin',
+          signal: controller.signal
+        }});
+      }} catch (error) {{
+        if (error && error.name === 'AbortError') {{
+          throw new Error('扩展搜索请求超时，请稍后重试');
+        }}
+        throw error;
+      }} finally {{
+        clearTimeout(timer);
+      }}
+      const data = await resp.json().catch(() => ({{ ok:false, error:'请求失败' }}));
+      if (!resp.ok || data.ok === false) {{
+        throw new Error(data.error || '请求失败');
+      }}
+      return data;
+    }}
+
+    function sleep(ms) {{
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }}
+
+    function getExpansionPaper(card) {{
+      try {{
+        return JSON.parse(card.dataset.expansionPaper || '{{}}');
+      }} catch (error) {{
+        return {{}};
+      }}
+    }}
+
+    function updateExpandButtonState(card) {{
+      const button = card.querySelector('.expand-reading-link');
+      if (!button) return;
+      const paper = getExpansionPaper(card);
+      const doi = normalizeDoi(paper.doi);
+      const expanded = Boolean(doi && expansionIndex[doi] && expansionIndex[doi].site_url);
+      card.dataset.expanded = expanded ? 'true' : 'false';
+      if (!doi) {{
+        card.dataset.expanded = 'false';
+        button.disabled = true;
+        button.textContent = '缺少 DOI';
+        button.classList.remove('action-link-related');
+        button.title = '当前阅读库仅能基于 DOI 发起延展搜索';
+        return;
+      }}
+      button.disabled = false;
+      button.textContent = expanded ? '查看相关论文' : '延展搜索';
+      button.classList.toggle('action-link-related', expanded);
+      button.title = expanded ? '已存在延展历史，点击可直接打开旧页面' : '基于该文献生成延展搜索结果';
+    }}
+
+    function updateAllExpandButtonStates() {{
+      cards().forEach((card) => updateExpandButtonState(card));
+    }}
+
+    async function waitReferenceExpansionJob(jobId) {{
+      const deadline = Date.now() + 20 * 60 * 1000;
+      while (Date.now() < deadline) {{
+        const data = await apiGet(`/api/papers/expand-references/jobs/${{encodeURIComponent(jobId)}}`);
+        const job = data.job || {{}};
+        const status = text(job.status).trim().toLowerCase();
+        const message = text(job.step_message).trim();
+        if (message) {{
+          showReadingExpansionStatus(message);
+        }}
+        if (status === 'completed') return job;
+        if (status === 'failed') {{
+          throw new Error(job.error || job.step_message || '扩展搜索失败');
+        }}
+        await sleep(1200);
+      }}
+      throw new Error('扩展搜索等待超时，请稍后到时间线中查看结果');
+    }}
+
+    async function loadExpansions() {{
+      try {{
+        const resp = await fetch('/api/expansions', {{ credentials: 'same-origin' }});
+        const data = await resp.json().catch(() => ({{ ok:false }}));
+        if (!resp.ok || data.ok === false) {{
+          expansionIndex = {{}};
+          return;
+        }}
+        expansionIndex = data.items || {{}};
+      }} catch (error) {{
+        expansionIndex = {{}};
+      }}
     }}
 
     if (selectAllBtn) {{
@@ -3068,13 +3337,20 @@ def build_library_html():
       return (card.dataset.tags || '').split(',').map((x) => x.trim()).filter(Boolean);
     }}
 
-    function tagsForActiveGroup() {{
+    function matchesExpansionFilter(card) {{
+      const expanded = (card.dataset.expanded || 'false') === 'true';
+      if (activeExpansionFilter === 'expanded') return expanded;
+      if (activeExpansionFilter === 'unexpanded') return !expanded;
+      return true;
+    }}
+
+    function tagsForActiveScope() {{
       const seen = new Set();
       const ordered = [];
       cards().forEach((card) => {{
         const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
         const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
-        if (!groupVisible) return;
+        if (!groupVisible || !matchesExpansionFilter(card)) return;
         normalizeCardTags(card).forEach((tag) => {{
           const low = tag.toLowerCase();
           if (seen.has(low)) return;
@@ -3091,15 +3367,24 @@ def build_library_html():
         const groupIds = (card.dataset.groupIds || '').split(',').map((x) => x.trim()).filter(Boolean);
         const tagVisible = activeTagFilter === 'all' || tags.includes(activeTagFilter);
         const groupVisible = activeGroupFilter === 'all' || groupIds.includes(activeGroupFilter);
-        card.style.display = tagVisible && groupVisible ? '' : 'none';
+        const expansionVisible = matchesExpansionFilter(card);
+        card.style.display = tagVisible && groupVisible && expansionVisible ? '' : 'none';
       }});
     }}
 
     function bindTagFilterButtons() {{
       filterButtons().forEach((btn) => {{
         btn.addEventListener('click', () => {{
-          activeTagFilter = btn.dataset.filter || 'all';
+          const nextFilter = btn.dataset.filter || 'all';
+          const clickingActiveAll = nextFilter === 'all' && activeTagFilter === 'all';
+          activeTagFilter = nextFilter;
+          if (nextFilter === 'all' && !tagSearchQuery.trim()) {{
+            showAllTags = clickingActiveAll ? !showAllTags : true;
+          }} else if (nextFilter !== 'all') {{
+            showAllTags = false;
+          }}
           filterButtons().forEach((item) => item.classList.toggle('active', item === btn));
+          renderLibraryTagFilters();
           applyLibraryFilters();
         }});
       }});
@@ -3107,18 +3392,45 @@ def build_library_html():
 
     function renderLibraryTagFilters() {{
       if (!tagFilterContainer) return;
-      const availableTags = tagsForActiveGroup();
+      const availableTags = tagsForActiveScope();
       const availableTagSet = new Set(availableTags.map((tag) => tag.toLowerCase()));
       if (activeTagFilter !== 'all' && !availableTagSet.has(activeTagFilter)) {{
         activeTagFilter = 'all';
       }}
+      const normalizedQuery = tagSearchQuery.trim().toLowerCase();
+      let visibleTags = [];
+      if (normalizedQuery) {{
+        visibleTags = availableTags.filter((tag) => tag.toLowerCase().includes(normalizedQuery));
+      }} else if (activeTagFilter !== 'all') {{
+        visibleTags = availableTags.filter((tag) => tag.toLowerCase() === activeTagFilter);
+      }} else if (showAllTags) {{
+        visibleTags = availableTags;
+      }}
       const buttons = [];
       buttons.push('<button class="tag' + (activeTagFilter === 'all' ? ' active' : '') + '" type="button" data-filter="all">全部</button>');
-      availableTags.forEach((tag) => {{
+      visibleTags.forEach((tag) => {{
         const low = tag.toLowerCase();
         buttons.push('<button class="tag' + (activeTagFilter === low ? ' active' : '') + '" type="button" data-filter="' + escapeHtml(low) + '">' + escapeHtml(tag) + '</button>');
       }});
       tagFilterContainer.innerHTML = buttons.join('');
+      if (tagSearchMeta) {{
+        if (!availableTags.length) {{
+          tagSearchMeta.textContent = '当前 Group 下还没有可用 tag。';
+        }} else if (normalizedQuery) {{
+          tagSearchMeta.textContent = visibleTags.length
+            ? `已找到 ${{visibleTags.length}} 个与“${{tagSearchQuery.trim()}}”相关的 tag。`
+            : `没有找到与“${{tagSearchQuery.trim()}}”相关的 tag。`;
+        }} else if (activeTagFilter !== 'all') {{
+          const activeTag = availableTags.find((tag) => tag.toLowerCase() === activeTagFilter) || '';
+          tagSearchMeta.textContent = activeTag
+            ? `当前按 tag「${{activeTag}}」筛选。`
+            : '当前正在按 tag 筛选。';
+        }} else if (showAllTags) {{
+          tagSearchMeta.textContent = `当前已展开全部 ${{availableTags.length}} 个 tag。`;
+        }} else {{
+          tagSearchMeta.textContent = '输入上方搜索词筛选 tag，或点“全部”展开完整 tag 列表。';
+        }}
+      }}
       bindTagFilterButtons();
     }}
 
@@ -3135,16 +3447,40 @@ def build_library_html():
       btn.addEventListener('click', () => {{
         activeGroupFilter = btn.dataset.groupFilter || 'all';
         groupFilterButtons().forEach((item) => item.classList.toggle('active', item === btn));
+        showAllTags = false;
         renderLibraryTagFilters();
         applyLibraryFilters();
       }});
     }});
+
+    expansionFilterButtons().forEach((btn) => {{
+      btn.addEventListener('click', () => {{
+        activeExpansionFilter = btn.dataset.expansionFilter || 'all';
+        expansionFilterButtons().forEach((item) => item.classList.toggle('active', item === btn));
+        showAllTags = false;
+        renderLibraryTagFilters();
+        applyLibraryFilters();
+      }});
+    }});
+
+    if (tagSearchInput) {{
+      tagSearchInput.addEventListener('input', () => {{
+        tagSearchQuery = tagSearchInput.value || '';
+        showAllTags = false;
+        renderLibraryTagFilters();
+      }});
+    }}
 
     document.querySelectorAll('[data-filter-tag]').forEach((btn) => {{
       btn.addEventListener('click', () => {{
         const target = (btn.dataset.filterTag || '').toLowerCase();
         if (!target) return;
         activeTagFilter = target;
+        tagSearchQuery = btn.textContent || '';
+        if (tagSearchInput) {{
+          tagSearchInput.value = tagSearchQuery;
+        }}
+        showAllTags = false;
         renderLibraryTagFilters();
         applyLibraryFilters();
         emphasizeActiveTopTag();
@@ -3153,6 +3489,7 @@ def build_library_html():
 
     renderLibraryTagFilters();
     applyLibraryFilters();
+    updateAllExpandButtonStates();
 
     document.querySelectorAll('.save-tag').forEach((btn) => {{
       btn.addEventListener('click', async () => {{
@@ -3335,7 +3672,7 @@ def build_library_html():
       let html = '';
       data.groups.forEach(g => {{
         html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid #e0e0e0;">
-          <span><strong>${{g.name}}</strong>${{g.description ? ' - ' + g.description : ''}}</span>
+          <span><strong>${{text(g.name)}}</strong>${{g.description ? ' - ' + g.description : ''}}</span>
           <button class="delete-group" data-id="${{g.id}}" style="padding:4px 10px; border-radius:8px; font-size:12px; background:#c62828;">删除</button>
         </div>`;
       }});
@@ -3466,6 +3803,53 @@ def build_library_html():
       }});
     }});
 
+    document.querySelectorAll('.expand-reading-link').forEach((btn) => {{
+      btn.addEventListener('click', async () => {{
+        const card = btn.closest('.card');
+        if (!card) return;
+        const paper = getExpansionPaper(card);
+        const doi = normalizeDoi(paper.doi);
+        if (!doi) {{
+          alert('该文献当前缺少 DOI，暂时无法从深度阅读页发起延展搜索。');
+          return;
+        }}
+        if (expansionIndex[doi] && expansionIndex[doi].site_url) {{
+          showReadingExpansionStatus('已找到现有相关论文页，正在打开...');
+          window.setTimeout(hideReadingExpansionStatus, 1200);
+          window.open(expansionIndex[doi].site_url, '_blank', 'noopener');
+          return;
+        }}
+        btn.disabled = true;
+        showReadingExpansionStatus('已进入扩展搜索队列，正在准备结果...');
+        try {{
+          const started = await apiPost('/api/papers/expand-references', {{
+            search_slug: card.dataset.sourceSearchSlug || '',
+            paper
+          }});
+          const job = started.job || {{}};
+          if (!job.id) {{
+            throw new Error('扩展搜索任务创建失败');
+          }}
+          const finished = job.status === 'completed' ? job : await waitReferenceExpansionJob(job.id);
+          if (finished.site_url) {{
+            expansionIndex[doi] = {{ site_url: finished.site_url }};
+          }}
+          updateExpandButtonState(card);
+          if (!finished.site_url) {{
+            throw new Error('扩展搜索结果未生成链接');
+          }}
+          showReadingExpansionStatus('延展搜索页面已生成，正在打开...');
+          window.open(finished.site_url, '_blank', 'noopener');
+          window.setTimeout(hideReadingExpansionStatus, 1200);
+        }} catch (error) {{
+          hideReadingExpansionStatus();
+          alert(error.message || '扩展搜索失败');
+        }} finally {{
+          updateExpandButtonState(card);
+        }}
+      }});
+    }});
+
     document.querySelectorAll('.remove-reading-link').forEach((btn) => {{
       btn.addEventListener('click', async () => {{
         const citationId = btn.dataset.id;
@@ -3510,6 +3894,11 @@ def build_library_html():
       }});
     }}
 
+    loadExpansions().finally(() => {{
+      updateAllExpandButtonStates();
+      renderLibraryTagFilters();
+      applyLibraryFilters();
+    }});
     pollOpenClawJob().catch(() => {{}});
   </script>
 </body>

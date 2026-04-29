@@ -234,7 +234,7 @@ def build_keyword_graph(limit: int = 36, max_edges: int = 120) -> dict:
                 "id": str(group_id),
                 "name": group.get("name") or f"Group {group_id}",
                 "description": group.get("description") or "",
-                "paper_count": group_graph["total_papers"],
+                "paper_count": group.get("paper_count") or group_graph["total_papers"],
                 "keyword_count": group_graph["graph_keywords"],
             }
         )
@@ -737,21 +737,32 @@ def list_reading_groups():
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT id, name, description, created_at
-            FROM reading_groups
-            ORDER BY created_at DESC
+            SELECT
+                rg.id,
+                rg.name,
+                rg.description,
+                rg.source_kind,
+                rg.created_at,
+                COUNT(cgl.id) AS paper_count
+            FROM reading_groups rg
+            LEFT JOIN citation_group_links cgl ON cgl.group_id = rg.id
+            GROUP BY rg.id, rg.name, rg.description, rg.source_kind, rg.created_at
+            ORDER BY paper_count DESC,
+                     rg.created_at DESC,
+                     rg.id DESC
             """
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def create_reading_group(name: str, description: str = ""):
+def create_reading_group(name: str, description: str = "", source_kind: str = "manual"):
     ensure_db()
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    normalized_source_kind = "auto" if str(source_kind or "").strip().lower() == "auto" else "manual"
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
-            "INSERT INTO reading_groups (name, description, created_at) VALUES (?, ?, ?)",
-            (name.strip(), description.strip(), now),
+            "INSERT INTO reading_groups (name, description, source_kind, created_at) VALUES (?, ?, ?, ?)",
+            (name.strip(), description.strip(), normalized_source_kind, now),
         )
         conn.commit()
         return cursor.lastrowid
@@ -766,7 +777,7 @@ def find_reading_group_by_name(name: str):
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
-            SELECT id, name, description, created_at
+            SELECT id, name, description, source_kind, created_at
             FROM reading_groups
             WHERE lower(name) = lower(?)
             ORDER BY id DESC
@@ -774,7 +785,9 @@ def find_reading_group_by_name(name: str):
             """,
             (normalized,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    return dict(row)
 
 
 def find_compatible_reading_group(name: str, *, similarity_threshold: float = 0.72):
@@ -808,7 +821,7 @@ def find_compatible_reading_group(name: str, *, similarity_threshold: float = 0.
     return None
 
 
-def get_or_create_reading_group(name: str, description: str = ""):
+def get_or_create_reading_group(name: str, description: str = "", source_kind: str = "manual"):
     normalized = " ".join(str(name or "").split())
     if not normalized:
         raise ValueError("Group 名称不能为空")
@@ -816,7 +829,7 @@ def get_or_create_reading_group(name: str, description: str = ""):
     if existing:
         return existing
     try:
-        group_id = create_reading_group(normalized, description)
+        group_id = create_reading_group(normalized, description, source_kind=source_kind)
     except sqlite3.IntegrityError:
         existing = find_reading_group_by_name(normalized)
         if existing:
@@ -826,17 +839,19 @@ def get_or_create_reading_group(name: str, description: str = ""):
         "id": group_id,
         "name": normalized,
         "description": description.strip(),
+        "source_kind": "auto" if str(source_kind or "").strip().lower() == "auto" else "manual",
+        "paper_count": 0,
     }
 
 
-def get_or_create_compatible_reading_group(name: str, description: str = ""):
+def get_or_create_compatible_reading_group(name: str, description: str = "", source_kind: str = "manual"):
     normalized = " ".join(str(name or "").split())
     if not normalized:
         raise ValueError("Group 名称不能为空")
     existing = find_compatible_reading_group(normalized)
     if existing:
         return existing
-    return get_or_create_reading_group(normalized, description)
+    return get_or_create_reading_group(normalized, description, source_kind=source_kind)
 
 
 def delete_reading_group(group_id: int):
